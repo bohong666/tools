@@ -2,7 +2,7 @@
 # firewall-manager.sh
 # 支持 Ubuntu / Debian，自动识别 ufw 或 iptables
 # 作者：ChatGPT GPT-5
-# 版本：v1.5
+# 版本：v1.6
 # 更新时间：2025-11-07
 
 # 检查 root 权限
@@ -11,7 +11,7 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
-FW_VERSION="v1.5"
+FW_VERSION="v1.6"
 
 # 检测防火墙类型
 detect_firewall() {
@@ -25,33 +25,18 @@ detect_firewall() {
   fi
 }
 
-# 显示防火墙状态及规则
+# 显示防火墙状态及原始规则
 show_status() {
   echo "=================================="
   echo "🧭 Linux 防火墙管理器 ($FW_TYPE) - $FW_VERSION"
   echo "=================================="
-  
+
   if [ "$FW_TYPE" = "ufw" ]; then
+    echo "🔹 ufw 状态（完整规则）："
     ufw status verbose
-    echo
-    echo "📋 当前 ufw 规则："
-    ufw status numbered
   else
-    # iptables 状态
-    systemctl is-active netfilter-persistent >/dev/null 2>&1 && echo "✅ iptables 已启用" || echo "❌ iptables 未运行"
-    echo
-    echo "📋 当前 iptables INPUT 规则："
-    iptables -S INPUT | while read line; do
-        if [[ $line == *"ACCEPT"* ]]; then
-            proto=$(echo $line | grep -oP '(?<=-p )\w+')
-            port=$(echo $line | grep -oP '(?<=--dport )\d+')
-            [[ -n "$proto" && -n "$port" ]] && echo "✅ $proto:$port"
-        elif [[ $line == *"DROP"* ]]; then
-            proto=$(echo $line | grep -oP '(?<=-p )\w+')
-            port=$(echo $line | grep -oP '(?<=--dport )\d+')
-            [[ -n "$proto" && -n "$port" ]] && echo "🚫 $proto:$port"
-        fi
-    done
+    echo "🔹 iptables 状态（完整 INPUT 链规则）："
+    iptables -L INPUT -n -v --line-numbers
   fi
   echo "=================================="
 }
@@ -62,11 +47,7 @@ modify_port() {
   local port=$2
   local proto=$3
 
-  if [ "$proto" == "both" ]; then
-    proto_list=("tcp" "udp")
-  else
-    proto_list=("$proto")
-  fi
+  [[ "$proto" == "both" ]] && proto_list=("tcp" "udp") || proto_list=("$proto")
 
   for p in "${proto_list[@]}"; do
     if [ "$FW_TYPE" = "ufw" ]; then
@@ -80,8 +61,24 @@ modify_port() {
       esac
     else
       case $action in
-        allow) iptables -A INPUT -p "$p" --dport "$port" -j ACCEPT; echo "✅ 已允许 $p 端口 $port" ;;
-        deny) iptables -A INPUT -p "$p" --dport "$port" -j DROP; echo "🚫 已禁止 $p 端口 $port" ;;
+        allow)
+          iptables -C INPUT -p "$p" --dport "$port" -j ACCEPT 2>/dev/null
+          if [ $? -ne 0 ]; then
+            iptables -A INPUT -p "$p" --dport "$port" -j ACCEPT
+            echo "✅ 已允许 $p 端口 $port"
+          else
+            echo "⚠️ $p 端口 $port 已存在允许规则"
+          fi
+          ;;
+        deny)
+          iptables -C INPUT -p "$p" --dport "$port" -j DROP 2>/dev/null
+          if [ $? -ne 0 ]; then
+            iptables -A INPUT -p "$p" --dport "$port" -j DROP
+            echo "🚫 已禁止 $p 端口 $port"
+          else
+            echo "⚠️ $p 端口 $port 已存在禁止规则"
+          fi
+          ;;
         delete)
           iptables -D INPUT -p "$p" --dport "$port" -j ACCEPT 2>/dev/null
           iptables -D INPUT -p "$p" --dport "$port" -j DROP 2>/dev/null
@@ -111,12 +108,12 @@ choose_proto() {
   echo "1) TCP"
   echo "2) UDP"
   echo "3) TCP + UDP（同时开放）"
-  read -p "请输入编号 (1 表示 TCP, 2 表示 UDP, 3 表示同时开放 TCP 和 UDP): " proto_choice
+  read -p "输入编号 (1/2/3): " proto_choice
   case $proto_choice in
     1) proto="tcp" ;;
     2) proto="udp" ;;
     3) proto="both" ;;
-    *) echo "❌ 输入无效，默认选择 TCP"; proto="tcp" ;;
+    *) echo "❌ 输入无效，默认 TCP"; proto="tcp" ;;
   esac
   echo "$proto"
 }
@@ -126,9 +123,9 @@ temp_clear() {
   if [ "$FW_TYPE" = "iptables" ]; then
     iptables -F
     iptables -P INPUT ACCEPT
-    echo "⚠️ iptables 规则已清空，防火墙临时关闭（重启后恢复）"
+    echo "⚠️ iptables 规则已清空（重启后恢复默认策略）"
   else
-    echo "⚠️ ufw 不支持临时清空规则，请使用 ufw disable"
+    echo "⚠️ ufw 不支持临时清空，请使用 ufw disable"
   fi
 }
 
@@ -136,9 +133,9 @@ temp_clear() {
 toggle_firewall() {
   local action=$1
   if [ "$FW_TYPE" = "ufw" ]; then
-    if [ "$action" = "on" ]; then ufw enable; else ufw disable; fi
+    [ "$action" == "on" ] && ufw enable || ufw disable
   else
-    if [ "$action" = "on" ]; then
+    if [ "$action" == "on" ]; then
       systemctl start netfilter-persistent 2>/dev/null || echo "✅ iptables 已启动"
     else
       iptables -F
@@ -151,7 +148,6 @@ toggle_firewall() {
 # 主菜单
 main_menu() {
   detect_firewall
-  clear
   show_status
 
   echo
@@ -168,7 +164,7 @@ main_menu() {
   echo "8) 保存并重启防火墙"
   echo "9) 退出"
   echo "=============================="
-  
+
   read -p "请选择操作编号: " choice
 
   case $choice in
@@ -205,5 +201,5 @@ main_menu() {
   fi
 }
 
-# 启动脚本
+# 启动
 main_menu
