@@ -1,7 +1,7 @@
 #!/bin/bash
 # ufw-manager.sh
-# ufw 专用防火墙管理器，确保 SSH 端口永远开放，端口操作稳定
-# 版本：v1.3
+# ufw 专用防火墙管理器 v1.4
+# 自动保持 SSH 开放，简化交互，端口操作稳定
 # 更新时间：2025-11-07
 
 # 检查 root
@@ -10,27 +10,25 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
-FW_VERSION="v1.3"
+FW_VERSION="v1.4"
 
 # 获取当前 SSH 端口
 SSH_PORT=$(ss -tlnp | grep sshd | awk '{print $4}' | awk -F: '{print $NF}' | head -n1)
 [ -z "$SSH_PORT" ] && SSH_PORT=22
 echo "🔹 当前 SSH 端口：$SSH_PORT"
 
-# 安装/切换 ufw
+# 安装/启用 ufw
 setup_ufw() {
   if ! command -v ufw >/dev/null 2>&1; then
     echo "⚠️ 系统未安装 ufw，正在安装..."
     apt update && apt install -y ufw
   fi
-
-  # 启用 ufw 并允许 SSH
   ufw --force enable
   ufw allow "$SSH_PORT"/tcp
   echo "✅ ufw 已启用，SSH 端口 $SSH_PORT 保证开放"
 }
 
-# 显示状态
+# 显示 ufw 状态
 show_status() {
   echo "=================================="
   echo "🧭 ufw 防火墙管理器 - $FW_VERSION"
@@ -62,8 +60,12 @@ add_port() {
   local proto=$2
   [[ "$proto" == "both" ]] && proto_list=("tcp" "udp") || proto_list=("$proto")
   for p in "${proto_list[@]}"; do
-    ufw allow "$port/$p"
-    echo "✅ 已允许 $p 端口 $port"
+    if ! ufw status | grep -qw "$port/$p"; then
+      ufw allow "$port/$p"
+      echo "✅ 已允许 $p 端口 $port"
+    else
+      echo "⚠️ $p 端口 $port 已存在规则，跳过"
+    fi
   done
   ufw allow "$SSH_PORT"/tcp
 }
@@ -78,8 +80,12 @@ deny_port() {
       echo "⚠️ 避免禁止 SSH 端口 $SSH_PORT"
       continue
     fi
-    ufw deny "$port/$p"
-    echo "🚫 已禁止 $p 端口 $port"
+    if ! ufw status | grep -qw "$port/$p"; then
+      ufw deny "$port/$p"
+      echo "🚫 已禁止 $p 端口 $port"
+    else
+      echo "⚠️ $p 端口 $port 已存在允许规则，禁止成功"
+    fi
   done
   ufw allow "$SSH_PORT"/tcp
 }
@@ -89,19 +95,16 @@ delete_port() {
   local port=$1
   local proto=$2
   [[ "$proto" == "both" ]] && proto_list=("tcp" "udp") || proto_list=("$proto")
-
   for p in "${proto_list[@]}"; do
     if [ "$port" == "$SSH_PORT" ] && [ "$p" == "tcp" ]; then
       echo "⚠️ 避免删除 SSH 端口 $SSH_PORT 规则"
       continue
     fi
-
     while true; do
-      # 获取所有匹配规则的编号
       mapfile -t nums < <(ufw status numbered | grep "$port/$p" | awk -F'[][]' '{print $2}' | sort -r)
       [ ${#nums[@]} -eq 0 ] && break
       for num in "${nums[@]}"; do
-        ufw delete "$num"
+        ufw --force delete "$num"
         echo "🧹 已删除 $p 端口 $port (规则编号 $num)"
       done
     done
