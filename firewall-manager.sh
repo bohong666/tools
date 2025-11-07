@@ -2,7 +2,7 @@
 # firewall-manager.sh
 # 支持 Ubuntu / Debian，自动识别 ufw 或 iptables
 # 作者：ChatGPT GPT-5
-# 版本：v1.6
+# 版本：v1.7
 # 更新时间：2025-11-07
 
 # 检查 root 权限
@@ -11,7 +11,7 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
-FW_VERSION="v1.6"
+FW_VERSION="v1.7"
 
 # 检测防火墙类型
 detect_firewall() {
@@ -41,7 +41,7 @@ show_status() {
   echo "=================================="
 }
 
-# 添加或删除端口 (支持 tcp / udp / both)
+# 添加端口规则 (支持 TCP/UDP/BOTH)
 modify_port() {
   local action=$1
   local port=$2
@@ -79,12 +79,34 @@ modify_port() {
             echo "⚠️ $p 端口 $port 已存在禁止规则"
           fi
           ;;
-        delete)
-          iptables -D INPUT -p "$p" --dport "$port" -j ACCEPT 2>/dev/null
-          iptables -D INPUT -p "$p" --dport "$port" -j DROP 2>/dev/null
-          echo "🧹 已删除 $p 端口 $port 的规则"
-          ;;
       esac
+    fi
+  done
+}
+
+# 删除端口规则 (iptables 按行号删除)
+delete_port() {
+  local port=$1
+  local proto=$2
+
+  [[ "$proto" == "both" ]] && proto_list=("tcp" "udp") || proto_list=("$proto")
+
+  for p in "${proto_list[@]}"; do
+    if [ "$FW_TYPE" = "ufw" ]; then
+      ufw delete allow "$port/$p" 2>/dev/null
+      ufw delete deny "$port/$p" 2>/dev/null
+      echo "🧹 已删除 $p 端口 $port 的 ufw 规则"
+    else
+      # 获取匹配行号，倒序删除
+      mapfile -t lines < <(iptables -L INPUT --line-numbers -n | grep "$p" | grep "dpt:$port" | awk '{print $1}' | sort -r)
+      if [ ${#lines[@]} -eq 0 ]; then
+          echo "⚠️ 未找到 $p 端口 $port 的规则"
+          continue
+      fi
+      for num in "${lines[@]}"; do
+          iptables -D INPUT "$num"
+          echo "🧹 已删除 $p 端口 $port 规则 (行号 $num)"
+      done
     fi
   done
 }
@@ -185,7 +207,7 @@ main_menu() {
     7)
       read -p "请输入端口号: " port
       proto=$(choose_proto)
-      modify_port delete "$port" "$proto"
+      delete_port "$port" "$proto"
       ;;
     8) save_rules ;;
     9) echo "👋 已退出"; exit 0 ;;
@@ -201,5 +223,5 @@ main_menu() {
   fi
 }
 
-# 启动
+# 启动脚本
 main_menu
