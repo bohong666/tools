@@ -2,7 +2,7 @@
 # firewall-manager.sh
 # 支持 Ubuntu / Debian，自动识别 ufw 或 iptables
 # 作者：ChatGPT GPT-5
-# 更新时间：2025-11-07 (修正版)
+# 更新时间：2025-11-07 (含 UDP 支持)
 
 # 检查 root 权限
 if [ "$EUID" -ne 0 ]; then
@@ -44,10 +44,10 @@ list_ports() {
     ufw status numbered
   else
     echo "✅ 允许端口："
-    iptables -L INPUT -n | awk '/ACCEPT/ && /dpt:/ {for(i=1;i<=NF;i++) if($i ~ /dpt:/) print substr($i,5)}' | sort -u
+    iptables -L INPUT -n | awk '/ACCEPT/ && /dpt:/ {proto="tcp"; for(i=1;i<=NF;i++){if($i=="udp")proto="udp"; if($i~/dpt:/)print proto":"substr($i,5)}}' | sort -u
     echo
     echo "🚫 禁止端口："
-    iptables -L INPUT -n | awk '/DROP/ && /dpt:/ {for(i=1;i<=NF;i++) if($i ~ /dpt:/) print substr($i,5)}' | sort -u
+    iptables -L INPUT -n | awk '/DROP/ && /dpt:/ {proto="tcp"; for(i=1;i<=NF;i++){if($i=="udp")proto="udp"; if($i~/dpt:/)print proto":"substr($i,5)}}' | sort -u
   fi
 }
 
@@ -86,27 +86,37 @@ toggle_firewall() {
 modify_port() {
   local action=$1
   local port=$2
-  if [ "$FW_TYPE" = "ufw" ]; then
-    if [ "$action" = "allow" ]; then
-      ufw allow "$port"
-    elif [ "$action" = "deny" ]; then
-      ufw deny "$port"
-    elif [ "$action" = "delete" ]; then
-      ufw delete "$port"
-    fi
+  local proto=$3
+  if [ "$proto" = "both" ]; then
+    proto_list=("tcp" "udp")
   else
-    if [ "$action" = "allow" ]; then
-      iptables -A INPUT -p tcp --dport "$port" -j ACCEPT
-      echo "✅ 已允许端口 $port"
-    elif [ "$action" = "deny" ]; then
-      iptables -A INPUT -p tcp --dport "$port" -j DROP
-      echo "🚫 已禁止端口 $port"
-    elif [ "$action" = "delete" ]; then
-      iptables -D INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null
-      iptables -D INPUT -p tcp --dport "$port" -j DROP 2>/dev/null
-      echo "🧹 已删除端口 $port 的规则"
-    fi
+    proto_list=("$proto")
   fi
+
+  for p in "${proto_list[@]}"; do
+    if [ "$FW_TYPE" = "ufw" ]; then
+      if [ "$action" = "allow" ]; then
+        ufw allow "$port/$p"
+      elif [ "$action" = "deny" ]; then
+        ufw deny "$port/$p"
+      elif [ "$action" = "delete" ]; then
+        ufw delete allow "$port/$p" 2>/dev/null
+        ufw delete deny "$port/$p" 2>/dev/null
+      fi
+    else
+      if [ "$action" = "allow" ]; then
+        iptables -A INPUT -p "$p" --dport "$port" -j ACCEPT
+        echo "✅ 已允许 $p 端口 $port"
+      elif [ "$action" = "deny" ]; then
+        iptables -A INPUT -p "$p" --dport "$port" -j DROP
+        echo "🚫 已禁止 $p 端口 $port"
+      elif [ "$action" = "delete" ]; then
+        iptables -D INPUT -p "$p" --dport "$port" -j ACCEPT 2>/dev/null
+        iptables -D INPUT -p "$p" --dport "$port" -j DROP 2>/dev/null
+        echo "🧹 已删除 $p 端口 $port 的规则"
+      fi
+    fi
+  done
 }
 
 # 保存规则
@@ -118,6 +128,23 @@ save_rules() {
     netfilter-persistent save
     echo "✅ 规则已保存并将在重启后生效"
   fi
+}
+
+# 协议选择
+choose_proto() {
+  echo
+  echo "请选择协议类型："
+  echo "1) TCP"
+  echo "2) UDP"
+  echo "3) TCP + UDP"
+  read -p "输入编号 (1/2/3): " proto_choice
+  case $proto_choice in
+    1) proto="tcp" ;;
+    2) proto="udp" ;;
+    3) proto="both" ;;
+    *) echo "❌ 输入无效，默认为 tcp"; proto="tcp" ;;
+  esac
+  echo "$proto"
 }
 
 # 主菜单
@@ -144,9 +171,9 @@ main_menu() {
     2) toggle_firewall on ;;
     3) toggle_firewall off ;;
     4) echo "⚠️ 临时关闭：仅清空当前规则，不保存"; iptables -F ;;
-    5) read -p "请输入端口号: " port; modify_port allow "$port" ;;
-    6) read -p "请输入端口号: " port; modify_port deny "$port" ;;
-    7) read -p "请输入端口号: " port; modify_port delete "$port" ;;
+    5) read -p "请输入端口号: " port; proto=$(choose_proto); modify_port allow "$port" "$proto" ;;
+    6) read -p "请输入端口号: " port; proto=$(choose_proto); modify_port deny "$port" "$proto" ;;
+    7) read -p "请输入端口号: " port; proto=$(choose_proto); modify_port delete "$port" "$proto" ;;
     8) save_rules ;;
     9) echo "👋 已退出"; exit 0 ;;
     *) echo "❌ 无效选项" ;;
