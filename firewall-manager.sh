@@ -2,7 +2,7 @@
 # firewall-manager.sh
 # 支持 Ubuntu / Debian，自动识别 ufw 或 iptables
 # 作者：ChatGPT GPT-5
-# 更新时间：2025-11-07
+# 更新时间：2025-11-07 (修正版)
 
 # 检查 root 权限
 if [ "$EUID" -ne 0 ]; then
@@ -44,10 +44,10 @@ list_ports() {
     ufw status numbered
   else
     echo "✅ 允许端口："
-    iptables -L INPUT -n | grep ACCEPT | awk '{print $7}' | grep -E '^[0-9]+$' | sort -u
+    iptables -L INPUT -n | awk '/ACCEPT/ && /dpt:/ {for(i=1;i<=NF;i++) if($i ~ /dpt:/) print substr($i,5)}' | sort -u
     echo
     echo "🚫 禁止端口："
-    iptables -L INPUT -n | grep DROP | awk '{print $7}' | grep -E '^[0-9]+$' | sort -u
+    iptables -L INPUT -n | awk '/DROP/ && /dpt:/ {for(i=1;i<=NF;i++) if($i ~ /dpt:/) print substr($i,5)}' | sort -u
   fi
 }
 
@@ -62,7 +62,18 @@ toggle_firewall() {
     fi
   else
     if [ "$action" = "on" ]; then
-      systemctl start netfilter-persistent 2>/dev/null || iptables -P INPUT ACCEPT
+      echo "🔄 正在恢复 iptables 规则..."
+      if systemctl list-unit-files | grep -q netfilter-persistent; then
+        systemctl start netfilter-persistent
+        systemctl enable netfilter-persistent >/dev/null 2>&1
+        netfilter-persistent reload
+      elif [ -f /etc/iptables/rules.v4 ]; then
+        iptables-restore < /etc/iptables/rules.v4
+        echo "✅ 已从 /etc/iptables/rules.v4 恢复规则"
+      else
+        echo "⚠️ 未找到已保存规则，仅设置默认 ACCEPT"
+        iptables -P INPUT ACCEPT
+      fi
     else
       iptables -P INPUT ACCEPT
       iptables -F
@@ -86,11 +97,14 @@ modify_port() {
   else
     if [ "$action" = "allow" ]; then
       iptables -A INPUT -p tcp --dport "$port" -j ACCEPT
+      echo "✅ 已允许端口 $port"
     elif [ "$action" = "deny" ]; then
       iptables -A INPUT -p tcp --dport "$port" -j DROP
+      echo "🚫 已禁止端口 $port"
     elif [ "$action" = "delete" ]; then
       iptables -D INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null
       iptables -D INPUT -p tcp --dport "$port" -j DROP 2>/dev/null
+      echo "🧹 已删除端口 $port 的规则"
     fi
   fi
 }
@@ -102,7 +116,7 @@ save_rules() {
   else
     apt install -y iptables-persistent >/dev/null 2>&1
     netfilter-persistent save
-    echo "✅ 规则已保存（重启后仍然生效）"
+    echo "✅ 规则已保存并将在重启后生效"
   fi
 }
 
@@ -118,8 +132,8 @@ main_menu() {
   echo "2) 开启防火墙"
   echo "3) 关闭防火墙"
   echo "4) 临时关闭防火墙（重启后恢复）"
-  echo "5) 添加允许端口"
-  echo "6) 添加禁止端口"
+  echo "5) 允许端口"
+  echo "6) 禁止端口"
   echo "7) 删除端口规则"
   echo "8) 保存并重启防火墙"
   echo "9) 退出"
