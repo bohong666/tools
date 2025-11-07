@@ -1,43 +1,41 @@
 #!/bin/bash
 # ufw-manager.sh
-# 统一使用 ufw 管理防火墙，如果当前是 iptables，会自动切换
-# 作者：ChatGPT GPT-5
-# 版本：v1.0
+# ufw 专用防火墙管理器，保证 SSH 端口永远开放
+# 版本：v1.2
 # 更新时间：2025-11-07
 
-# 检查 root 权限
+# 检查 root
 if [ "$EUID" -ne 0 ]; then
-  echo "❌ 请使用 root 权限运行（sudo bash $0）"
+  echo "❌ 请使用 root 权限运行"
   exit 1
 fi
 
-FW_VERSION="v1.0"
+FW_VERSION="v1.2"
 
-# 检测防火墙并切换到 ufw
+# 获取当前 SSH 端口
+SSH_PORT=$(ss -tlnp | grep sshd | awk '{print $4}' | awk -F: '{print $NF}' | head -n1)
+[ -z "$SSH_PORT" ] && SSH_PORT=22
+echo "🔹 当前 SSH 端口：$SSH_PORT"
+
+# 安装/切换 ufw
 setup_ufw() {
   if command -v ufw >/dev/null 2>&1; then
     FW_TYPE="ufw"
   elif command -v iptables >/dev/null 2>&1; then
-    echo "⚠️ 当前使用 iptables，正在切换到 ufw..."
-    # 保存 iptables 规则（可选）
+    echo "⚠️ 当前使用 iptables，切换到 ufw..."
     iptables-save > "/root/iptables_backup_$(date +%F_%H%M%S).rules"
-    # 清空 iptables 规则
     iptables -F
     iptables -X
-    iptables -t nat -F
-    iptables -t nat -X
-    iptables -t mangle -F
-    iptables -t mangle -X
-    echo "✅ iptables 已清空"
-    # 安装并启用 ufw
     apt update && apt install -y ufw
     ufw enable
     FW_TYPE="ufw"
-    echo "✅ 已切换到 ufw 防火墙"
+    echo "✅ 已切换到 ufw"
   else
-    echo "❌ 系统没有安装 ufw 或 iptables，请先安装 ufw"
+    echo "❌ 系统未安装 ufw 或 iptables"
     exit 1
   fi
+  # 确保 SSH 端口开放
+  ufw allow "$SSH_PORT"/tcp
 }
 
 # 显示 ufw 状态
@@ -55,7 +53,7 @@ choose_proto() {
   echo "请选择协议类型："
   echo "1) TCP"
   echo "2) UDP"
-  echo "3) TCP + UDP（同时开放）"
+  echo "3) TCP + UDP"
   read -p "输入编号 (1/2/3): " proto_choice
   case $proto_choice in
     1) proto="tcp" ;;
@@ -75,6 +73,8 @@ add_port() {
     ufw allow "$port/$p"
     echo "✅ 已允许 $p 端口 $port"
   done
+  # 确保 SSH 端口开放
+  ufw allow "$SSH_PORT"/tcp
 }
 
 # 禁止端口
@@ -83,9 +83,15 @@ deny_port() {
   local proto=$2
   [[ "$proto" == "both" ]] && proto_list=("tcp" "udp") || proto_list=("$proto")
   for p in "${proto_list[@]}"; do
+    # 避免禁止 SSH
+    if [ "$port" == "$SSH_PORT" ] && [ "$p" == "tcp" ]; then
+      echo "⚠️ 避免禁止 SSH 端口 $SSH_PORT"
+      continue
+    fi
     ufw deny "$port/$p"
     echo "🚫 已禁止 $p 端口 $port"
   done
+  ufw allow "$SSH_PORT"/tcp
 }
 
 # 删除端口
@@ -94,7 +100,10 @@ delete_port() {
   local proto=$2
   [[ "$proto" == "both" ]] && proto_list=("tcp" "udp") || proto_list=("$proto")
   for p in "${proto_list[@]}"; do
-    # 使用 ufw delete 规则
+    if [ "$port" == "$SSH_PORT" ] && [ "$p" == "tcp" ]; then
+      echo "⚠️ 避免删除 SSH 端口 $SSH_PORT 规则"
+      continue
+    fi
     while true; do
       num=$(ufw status numbered | grep "$port/$p" | awk -F'[][]' '{print $2}' | tail -n1)
       [ -z "$num" ] && break
@@ -102,6 +111,7 @@ delete_port() {
     done
     echo "🧹 已删除 $p 端口 $port"
   done
+  ufw allow "$SSH_PORT"/tcp
 }
 
 # 开启/关闭防火墙
@@ -113,10 +123,12 @@ toggle_firewall() {
   else
     ufw disable
     echo "⚠️ 防火墙已关闭"
+    # 再次保证 SSH
+    ufw allow "$SSH_PORT"/tcp
   fi
 }
 
-# 保存规则（ufw 自动保存，无需额外操作）
+# 保存规则
 save_rules() {
   ufw reload
   echo "✅ ufw 规则已重新加载"
