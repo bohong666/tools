@@ -1,7 +1,7 @@
 #!/bin/bash
 # ufw-manager.sh
-# ufw 专用防火墙管理器，保证 SSH 端口永远开放
-# 版本：v1.2
+# ufw 专用防火墙管理器，确保 SSH 端口永远开放，端口操作稳定
+# 版本：v1.3
 # 更新时间：2025-11-07
 
 # 检查 root
@@ -10,7 +10,7 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
-FW_VERSION="v1.2"
+FW_VERSION="v1.3"
 
 # 获取当前 SSH 端口
 SSH_PORT=$(ss -tlnp | grep sshd | awk '{print $4}' | awk -F: '{print $NF}' | head -n1)
@@ -19,26 +19,18 @@ echo "🔹 当前 SSH 端口：$SSH_PORT"
 
 # 安装/切换 ufw
 setup_ufw() {
-  if command -v ufw >/dev/null 2>&1; then
-    FW_TYPE="ufw"
-  elif command -v iptables >/dev/null 2>&1; then
-    echo "⚠️ 当前使用 iptables，切换到 ufw..."
-    iptables-save > "/root/iptables_backup_$(date +%F_%H%M%S).rules"
-    iptables -F
-    iptables -X
+  if ! command -v ufw >/dev/null 2>&1; then
+    echo "⚠️ 系统未安装 ufw，正在安装..."
     apt update && apt install -y ufw
-    ufw enable
-    FW_TYPE="ufw"
-    echo "✅ 已切换到 ufw"
-  else
-    echo "❌ 系统未安装 ufw 或 iptables"
-    exit 1
   fi
-  # 确保 SSH 端口开放
+
+  # 启用 ufw 并允许 SSH
+  ufw --force enable
   ufw allow "$SSH_PORT"/tcp
+  echo "✅ ufw 已启用，SSH 端口 $SSH_PORT 保证开放"
 }
 
-# 显示 ufw 状态
+# 显示状态
 show_status() {
   echo "=================================="
   echo "🧭 ufw 防火墙管理器 - $FW_VERSION"
@@ -73,7 +65,6 @@ add_port() {
     ufw allow "$port/$p"
     echo "✅ 已允许 $p 端口 $port"
   done
-  # 确保 SSH 端口开放
   ufw allow "$SSH_PORT"/tcp
 }
 
@@ -83,7 +74,6 @@ deny_port() {
   local proto=$2
   [[ "$proto" == "both" ]] && proto_list=("tcp" "udp") || proto_list=("$proto")
   for p in "${proto_list[@]}"; do
-    # 避免禁止 SSH
     if [ "$port" == "$SSH_PORT" ] && [ "$p" == "tcp" ]; then
       echo "⚠️ 避免禁止 SSH 端口 $SSH_PORT"
       continue
@@ -99,17 +89,22 @@ delete_port() {
   local port=$1
   local proto=$2
   [[ "$proto" == "both" ]] && proto_list=("tcp" "udp") || proto_list=("$proto")
+
   for p in "${proto_list[@]}"; do
     if [ "$port" == "$SSH_PORT" ] && [ "$p" == "tcp" ]; then
       echo "⚠️ 避免删除 SSH 端口 $SSH_PORT 规则"
       continue
     fi
+
     while true; do
-      num=$(ufw status numbered | grep "$port/$p" | awk -F'[][]' '{print $2}' | tail -n1)
-      [ -z "$num" ] && break
-      ufw delete "$num"
+      # 获取所有匹配规则的编号
+      mapfile -t nums < <(ufw status numbered | grep "$port/$p" | awk -F'[][]' '{print $2}' | sort -r)
+      [ ${#nums[@]} -eq 0 ] && break
+      for num in "${nums[@]}"; do
+        ufw delete "$num"
+        echo "🧹 已删除 $p 端口 $port (规则编号 $num)"
+      done
     done
-    echo "🧹 已删除 $p 端口 $port"
   done
   ufw allow "$SSH_PORT"/tcp
 }
@@ -118,12 +113,11 @@ delete_port() {
 toggle_firewall() {
   local action=$1
   if [ "$action" == "on" ]; then
-    ufw enable
+    ufw --force enable
     echo "✅ 防火墙已开启"
   else
-    ufw disable
+    ufw --force disable
     echo "⚠️ 防火墙已关闭"
-    # 再次保证 SSH
     ufw allow "$SSH_PORT"/tcp
   fi
 }
@@ -183,5 +177,4 @@ main_menu() {
   [ "$again" = "y" ] && main_menu || echo "✅ 操作完成。"
 }
 
-# 启动脚本
 main_menu
