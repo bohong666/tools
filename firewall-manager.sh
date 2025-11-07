@@ -2,7 +2,7 @@
 # firewall-manager.sh
 # 支持 Ubuntu / Debian，自动识别 ufw 或 iptables
 # 作者：ChatGPT GPT-5
-# 版本：v1.3
+# 版本：v1.4
 # 更新时间：2025-11-07
 
 # 检查 root 权限
@@ -10,6 +10,8 @@ if [ "$EUID" -ne 0 ]; then
   echo "❌ 请使用 root 权限运行此脚本（sudo bash $0）"
   exit 1
 fi
+
+FW_VERSION="v1.4"
 
 # 检测防火墙类型
 detect_firewall() {
@@ -23,88 +25,71 @@ detect_firewall() {
   fi
 }
 
-# 显示当前状态
+# 显示防火墙状态及规则
 show_status() {
   echo "=================================="
-  echo "🧭 Linux 防火墙管理器 ($FW_TYPE) - v1.3"
+  echo "🧭 Linux 防火墙管理器 ($FW_TYPE) - $FW_VERSION"
   echo "=================================="
+  
   if [ "$FW_TYPE" = "ufw" ]; then
     ufw status verbose
-  else
-    echo "🔥 当前 iptables 状态："
-    systemctl is-active netfilter-persistent >/dev/null 2>&1 && echo "✅ 已启用" || echo "❌ 未运行"
-  fi
-}
-
-# 列出允许与禁用端口
-list_ports() {
-  echo "=============================="
-  echo "📋 当前端口策略："
-  echo "=============================="
-  if [ "$FW_TYPE" = "ufw" ]; then
+    echo
+    echo "📋 当前 ufw 规则："
     ufw status numbered
   else
-    echo "✅ 允许的 TCP 端口："
-    iptables -L INPUT -n | grep ACCEPT | grep tcp | awk '{print $7}' | grep -E '^[0-9]+$' | sort -u
+    # iptables 状态
+    systemctl is-active netfilter-persistent >/dev/null 2>&1 && echo "✅ iptables 已启用" || echo "❌ iptables 未运行"
     echo
-    echo "✅ 允许的 UDP 端口："
-    iptables -L INPUT -n | grep ACCEPT | grep udp | awk '{print $7}' | grep -E '^[0-9]+$' | sort -u
-    echo
-    echo "🚫 禁止的 TCP 端口："
-    iptables -L INPUT -n | grep DROP | grep tcp | awk '{print $7}' | grep -E '^[0-9]+$' | sort -u
-    echo
-    echo "🚫 禁止的 UDP 端口："
-    iptables -L INPUT -n | grep DROP | grep udp | awk '{print $7}' | grep -E '^[0-9]+$' | sort -u
+    echo "📋 当前 iptables INPUT 规则："
+    iptables -S INPUT | while read line; do
+        if [[ $line == *"ACCEPT"* ]]; then
+            proto=$(echo $line | grep -oP '(?<=-p )\w+')
+            port=$(echo $line | grep -oP '(?<=--dport )\d+')
+            [[ -n "$proto" && -n "$port" ]] && echo "✅ $proto:$port"
+        elif [[ $line == *"DROP"* ]]; then
+            proto=$(echo $line | grep -oP '(?<=-p )\w+')
+            port=$(echo $line | grep -oP '(?<=--dport )\d+')
+            [[ -n "$proto" && -n "$port" ]] && echo "🚫 $proto:$port"
+        fi
+    done
   fi
+  echo "=================================="
 }
 
-# 开启或关闭防火墙
-toggle_firewall() {
-  local action=$1
-  if [ "$FW_TYPE" = "ufw" ]; then
-    if [ "$action" = "on" ]; then
-      ufw enable
-    else
-      ufw disable
-    fi
-  else
-    if [ "$action" = "on" ]; then
-      systemctl start netfilter-persistent 2>/dev/null || echo "✅ iptables 已启动"
-    else
-      iptables -P INPUT ACCEPT
-      iptables -F
-      echo "⚠️ iptables 已清空规则（临时关闭防火墙）"
-    fi
-  fi
-}
-
-# 添加或删除端口 (支持 tcp / udp)
+# 添加或删除端口 (支持 tcp / udp / both)
 modify_port() {
   local action=$1
   local port=$2
   local proto=$3
 
-  if [ "$proto" != "tcp" ] && [ "$proto" != "udp" ]; then
-    echo "❌ 协议必须是 tcp 或 udp"
-    return
+  if [ "$proto" == "both" ]; then
+    proto_list=("tcp" "udp")
+  else
+    proto_list=("$proto")
   fi
 
-  if [ "$FW_TYPE" = "ufw" ]; then
-    case $action in
-      allow) ufw allow "$port/$proto" ;;
-      deny) ufw deny "$port/$proto" ;;
-      delete) ufw delete allow "$port/$proto" 2>/dev/null; ufw delete deny "$port/$proto" 2>/dev/null ;;
-    esac
-  else
-    case $action in
-      allow) iptables -A INPUT -p "$proto" --dport "$port" -j ACCEPT ;;
-      deny) iptables -A INPUT -p "$proto" --dport "$port" -j DROP ;;
-      delete)
-        iptables -D INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null
-        iptables -D INPUT -p "$proto" --dport "$port" -j DROP 2>/dev/null
-        ;;
-    esac
-  fi
+  for p in "${proto_list[@]}"; do
+    if [ "$FW_TYPE" = "ufw" ]; then
+      case $action in
+        allow) ufw allow "$port/$p" ;;
+        deny) ufw deny "$port/$p" ;;
+        delete)
+          ufw delete allow "$port/$p" 2>/dev/null
+          ufw delete deny "$port/$p" 2>/dev/null
+          ;;
+      esac
+    else
+      case $action in
+        allow) iptables -A INPUT -p "$p" --dport "$port" -j ACCEPT; echo "✅ 已允许 $p 端口 $port" ;;
+        deny) iptables -A INPUT -p "$p" --dport "$port" -j DROP; echo "🚫 已禁止 $p 端口 $port" ;;
+        delete)
+          iptables -D INPUT -p "$p" --dport "$port" -j ACCEPT 2>/dev/null
+          iptables -D INPUT -p "$p" --dport "$port" -j DROP 2>/dev/null
+          echo "🧹 已删除 $p 端口 $port 的规则"
+          ;;
+      esac
+    fi
+  done
 }
 
 # 保存规则
@@ -119,11 +104,40 @@ save_rules() {
   fi
 }
 
+# 协议选择
+choose_proto() {
+  echo
+  echo "请选择协议类型："
+  echo "1) TCP"
+  echo "2) UDP"
+  echo "3) TCP + UDP"
+  read -p "输入编号 (1/2/3): " proto_choice
+  case $proto_choice in
+    1) proto="tcp" ;;
+    2) proto="udp" ;;
+    3) proto="both" ;;
+    *) echo "❌ 输入无效，默认为 tcp"; proto="tcp" ;;
+  esac
+  echo "$proto"
+}
+
+# 临时清空规则（仅 iptables）
+temp_clear() {
+  if [ "$FW_TYPE" = "iptables" ]; then
+    iptables -F
+    iptables -P INPUT ACCEPT
+    echo "⚠️ iptables 规则已清空，防火墙临时关闭（重启后恢复）"
+  else
+    echo "⚠️ ufw 不支持临时清空，请使用 ufw disable"
+  fi
+}
+
 # 主菜单
 main_menu() {
   detect_firewall
   clear
   show_status
+
   echo
   echo "=============================="
   echo "🔥 防火墙管理菜单"
@@ -138,26 +152,27 @@ main_menu() {
   echo "8) 保存并重启防火墙"
   echo "9) 退出"
   echo "=============================="
+  
   read -p "请选择操作编号: " choice
 
   case $choice in
-    1) list_ports ;;
+    1) show_status ;;
     2) toggle_firewall on ;;
     3) toggle_firewall off ;;
-    4) echo "⚠️ 临时关闭防火墙..."; iptables -F ;;
+    4) temp_clear ;;
     5)
       read -p "请输入端口号: " port
-      read -p "协议 (tcp/udp): " proto
+      proto=$(choose_proto)
       modify_port allow "$port" "$proto"
       ;;
     6)
       read -p "请输入端口号: " port
-      read -p "协议 (tcp/udp): " proto
+      proto=$(choose_proto)
       modify_port deny "$port" "$proto"
       ;;
     7)
       read -p "请输入端口号: " port
-      read -p "协议 (tcp/udp): " proto
+      proto=$(choose_proto)
       modify_port delete "$port" "$proto"
       ;;
     8) save_rules ;;
@@ -174,4 +189,5 @@ main_menu() {
   fi
 }
 
+# 启动
 main_menu
