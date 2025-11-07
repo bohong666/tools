@@ -2,7 +2,7 @@
 # firewall-manager.sh
 # 支持 Ubuntu / Debian，自动识别 ufw 或 iptables
 # 作者：ChatGPT GPT-5
-# 版本：v1.4
+# 版本：v1.5
 # 更新时间：2025-11-07
 
 # 检查 root 权限
@@ -11,7 +11,7 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
-FW_VERSION="v1.4"
+FW_VERSION="v1.5"
 
 # 检测防火墙类型
 detect_firewall() {
@@ -110,13 +110,13 @@ choose_proto() {
   echo "请选择协议类型："
   echo "1) TCP"
   echo "2) UDP"
-  echo "3) TCP + UDP"
-  read -p "输入编号 (1/2/3): " proto_choice
+  echo "3) TCP + UDP（同时开放）"
+  read -p "请输入编号 (1 表示 TCP, 2 表示 UDP, 3 表示同时开放 TCP 和 UDP): " proto_choice
   case $proto_choice in
     1) proto="tcp" ;;
     2) proto="udp" ;;
     3) proto="both" ;;
-    *) echo "❌ 输入无效，默认为 tcp"; proto="tcp" ;;
+    *) echo "❌ 输入无效，默认选择 TCP"; proto="tcp" ;;
   esac
   echo "$proto"
 }
@@ -128,7 +128,23 @@ temp_clear() {
     iptables -P INPUT ACCEPT
     echo "⚠️ iptables 规则已清空，防火墙临时关闭（重启后恢复）"
   else
-    echo "⚠️ ufw 不支持临时清空，请使用 ufw disable"
+    echo "⚠️ ufw 不支持临时清空规则，请使用 ufw disable"
+  fi
+}
+
+# 开启/关闭防火墙
+toggle_firewall() {
+  local action=$1
+  if [ "$FW_TYPE" = "ufw" ]; then
+    if [ "$action" = "on" ]; then ufw enable; else ufw disable; fi
+  else
+    if [ "$action" = "on" ]; then
+      systemctl start netfilter-persistent 2>/dev/null || echo "✅ iptables 已启动"
+    else
+      iptables -F
+      iptables -P INPUT ACCEPT
+      echo "⚠️ iptables 已清空规则（关闭防火墙）"
+    fi
   fi
 }
 
@@ -189,5 +205,5 @@ main_menu() {
   fi
 }
 
-# 启动
+# 启动脚本
 main_menu
