@@ -2,7 +2,7 @@
 # firewall-manager.sh
 # 支持 Ubuntu / Debian，自动识别 ufw 或 iptables
 # 作者：ChatGPT GPT-5
-# 版本：v1.7
+# 版本：v1.9
 # 更新时间：2025-11-07
 
 # 检查 root 权限
@@ -11,7 +11,8 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
-FW_VERSION="v1.7"
+FW_VERSION="v1.9"
+TMP_BACKUP="/tmp/iptables_backup_${RANDOM}.v1.9"
 
 # 检测防火墙类型
 detect_firewall() {
@@ -30,7 +31,6 @@ show_status() {
   echo "=================================="
   echo "🧭 Linux 防火墙管理器 ($FW_TYPE) - $FW_VERSION"
   echo "=================================="
-
   if [ "$FW_TYPE" = "ufw" ]; then
     echo "🔹 ufw 状态（完整规则）："
     ufw status verbose
@@ -39,88 +39,6 @@ show_status() {
     iptables -L INPUT -n -v --line-numbers
   fi
   echo "=================================="
-}
-
-# 添加端口规则 (支持 TCP/UDP/BOTH)
-modify_port() {
-  local action=$1
-  local port=$2
-  local proto=$3
-
-  [[ "$proto" == "both" ]] && proto_list=("tcp" "udp") || proto_list=("$proto")
-
-  for p in "${proto_list[@]}"; do
-    if [ "$FW_TYPE" = "ufw" ]; then
-      case $action in
-        allow) ufw allow "$port/$p" ;;
-        deny) ufw deny "$port/$p" ;;
-        delete)
-          ufw delete allow "$port/$p" 2>/dev/null
-          ufw delete deny "$port/$p" 2>/dev/null
-          ;;
-      esac
-    else
-      case $action in
-        allow)
-          iptables -C INPUT -p "$p" --dport "$port" -j ACCEPT 2>/dev/null
-          if [ $? -ne 0 ]; then
-            iptables -A INPUT -p "$p" --dport "$port" -j ACCEPT
-            echo "✅ 已允许 $p 端口 $port"
-          else
-            echo "⚠️ $p 端口 $port 已存在允许规则"
-          fi
-          ;;
-        deny)
-          iptables -C INPUT -p "$p" --dport "$port" -j DROP 2>/dev/null
-          if [ $? -ne 0 ]; then
-            iptables -A INPUT -p "$p" --dport "$port" -j DROP
-            echo "🚫 已禁止 $p 端口 $port"
-          else
-            echo "⚠️ $p 端口 $port 已存在禁止规则"
-          fi
-          ;;
-      esac
-    fi
-  done
-}
-
-# 删除端口规则 (iptables 按行号删除)
-delete_port() {
-  local port=$1
-  local proto=$2
-
-  [[ "$proto" == "both" ]] && proto_list=("tcp" "udp") || proto_list=("$proto")
-
-  for p in "${proto_list[@]}"; do
-    if [ "$FW_TYPE" = "ufw" ]; then
-      ufw delete allow "$port/$p" 2>/dev/null
-      ufw delete deny "$port/$p" 2>/dev/null
-      echo "🧹 已删除 $p 端口 $port 的 ufw 规则"
-    else
-      # 获取匹配行号，倒序删除
-      mapfile -t lines < <(iptables -L INPUT --line-numbers -n | grep "$p" | grep "dpt:$port" | awk '{print $1}' | sort -r)
-      if [ ${#lines[@]} -eq 0 ]; then
-          echo "⚠️ 未找到 $p 端口 $port 的规则"
-          continue
-      fi
-      for num in "${lines[@]}"; do
-          iptables -D INPUT "$num"
-          echo "🧹 已删除 $p 端口 $port 规则 (行号 $num)"
-      done
-    fi
-  done
-}
-
-# 保存规则
-save_rules() {
-  if [ "$FW_TYPE" = "ufw" ]; then
-    ufw reload
-    echo "✅ ufw 规则已重新加载"
-  else
-    apt install -y iptables-persistent >/dev/null 2>&1
-    netfilter-persistent save
-    echo "✅ iptables 规则已保存（重启后仍然生效）"
-  fi
 }
 
 # 协议选择
@@ -140,12 +58,97 @@ choose_proto() {
   echo "$proto"
 }
 
-# 临时清空规则（仅 iptables）
+# 添加端口规则
+add_port() {
+  local port=$1
+  local proto=$2
+  [[ "$proto" == "both" ]] && proto_list=("tcp" "udp") || proto_list=("$proto")
+
+  for p in "${proto_list[@]}"; do
+    if [ "$FW_TYPE" = "ufw" ]; then
+      ufw allow "$port/$p"
+    else
+      iptables -C INPUT -p "$p" --dport "$port" -j ACCEPT 2>/dev/null
+      if [ $? -ne 0 ]; then
+        iptables -A INPUT -p "$p" --dport "$port" -j ACCEPT
+        echo "✅ 已允许 $p 端口 $port"
+      else
+        echo "⚠️ $p 端口 $port 已存在允许规则"
+      fi
+    fi
+  done
+}
+
+# 禁止端口规则
+deny_port() {
+  local port=$1
+  local proto=$2
+  [[ "$proto" == "both" ]] && proto_list=("tcp" "udp") || proto_list=("$proto")
+
+  for p in "${proto_list[@]}"; do
+    if [ "$FW_TYPE" = "ufw" ]; then
+      ufw deny "$port/$p"
+    else
+      iptables -C INPUT -p "$p" --dport "$port" -j DROP 2>/dev/null
+      if [ $? -ne 0 ]; then
+        iptables -A INPUT -p "$p" --dport "$port" -j DROP
+        echo "🚫 已禁止 $p 端口 $port"
+      else
+        echo "⚠️ $p 端口 $port 已存在禁止规则"
+      fi
+    fi
+  done
+}
+
+# 删除端口规则
+delete_port() {
+  local port=$1
+  local proto=$2
+  [[ "$proto" == "both" ]] && proto_list=("tcp" "udp") || proto_list=("$proto")
+
+  for p in "${proto_list[@]}"; do
+    if [ "$FW_TYPE" = "ufw" ]; then
+      while true; do
+        num=$(ufw status numbered | grep "$port/$p" | awk -F'[][]' '{print $2}' | tail -n1)
+        if [ -z "$num" ]; then
+          break
+        fi
+        ufw delete "$num"
+      done
+      echo "🧹 已删除 $p 端口 $port 的 ufw 规则"
+    else
+      mapfile -t lines < <(iptables -L INPUT --line-numbers -n | grep "$p" | grep "dpt:$port" | awk '{print $1}' | sort -r)
+      if [ ${#lines[@]} -eq 0 ]; then
+        echo "⚠️ 未找到 $p 端口 $port 的规则"
+        continue
+      fi
+      for num in "${lines[@]}"; do
+        iptables -D INPUT "$num"
+        echo "🧹 已删除 $p 端口 $port 规则 (行号 $num)"
+      done
+    fi
+  done
+}
+
+# 保存规则
+save_rules() {
+  if [ "$FW_TYPE" = "ufw" ]; then
+    ufw reload
+    echo "✅ ufw 规则已重新加载"
+  else
+    apt install -y iptables-persistent >/dev/null 2>&1
+    netfilter-persistent save
+    echo "✅ iptables 规则已保存（重启后仍然生效）"
+  fi
+}
+
+# 临时清空规则（iptables）
 temp_clear() {
   if [ "$FW_TYPE" = "iptables" ]; then
+    iptables-save > "$TMP_BACKUP"
     iptables -F
     iptables -P INPUT ACCEPT
-    echo "⚠️ iptables 规则已清空（重启后恢复默认策略）"
+    echo "⚠️ iptables 已清空规则（临时关闭）"
   else
     echo "⚠️ ufw 不支持临时清空，请使用 ufw disable"
   fi
@@ -158,8 +161,14 @@ toggle_firewall() {
     [ "$action" == "on" ] && ufw enable || ufw disable
   else
     if [ "$action" == "on" ]; then
-      systemctl start netfilter-persistent 2>/dev/null || echo "✅ iptables 已启动"
+      if [ -f "$TMP_BACKUP" ]; then
+        iptables-restore < "$TMP_BACKUP"
+        echo "✅ iptables 已恢复规则并开启防火墙"
+      else
+        systemctl start netfilter-persistent 2>/dev/null || echo "✅ iptables 已启动"
+      fi
     else
+      iptables-save > "$TMP_BACKUP"
       iptables -F
       iptables -P INPUT ACCEPT
       echo "⚠️ iptables 已清空规则（关闭防火墙）"
@@ -197,12 +206,12 @@ main_menu() {
     5)
       read -p "请输入端口号: " port
       proto=$(choose_proto)
-      modify_port allow "$port" "$proto"
+      add_port "$port" "$proto"
       ;;
     6)
       read -p "请输入端口号: " port
       proto=$(choose_proto)
-      modify_port deny "$port" "$proto"
+      deny_port "$port" "$proto"
       ;;
     7)
       read -p "请输入端口号: " port
