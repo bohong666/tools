@@ -2,20 +2,17 @@
 set -e
 
 #####################################
-# Firewall Manager v3 (2025-01)
+# Firewall Manager v4.0
 # 作者：ChatGPT
-# 功能：统一管理 IPv4/IPv6 防火墙
-# 特性：
-#   ✔ 自动检测 SSH 端口
+# 功能：
+#   ✔ 自动检测 SSH 端口（sshd_config 优先）
 #   ✔ 用户自定义开放端口
-#   ✔ IPv4 ping 关闭 / IPv6 ping 保留
-#   ✔ 所有输出美化
-#   ✔ 自动判断系统
-#   ✔ 不会误杀 SSH
+#   ✔ IPv4 ping 关闭，IPv6 ping 保留
+#   ✔ 屏幕输出美观
 #   ✔ 自动保存规则
 #####################################
 
-VERSION="3.0"
+VERSION="4.0"
 
 echo ""
 echo "=========================================="
@@ -38,23 +35,37 @@ echo "🖥️  系统类型：$PRETTY_NAME"
 echo ""
 
 # -----------------------------
-# Detect SSH Port
+# Reliable SSH Port Detection
 # -----------------------------
-SSH_PORT=$(ss -tnlp | grep sshd | awk -F '[: ]+' '{print $5}' | sed 's/.*://;t;d' | head -n 1)
+detect_ssh_port() {
+    # 1. 主配置
+    CFG_PORT=$(grep -Ei "^Port[[:space:]]+[0-9]+" /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' | head -n1)
 
-if [[ -z "$SSH_PORT" ]]; then
-    SSH_PORT=22
-fi
+    # 2. 配置目录
+    if [[ -z "$CFG_PORT" && -d /etc/ssh/sshd_config.d ]]; then
+        CFG_PORT=$(grep -Er "^Port[[:space:]]+[0-9]+" /etc/ssh/sshd_config.d/ 2>/dev/null | awk '{print $2}' | head -n1)
+    fi
 
-echo "🔐 自动检测到 SSH 端口：$SSH_PORT"
+    # 3. fallback ss
+    if [[ -z "$CFG_PORT" ]]; then
+        CFG_PORT=$(ss -tnlp 2>/dev/null | grep sshd | awk -F '[: ]+' '{print $5}' | sed 's/.*://;t;d' | grep -E "^[0-9]+$" | head -n1)
+    fi
+
+    # 4. 最终兜底
+    [[ -z "$CFG_PORT" ]] && CFG_PORT=22
+
+    echo "$CFG_PORT"
+}
+
+SSH_PORT=$(detect_ssh_port)
+echo "🔐 检测到 SSH 端口：$SSH_PORT"
 echo ""
 
 # -----------------------------
-# Input Ports
+# User Input for Extra Ports
 # -----------------------------
-read -p "请输入需额外开放的端口（例如：443,80）：" USER_PORTS_RAW
+read -p "请输入需额外开放的端口（多个用逗号或分号，如: 443,80）：" USER_PORTS_RAW
 
-# 格式化
 USER_PORTS=$(echo "$USER_PORTS_RAW" | tr -d ' ' | tr ';' ',')
 
 # 合并去重
@@ -64,7 +75,7 @@ echo ""
 echo "📌 最终将开放以下端口：$ALL_PORTS"
 echo ""
 
-read -p "⚠️ 确定要应用此防火墙规则？(yes/no): " CONFIRM
+read -p "⚠️ 确认应用规则？(yes/no): " CONFIRM
 [[ "$CONFIRM" != "yes" ]] && echo "已取消。" && exit 0
 
 echo ""
@@ -72,15 +83,18 @@ echo "🚧 正在应用规则..."
 sleep 1
 
 # -----------------------------
-# 清空旧规则
+# Flush Existing Rules
 # -----------------------------
 iptables -F
 iptables -X
+iptables -Z
+
 ip6tables -F
 ip6tables -X
+ip6tables -Z
 
 # -----------------------------
-# 默认策略
+# Default Policies
 # -----------------------------
 iptables -P INPUT DROP
 iptables -P FORWARD DROP
@@ -91,8 +105,9 @@ ip6tables -P FORWARD DROP
 ip6tables -P OUTPUT ACCEPT
 
 # -----------------------------
-# 基本规则
+# Basic Rules
 # -----------------------------
+# Loopback & Established
 iptables -A INPUT -i lo -j ACCEPT
 iptables -A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
 
@@ -100,17 +115,16 @@ ip6tables -A INPUT -i lo -j ACCEPT
 ip6tables -A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
 
 # -----------------------------
-# ❌ 关闭 IPv4 ping
+# Close IPv4 ping
 # -----------------------------
 iptables -A INPUT -p icmp --icmp-type echo-request -j DROP
 
+# IPv6 ping 保留
 # -----------------------------
-# ⚠️ 保留 IPv6 ICMP
-# -----------------------------
-# 不添加任何 DROP 规则
+# 不关闭 ICMPv6
 
 # -----------------------------
-# 开放端口
+# Open Ports
 # -----------------------------
 IFS=","
 echo ""
@@ -126,13 +140,14 @@ for p in $ALL_PORTS; do
 done
 unset IFS
 
+# -----------------------------
+# Save Rules
+# -----------------------------
 echo ""
-echo "💾 正在保存防火墙规则..."
+echo "💾 保存防火墙规则..."
 
-# -----------------------------
-# 保存规则
-# -----------------------------
 if [[ $OS == "ubuntu" || $OS == "debian" ]]; then
+    export DEBIAN_FRONTEND=noninteractive
     apt-get update -y >/dev/null 2>&1
     apt-get install -y iptables-persistent >/dev/null 2>&1
     netfilter-persistent save
@@ -144,12 +159,12 @@ echo ""
 echo "=========================================="
 echo " ✅ 防火墙规则已成功应用！"
 echo "=========================================="
-echo "🔐 SSH 端口已自动保留：$SSH_PORT"
+echo "🔐 SSH 端口已保留：$SSH_PORT"
 echo "🛑 IPv4 Ping 已关闭"
-echo "🌐 IPv6 Ping 保持正常（避免网络故障）"
-echo "🔒 所有其他端口已禁止访问"
+echo "🌐 IPv6 Ping 保持正常"
+echo "🔒 其他所有端口默认关闭"
 echo ""
-echo "建议测试 SSH 端口是否正常："
+echo "建议测试 SSH 端口是否可用："
 echo "   nc -zv YOUR_IP $SSH_PORT"
 echo ""
 echo "如需重新配置，请再次运行本脚本。"
