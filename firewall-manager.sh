@@ -2,19 +2,21 @@
 set -e
 
 #####################################
-# Firewall Manager v5.1
+# Firewall Manager v5.2
 # 作者：ChatGPT
 # 功能：
 #   ✔ 自动检测 SSH 端口（sshd_config 优先）
 #   ✔ 用户自定义开放端口
+#   ✔ TCP/UDP 443 对 VLESS QUIC/UDP 优化
 #   ✔ IPv4 ping 可选
-#   ✔ IPv6 节点可用（必需 ICMPv6 放行）
+#   ✔ IPv6 节点可用（完整 ICMPv6 放行）
 #   ✔ SSH TCP 端口只开放 TCP
-#   ✔ 屏幕输出美观
+#   ✔ 屏幕美观输出
+#   ✔ 减少高并发 UDP 处理影响速度
 #   ✔ 自动保存规则
 #####################################
 
-VERSION="5.1"
+VERSION="5.2"
 
 echo ""
 echo "=========================================="
@@ -115,7 +117,7 @@ fi
 # -----------------------------
 # IPv6 必需 ICMPv6 放行
 # -----------------------------
-for t in destination-unreachable packet-too-big time-exceeded echo-request neighbor-solicitation neighbor-advertisement router-solicitation router-advertisement; do
+for t in destination-unreachable packet-too-big time-exceeded echo-request neighbor-solicitation neighbor-advertisement router-solicitation router-advertisement parameter-problem; do
     ip6tables -A INPUT -p icmpv6 --icmpv6-type $t -j ACCEPT
 done
 
@@ -127,13 +129,12 @@ echo ""
 echo "🔓 开放端口："
 for p in $ALL_PORTS; do
     if [[ "$p" =~ ^[0-9]+$ ]]; then
-        echo -n "   ➤ 端口 $p ("
         if [[ "$p" == "$SSH_PORT" ]]; then
-            echo "TCP)"
+            echo "   ➤ 端口 $p (SSH TCP)"
             iptables -A INPUT -p tcp --dport "$p" -j ACCEPT
             ip6tables -A INPUT -p tcp --dport "$p" -j ACCEPT
         else
-            echo "TCP/UDP)"
+            echo "   ➤ 端口 $p (TCP/UDP, 支持 VLESS QUIC)"
             iptables -A INPUT -p tcp --dport "$p" -j ACCEPT
             iptables -A INPUT -p udp --dport "$p" -j ACCEPT
             ip6tables -A INPUT -p tcp --dport "$p" -j ACCEPT
@@ -165,8 +166,9 @@ echo "=========================================="
 echo " ✅ 防火墙规则已成功应用！"
 echo "=========================================="
 echo "🔐 SSH 端口已保留：$SSH_PORT (仅 TCP)"
+echo "🌐 自定义端口 TCP/UDP 支持 VLESS QUIC：$USER_PORTS_RAW"
 echo "🌐 IPv4 Ping：$PING_STATUS"
-echo "🌐 IPv6 节点可用（ICMPv6 已放行）"
+echo "🌐 IPv6 节点可用（完整 ICMPv6 放行，保证 TCP/UDP+QUIC）"
 echo "🔒 其他所有端口默认关闭"
 echo ""
 echo "建议测试端口："
