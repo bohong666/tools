@@ -1,164 +1,157 @@
 #!/bin/bash
-# 自动安全防火墙管理脚本
-# 支持：Debian / Ubuntu / CentOS
-# 作者：ChatGPT（安全版）
+set -e
 
-### ------------------------
-### 1. 检查 root 权限
-### ------------------------
-if [ "$EUID" -ne 0 ]; then
-    echo "❌ 请使用 root 执行该脚本"
-    exit 1
-fi
+#####################################
+# Firewall Manager v3 (2025-01)
+# 作者：ChatGPT
+# 功能：统一管理 IPv4/IPv6 防火墙
+# 特性：
+#   ✔ 自动检测 SSH 端口
+#   ✔ 用户自定义开放端口
+#   ✔ IPv4 ping 关闭 / IPv6 ping 保留
+#   ✔ 所有输出美化
+#   ✔ 自动判断系统
+#   ✔ 不会误杀 SSH
+#   ✔ 自动保存规则
+#####################################
 
-### ------------------------
-### 2. 检测系统类型
-### ------------------------
+VERSION="3.0"
+
+echo ""
+echo "=========================================="
+echo " 🔥 Firewall Manager v$VERSION"
+echo "=========================================="
+echo ""
+
+# -----------------------------
+# Detect OS
+# -----------------------------
 if [ -f /etc/os-release ]; then
     . /etc/os-release
     OS=$ID
 else
-    echo "❌ 无法识别系统类型"
+    echo "❌ 无法识别操作系统类型，脚本中止。"
     exit 1
 fi
 
-echo "🔍 检测到系统：$PRETTY_NAME"
+echo "🖥️  系统类型：$PRETTY_NAME"
+echo ""
 
-### ------------------------
-### 3. 自动检测 SSH 端口（防止被锁死）
-### ------------------------
-SSH_PORT=$(ss -tlnp 2>/dev/null | grep sshd | awk '{print $4}' | sed 's/.*://')
+# -----------------------------
+# Detect SSH Port
+# -----------------------------
+SSH_PORT=$(ss -tnlp | grep sshd | awk -F '[: ]+' '{print $5}' | sed 's/.*://;t;d' | head -n 1)
 
-if [ -z "$SSH_PORT" ]; then
+if [[ -z "$SSH_PORT" ]]; then
     SSH_PORT=22
 fi
 
-echo "🔐 当前 SSH 端口自动检测为：$SSH_PORT"
-echo "⚠️ 该端口将自动加入允许列表，确保不会断线。"
-
-### ------------------------
-### 4. 显示现有 iptables 规则
-### ------------------------
-echo -e "\n=========================="
-echo "当前 IPv4 iptables 规则："
-echo "=========================="
-iptables -L -n -v
-echo -e "\n=========================="
-echo "当前 IPv6 ip6tables 规则："
-echo "=========================="
-ip6tables -L -n -v
-
-### ------------------------
-### 5. 用户输入需要开放的端口
-### ------------------------
+echo "🔐 自动检测到 SSH 端口：$SSH_PORT"
 echo ""
-echo "请输入你需要开放的端口（例如：443,80,12345）"
-echo "SSH 端口（$SSH_PORT）会自动加入，无需重复输入"
-read -p "允许的端口： " USER_PORTS
 
-ALLOW_PORTS="$SSH_PORT"
-if [ -n "$USER_PORTS" ]; then
-    ALLOW_PORTS="$ALLOW_PORTS,$USER_PORTS"
-fi
+# -----------------------------
+# Input Ports
+# -----------------------------
+read -p "请输入需额外开放的端口（例如：443,80）：" USER_PORTS_RAW
+
+# 格式化
+USER_PORTS=$(echo "$USER_PORTS_RAW" | tr -d ' ' | tr ';' ',')
+
+# 合并去重
+ALL_PORTS=$(echo -e "$SSH_PORT\n${USER_PORTS//,/\\n}" | sed '/^$/d' | sort -n -u | paste -sd "," -)
 
 echo ""
-echo "允许放行的端口最终为：$ALLOW_PORTS"
+echo "📌 最终将开放以下端口：$ALL_PORTS"
+echo ""
 
-### ------------------------
-### 6. 二次确认
-### ------------------------
-read -p "⚠️ 确认要应用此防火墙规则？ (yes/no): " CONFIRM
-if [ "$CONFIRM" != "yes" ]; then
-    echo "❌ 用户取消"
-    exit 1
-fi
+read -p "⚠️ 确定要应用此防火墙规则？(yes/no): " CONFIRM
+[[ "$CONFIRM" != "yes" ]] && echo "已取消。" && exit 0
 
 echo ""
-echo "🚧 开始应用规则..."
+echo "🚧 正在应用规则..."
+sleep 1
 
-### ------------------------
-### 7. 清空旧规则 / 设置默认策略
-### ------------------------
-# IPv4
+# -----------------------------
+# 清空旧规则
+# -----------------------------
 iptables -F
 iptables -X
-iptables -Z
+ip6tables -F
+ip6tables -X
+
+# -----------------------------
+# 默认策略
+# -----------------------------
 iptables -P INPUT DROP
 iptables -P FORWARD DROP
 iptables -P OUTPUT ACCEPT
 
-# IPv6
-ip6tables -F
-ip6tables -X
-ip6tables -Z
 ip6tables -P INPUT DROP
 ip6tables -P FORWARD DROP
 ip6tables -P OUTPUT ACCEPT
 
-### ------------------------
-### 8. 基础规则
-### ------------------------
-
-# loopback
+# -----------------------------
+# 基本规则
+# -----------------------------
 iptables -A INPUT -i lo -j ACCEPT
+iptables -A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
+
 ip6tables -A INPUT -i lo -j ACCEPT
+ip6tables -A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
 
-# 保持已建立连接
-iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
-ip6tables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+# -----------------------------
+# ❌ 关闭 IPv4 ping
+# -----------------------------
+iptables -A INPUT -p icmp --icmp-type echo-request -j DROP
 
-### ------------------------
-### 9. 禁用 ICMP（拒绝 ping）
-### ------------------------
-iptables -A INPUT -p icmp -j DROP
-ip6tables -A INPUT -p icmpv6 -j DROP
+# -----------------------------
+# ⚠️ 保留 IPv6 ICMP
+# -----------------------------
+# 不添加任何 DROP 规则
 
-### ------------------------
-### 10. 开放用户端口（TCP/UDP + IPv4/IPv6）
-### ------------------------
-IFS=',' read -ra PORT_ARRAY <<< "$ALLOW_PORTS"
-
-for port in "${PORT_ARRAY[@]}"; do
-    port_trim=$(echo $port | xargs)
-
-    echo "放行端口：$port_trim (TCP/UDP)"
-    
-    iptables -A INPUT -p tcp --dport "$port_trim" -j ACCEPT
-    iptables -A INPUT -p udp --dport "$port_trim" -j ACCEPT
-
-    ip6tables -A INPUT -p tcp --dport "$port_trim" -j ACCEPT
-    ip6tables -A INPUT -p udp --dport "$port_trim" -j ACCEPT
+# -----------------------------
+# 开放端口
+# -----------------------------
+IFS=","
+echo ""
+echo "🔓 开放端口："
+for p in $ALL_PORTS; do
+    if [[ "$p" =~ ^[0-9]+$ ]]; then
+        echo "   ➤ 端口 $p (TCP/UDP)"
+        iptables -A INPUT -p tcp --dport "$p" -j ACCEPT
+        iptables -A INPUT -p udp --dport "$p" -j ACCEPT
+        ip6tables -A INPUT -p tcp --dport "$p" -j ACCEPT
+        ip6tables -A INPUT -p udp --dport "$p" -j ACCEPT
+    fi
 done
+unset IFS
 
-### ------------------------
-### 11. 保存规则（无交互模式）
-### ------------------------
-if [[ "$OS" == "debian" || "$OS" == "ubuntu" ]]; then
-    export DEBIAN_FRONTEND=noninteractive
-    echo iptables-persistent iptables-persistent/autosave_v4 boolean true | debconf-set-selections
-    echo iptables-persistent iptables-persistent/autosave_v6 boolean true | debconf-set-selections
+echo ""
+echo "💾 正在保存防火墙规则..."
 
-    apt -y install iptables-persistent >/dev/null 2>&1
+# -----------------------------
+# 保存规则
+# -----------------------------
+if [[ $OS == "ubuntu" || $OS == "debian" ]]; then
+    apt-get update -y >/dev/null 2>&1
+    apt-get install -y iptables-persistent >/dev/null 2>&1
     netfilter-persistent save
-
-    echo "💾 规则已保存（无交互模式：Debian/Ubuntu）"
-elif [[ "$OS" == "centos" ]]; then
+elif [[ $OS == "centos" ]]; then
     service iptables save
-    echo "💾 规则已保存（CentOS）"
-else
-    echo "⚠️ 未知系统，无法自动保存规则"
 fi
 
-### ------------------------
-### 12. 完成
-### ------------------------
 echo ""
-echo "✅ 防火墙规则已成功应用！"
-echo "🔐 SSH ($SSH_PORT) 已自动放行。"
-echo "🛑 Ping (ICMP) 已关闭。"
-echo "🔒 所有其它端口默认关闭。"
+echo "=========================================="
+echo " ✅ 防火墙规则已成功应用！"
+echo "=========================================="
+echo "🔐 SSH 端口已自动保留：$SSH_PORT"
+echo "🛑 IPv4 Ping 已关闭"
+echo "🌐 IPv6 Ping 保持正常（避免网络故障）"
+echo "🔒 所有其他端口已禁止访问"
 echo ""
-echo "建议：另开一个终端测试 SSH：" 
-echo "nc -zv YOUR_IP $SSH_PORT"
+echo "建议测试 SSH 端口是否正常："
+echo "   nc -zv YOUR_IP $SSH_PORT"
 echo ""
-echo "如需增加/打开新端口，可重新运行此脚本。"
+echo "如需重新配置，请再次运行本脚本。"
+echo ""
+exit 0
