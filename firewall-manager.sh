@@ -1,183 +1,156 @@
 #!/bin/bash
-# ufw-manager.sh
-# ufw 专用防火墙管理器 v1.4
-# 自动保持 SSH 开放，简化交互，端口操作稳定
-# 更新时间：2025-11-07
+# 自动安全防火墙配置脚本
+# 适配 Debian / Ubuntu / CentOS
+# 作者：ChatGPT（安全版）
 
-# 检查 root
+### ------------------------
+### 1. 检查 root 权限
+### ------------------------
 if [ "$EUID" -ne 0 ]; then
-  echo "❌ 请使用 root 权限运行"
-  exit 1
+    echo "❌ 请使用 root 执行该脚本"
+    exit 1
 fi
 
-FW_VERSION="v1.4"
+### ------------------------
+### 2. 检测系统类型
+### ------------------------
+if [ -f /etc/os-release ]; then
+    . /etc/os-release
+    OS=$ID
+else
+    echo "❌ 无法识别系统类型"
+    exit 1
+fi
 
-# 获取当前 SSH 端口
-SSH_PORT=$(ss -tlnp | grep sshd | awk '{print $4}' | awk -F: '{print $NF}' | head -n1)
-[ -z "$SSH_PORT" ] && SSH_PORT=22
-echo "🔹 当前 SSH 端口：$SSH_PORT"
+echo "🔍 检测到系统：$PRETTY_NAME"
 
-# 安装/启用 ufw
-setup_ufw() {
-  if ! command -v ufw >/dev/null 2>&1; then
-    echo "⚠️ 系统未安装 ufw，正在安装..."
-    apt update && apt install -y ufw
-  fi
-  ufw --force enable
-  ufw allow "$SSH_PORT"/tcp
-  echo "✅ ufw 已启用，SSH 端口 $SSH_PORT 保证开放"
-}
+### ------------------------
+### 3. 检测当前 SSH 端口（避免锁死）
+### ------------------------
+SSH_PORT=$(ss -tlnp | grep sshd | awk '{print $4}' | sed 's/.*://')
 
-# 显示 ufw 状态
-show_status() {
-  echo "=================================="
-  echo "🧭 ufw 防火墙管理器 - $FW_VERSION"
-  echo "=================================="
-  ufw status verbose
-  echo "=================================="
-}
+if [ -z "$SSH_PORT" ]; then
+    SSH_PORT=22
+fi
 
-# 协议选择
-choose_proto() {
-  echo
-  echo "请选择协议类型："
-  echo "1) TCP"
-  echo "2) UDP"
-  echo "3) TCP + UDP"
-  read -p "输入编号 (1/2/3): " proto_choice
-  case $proto_choice in
-    1) proto="tcp" ;;
-    2) proto="udp" ;;
-    3) proto="both" ;;
-    *) echo "❌ 输入无效，默认 TCP"; proto="tcp" ;;
-  esac
-  echo "$proto"
-}
+echo "🔐 当前 SSH 端口自动检测为：$SSH_PORT"
+echo "⚠️ 该端口将自动加入放行列表，确保不会断线。"
 
-# 添加端口
-add_port() {
-  local port=$1
-  local proto=$2
-  [[ "$proto" == "both" ]] && proto_list=("tcp" "udp") || proto_list=("$proto")
-  for p in "${proto_list[@]}"; do
-    if ! ufw status | grep -qw "$port/$p"; then
-      ufw allow "$port/$p"
-      echo "✅ 已允许 $p 端口 $port"
-    else
-      echo "⚠️ $p 端口 $port 已存在规则，跳过"
-    fi
-  done
-  ufw allow "$SSH_PORT"/tcp
-}
+### ------------------------
+### 4. 显示当前防火墙规则
+### ------------------------
+echo -e "\n=========================="
+echo "当前 IPv4 iptables 规则："
+echo "=========================="
+iptables -L -n -v
+echo -e "\n=========================="
+echo "当前 IPv6 ip6tables 规则："
+echo "=========================="
+ip6tables -L -n -v
 
-# 禁止端口
-deny_port() {
-  local port=$1
-  local proto=$2
-  [[ "$proto" == "both" ]] && proto_list=("tcp" "udp") || proto_list=("$proto")
-  for p in "${proto_list[@]}"; do
-    if [ "$port" == "$SSH_PORT" ] && [ "$p" == "tcp" ]; then
-      echo "⚠️ 避免禁止 SSH 端口 $SSH_PORT"
-      continue
-    fi
-    if ! ufw status | grep -qw "$port/$p"; then
-      ufw deny "$port/$p"
-      echo "🚫 已禁止 $p 端口 $port"
-    else
-      echo "⚠️ $p 端口 $port 已存在允许规则，禁止成功"
-    fi
-  done
-  ufw allow "$SSH_PORT"/tcp
-}
+### ------------------------
+### 5. 让用户输入需要放行的端口
+### ------------------------
+echo ""
+echo "请输入你需要开放的端口（例如：443,80,12345）"
+echo "SSH 端口（$SSH_PORT）会自动加入，无需重复输入"
+read -p "允许的端口： " USER_PORTS
 
-# 删除端口
-delete_port() {
-  local port=$1
-  local proto=$2
-  [[ "$proto" == "both" ]] && proto_list=("tcp" "udp") || proto_list=("$proto")
-  for p in "${proto_list[@]}"; do
-    if [ "$port" == "$SSH_PORT" ] && [ "$p" == "tcp" ]; then
-      echo "⚠️ 避免删除 SSH 端口 $SSH_PORT 规则"
-      continue
-    fi
-    while true; do
-      mapfile -t nums < <(ufw status numbered | grep "$port/$p" | awk -F'[][]' '{print $2}' | sort -r)
-      [ ${#nums[@]} -eq 0 ] && break
-      for num in "${nums[@]}"; do
-        ufw --force delete "$num"
-        echo "🧹 已删除 $p 端口 $port (规则编号 $num)"
-      done
-    done
-  done
-  ufw allow "$SSH_PORT"/tcp
-}
+# 合并端口列表
+ALLOW_PORTS="$SSH_PORT"
+if [ -n "$USER_PORTS" ]; then
+    ALLOW_PORTS="$ALLOW_PORTS,$USER_PORTS"
+fi
 
-# 开启/关闭防火墙
-toggle_firewall() {
-  local action=$1
-  if [ "$action" == "on" ]; then
-    ufw --force enable
-    echo "✅ 防火墙已开启"
-  else
-    ufw --force disable
-    echo "⚠️ 防火墙已关闭"
-    ufw allow "$SSH_PORT"/tcp
-  fi
-}
+echo ""
+echo "允许放行的端口最终为：$ALLOW_PORTS"
 
-# 保存规则
-save_rules() {
-  ufw reload
-  echo "✅ ufw 规则已重新加载"
-}
+### ------------------------
+### 6. 二次确认
+### ------------------------
+read -p "⚠️ 确认要应用此防火墙规则？ (yes/no): " CONFIRM
+if [ "$CONFIRM" != "yes" ]; then
+    echo "❌ 用户取消"
+    exit 1
+fi
 
-# 主菜单
-main_menu() {
-  setup_ufw
-  show_status
+echo ""
+echo "🚧 开始应用规则..."
 
-  echo
-  echo "=============================="
-  echo "🔥 ufw 防火墙管理菜单"
-  echo "=============================="
-  echo "1) 查看端口规则"
-  echo "2) 开启防火墙"
-  echo "3) 关闭防火墙"
-  echo "4) 添加允许端口"
-  echo "5) 添加禁止端口"
-  echo "6) 删除端口规则"
-  echo "7) 保存规则"
-  echo "8) 退出"
-  echo "=============================="
+### ------------------------
+### 7. 清空旧规则 / 设置默认策略
+### ------------------------
 
-  read -p "请选择操作编号: " choice
-  case $choice in
-    1) show_status ;;
-    2) toggle_firewall on ;;
-    3) toggle_firewall off ;;
-    4)
-      read -p "请输入端口号: " port
-      proto=$(choose_proto)
-      add_port "$port" "$proto"
-      ;;
-    5)
-      read -p "请输入端口号: " port
-      proto=$(choose_proto)
-      deny_port "$port" "$proto"
-      ;;
-    6)
-      read -p "请输入端口号: " port
-      proto=$(choose_proto)
-      delete_port "$port" "$proto"
-      ;;
-    7) save_rules ;;
-    8) echo "👋 已退出"; exit 0 ;;
-    *) echo "❌ 无效选项" ;;
-  esac
+# IPv4
+iptables -F
+iptables -X
+iptables -Z
+iptables -P INPUT DROP
+iptables -P FORWARD DROP
+iptables -P OUTPUT ACCEPT
 
-  echo
-  read -p "是否返回主菜单？(y/n): " again
-  [ "$again" = "y" ] && main_menu || echo "✅ 操作完成。"
-}
+# IPv6
+ip6tables -F
+ip6tables -X
+ip6tables -Z
+ip6tables -P INPUT DROP
+ip6tables -P FORWARD DROP
+ip6tables -P OUTPUT ACCEPT
 
-main_menu
+### ------------------------
+### 8. 通用放行规则
+### ------------------------
+
+# loopback
+iptables -A INPUT -i lo -j ACCEPT
+ip6tables -A INPUT -i lo -j ACCEPT
+
+# 已建立连接
+iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+ip6tables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+
+### ------------------------
+### 9. 禁用 ICMP（禁止 ping）
+### ------------------------
+iptables -A INPUT -p icmp -j DROP
+ip6tables -A INPUT -p icmpv6 -j DROP
+
+### ------------------------
+### 10. 开放用户端口（IPv4 + IPv6）
+### ------------------------
+IFS=',' read -ra PORT_ARRAY <<< "$ALLOW_PORTS"
+
+for port in "${PORT_ARRAY[@]}"; do
+    port_trim=$(echo $port | xargs)
+
+    echo "放行端口：$port_trim (TCP/UDP)"
+    iptables -A INPUT -p tcp --dport "$port_trim" -j ACCEPT
+    iptables -A INPUT -p udp --dport "$port_trim" -j ACCEPT
+
+    ip6tables -A INPUT -p tcp --dport "$port_trim" -j ACCEPT
+    ip6tables -A INPUT -p udp --dport "$port_trim" -j ACCEPT
+done
+
+### ------------------------
+### 11. 保存规则
+### ------------------------
+if [[ "$OS" == "debian" || "$OS" == "ubuntu" ]]; then
+    apt install -y iptables-persistent >/dev/null 2>&1
+    netfilter-persistent save
+    echo "💾 规则已保存（Debian/Ubuntu）"
+elif [[ "$OS" == "centos" ]]; then
+    service iptables save
+    echo "💾 规则已保存（CentOS）"
+else
+    echo "⚠️ 未知系统，未保存规则，请手动保存！"
+fi
+
+echo ""
+echo "✅ 防火墙规则已成功应用！当前开放端口：$ALLOW_PORTS"
+echo "🔐 SSH ($SSH_PORT) 已自动保护，不会断线。"
+echo "🛑 Ping (ICMP) 已关闭。"
+echo ""
+echo "建议你另外开一个终端测试："
+echo "nc -zv YOUR_IP $SSH_PORT"
+echo ""
+echo "如需退回默认规则，可随时找我。"
