@@ -2,17 +2,18 @@
 set -e
 
 #####################################
-# Firewall Manager v4.0
+# Firewall Manager v5.0
 # 作者：ChatGPT
 # 功能：
 #   ✔ 自动检测 SSH 端口（sshd_config 优先）
 #   ✔ 用户自定义开放端口
-#   ✔ IPv4 ping 关闭，IPv6 ping 保留
+#   ✔ IPv4 ping 开放
+#   ✔ SSH TCP 端口只开放 TCP
 #   ✔ 屏幕输出美观
 #   ✔ 自动保存规则
 #####################################
 
-VERSION="4.0"
+VERSION="5.0"
 
 echo ""
 echo "=========================================="
@@ -38,22 +39,17 @@ echo ""
 # Reliable SSH Port Detection
 # -----------------------------
 detect_ssh_port() {
-    # 1. 主配置
     CFG_PORT=$(grep -Ei "^Port[[:space:]]+[0-9]+" /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' | head -n1)
 
-    # 2. 配置目录
     if [[ -z "$CFG_PORT" && -d /etc/ssh/sshd_config.d ]]; then
         CFG_PORT=$(grep -Er "^Port[[:space:]]+[0-9]+" /etc/ssh/sshd_config.d/ 2>/dev/null | awk '{print $2}' | head -n1)
     fi
 
-    # 3. fallback ss
     if [[ -z "$CFG_PORT" ]]; then
         CFG_PORT=$(ss -tnlp 2>/dev/null | grep sshd | awk -F '[: ]+' '{print $5}' | sed 's/.*://;t;d' | grep -E "^[0-9]+$" | head -n1)
     fi
 
-    # 4. 最终兜底
     [[ -z "$CFG_PORT" ]] && CFG_PORT=22
-
     echo "$CFG_PORT"
 }
 
@@ -65,10 +61,8 @@ echo ""
 # User Input for Extra Ports
 # -----------------------------
 read -p "请输入需额外开放的端口（多个用逗号或分号，如: 443,80）：" USER_PORTS_RAW
-
 USER_PORTS=$(echo "$USER_PORTS_RAW" | tr -d ' ' | tr ';' ',')
 
-# 合并去重
 ALL_PORTS=$(echo -e "$SSH_PORT\n${USER_PORTS//,/\\n}" | sed '/^$/d' | sort -n -u | paste -sd "," -)
 
 echo ""
@@ -107,7 +101,6 @@ ip6tables -P OUTPUT ACCEPT
 # -----------------------------
 # Basic Rules
 # -----------------------------
-# Loopback & Established
 iptables -A INPUT -i lo -j ACCEPT
 iptables -A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
 
@@ -115,13 +108,9 @@ ip6tables -A INPUT -i lo -j ACCEPT
 ip6tables -A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
 
 # -----------------------------
-# Close IPv4 ping
+# IPv4 ping 开放
 # -----------------------------
-iptables -A INPUT -p icmp --icmp-type echo-request -j DROP
-
-# IPv6 ping 保留
-# -----------------------------
-# 不关闭 ICMPv6
+iptables -A INPUT -p icmp --icmp-type echo-request -j ACCEPT
 
 # -----------------------------
 # Open Ports
@@ -131,11 +120,18 @@ echo ""
 echo "🔓 开放端口："
 for p in $ALL_PORTS; do
     if [[ "$p" =~ ^[0-9]+$ ]]; then
-        echo "   ➤ 端口 $p (TCP/UDP)"
-        iptables -A INPUT -p tcp --dport "$p" -j ACCEPT
-        iptables -A INPUT -p udp --dport "$p" -j ACCEPT
-        ip6tables -A INPUT -p tcp --dport "$p" -j ACCEPT
-        ip6tables -A INPUT -p udp --dport "$p" -j ACCEPT
+        echo -n "   ➤ 端口 $p ("
+        if [[ "$p" == "$SSH_PORT" ]]; then
+            echo "TCP)"
+            iptables -A INPUT -p tcp --dport "$p" -j ACCEPT
+            ip6tables -A INPUT -p tcp --dport "$p" -j ACCEPT
+        else
+            echo "TCP/UDP)"
+            iptables -A INPUT -p tcp --dport "$p" -j ACCEPT
+            iptables -A INPUT -p udp --dport "$p" -j ACCEPT
+            ip6tables -A INPUT -p tcp --dport "$p" -j ACCEPT
+            ip6tables -A INPUT -p udp --dport "$p" -j ACCEPT
+        fi
     fi
 done
 unset IFS
@@ -145,7 +141,6 @@ unset IFS
 # -----------------------------
 echo ""
 echo "💾 保存防火墙规则..."
-
 if [[ $OS == "ubuntu" || $OS == "debian" ]]; then
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -y >/dev/null 2>&1
@@ -159,8 +154,8 @@ echo ""
 echo "=========================================="
 echo " ✅ 防火墙规则已成功应用！"
 echo "=========================================="
-echo "🔐 SSH 端口已保留：$SSH_PORT"
-echo "🛑 IPv4 Ping 已关闭"
+echo "🔐 SSH 端口已保留：$SSH_PORT (仅 TCP)"
+echo "🌐 IPv4 Ping 已开放"
 echo "🌐 IPv6 Ping 保持正常"
 echo "🔒 其他所有端口默认关闭"
 echo ""
