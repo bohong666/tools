@@ -2,18 +2,19 @@
 set -e
 
 #####################################
-# Firewall Manager v5.0
+# Firewall Manager v5.1
 # 作者：ChatGPT
 # 功能：
 #   ✔ 自动检测 SSH 端口（sshd_config 优先）
 #   ✔ 用户自定义开放端口
-#   ✔ IPv4 ping 开放
+#   ✔ IPv4 ping 可选
+#   ✔ IPv6 节点可用（必需 ICMPv6 放行）
 #   ✔ SSH TCP 端口只开放 TCP
 #   ✔ 屏幕输出美观
 #   ✔ 自动保存规则
 #####################################
 
-VERSION="5.0"
+VERSION="5.1"
 
 echo ""
 echo "=========================================="
@@ -36,19 +37,16 @@ echo "🖥️  系统类型：$PRETTY_NAME"
 echo ""
 
 # -----------------------------
-# Reliable SSH Port Detection
+# Detect SSH port
 # -----------------------------
 detect_ssh_port() {
     CFG_PORT=$(grep -Ei "^Port[[:space:]]+[0-9]+" /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' | head -n1)
-
     if [[ -z "$CFG_PORT" && -d /etc/ssh/sshd_config.d ]]; then
         CFG_PORT=$(grep -Er "^Port[[:space:]]+[0-9]+" /etc/ssh/sshd_config.d/ 2>/dev/null | awk '{print $2}' | head -n1)
     fi
-
     if [[ -z "$CFG_PORT" ]]; then
         CFG_PORT=$(ss -tnlp 2>/dev/null | grep sshd | awk -F '[: ]+' '{print $5}' | sed 's/.*://;t;d' | grep -E "^[0-9]+$" | head -n1)
     fi
-
     [[ -z "$CFG_PORT" ]] && CFG_PORT=22
     echo "$CFG_PORT"
 }
@@ -58,7 +56,7 @@ echo "🔐 检测到 SSH 端口：$SSH_PORT"
 echo ""
 
 # -----------------------------
-# User Input for Extra Ports
+# User input for additional ports
 # -----------------------------
 read -p "请输入需额外开放的端口（多个用逗号或分号，如: 443,80）：" USER_PORTS_RAW
 USER_PORTS=$(echo "$USER_PORTS_RAW" | tr -d ' ' | tr ';' ',')
@@ -79,13 +77,8 @@ sleep 1
 # -----------------------------
 # Flush Existing Rules
 # -----------------------------
-iptables -F
-iptables -X
-iptables -Z
-
-ip6tables -F
-ip6tables -X
-ip6tables -Z
+iptables -F; iptables -X; iptables -Z
+ip6tables -F; ip6tables -X; ip6tables -Z
 
 # -----------------------------
 # Default Policies
@@ -108,9 +101,23 @@ ip6tables -A INPUT -i lo -j ACCEPT
 ip6tables -A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
 
 # -----------------------------
-# IPv4 ping 开放
+# IPv4 ping (echo-request) 可选
 # -----------------------------
-iptables -A INPUT -p icmp --icmp-type echo-request -j ACCEPT
+read -p "是否允许 IPv4 Ping？(yes/no, 默认 yes): " PING_CONFIRM
+[[ "$PING_CONFIRM" == "" ]] && PING_CONFIRM="yes"
+if [[ "$PING_CONFIRM" == "yes" ]]; then
+    iptables -A INPUT -p icmp --icmp-type echo-request -j ACCEPT
+    PING_STATUS="已开放"
+else
+    PING_STATUS="已关闭"
+fi
+
+# -----------------------------
+# IPv6 必需 ICMPv6 放行
+# -----------------------------
+for t in destination-unreachable packet-too-big time-exceeded echo-request neighbor-solicitation neighbor-advertisement router-solicitation router-advertisement; do
+    ip6tables -A INPUT -p icmpv6 --icmpv6-type $t -j ACCEPT
+done
 
 # -----------------------------
 # Open Ports
@@ -150,18 +157,24 @@ elif [[ $OS == "centos" ]]; then
     service iptables save
 fi
 
+# -----------------------------
+# Finish
+# -----------------------------
 echo ""
 echo "=========================================="
 echo " ✅ 防火墙规则已成功应用！"
 echo "=========================================="
 echo "🔐 SSH 端口已保留：$SSH_PORT (仅 TCP)"
-echo "🌐 IPv4 Ping 已开放"
-echo "🌐 IPv6 Ping 保持正常"
+echo "🌐 IPv4 Ping：$PING_STATUS"
+echo "🌐 IPv6 节点可用（ICMPv6 已放行）"
 echo "🔒 其他所有端口默认关闭"
 echo ""
-echo "建议测试 SSH 端口是否可用："
-echo "   nc -zv YOUR_IP $SSH_PORT"
+echo "建议测试端口："
+echo "   nc -zv YOUR_IP $SSH_PORT  # SSH"
+for p in $USER_PORTS_RAW; do
+    [[ "$p" =~ ^[0-9]+$ ]] && echo "   nc -zv YOUR_IP $p  # 自定义端口"
+done
 echo ""
-echo "如需重新配置，请再次运行本脚本。"
+echo "如需重新配置，请再次运行此脚本。"
 echo ""
 exit 0
