@@ -4,7 +4,7 @@
 # Ubuntu Xray VLESS+Reality+Vision 配置脚本
 # 版本: v2.0.3
 # 更新日期: 2024-12-11
-# 修复: 适配新版Xray密钥输出格式
+# 作者:hogue
 # ============================================
 
 SCRIPT_VERSION="v2.0.3"
@@ -536,8 +536,8 @@ fi
 echo ""
 log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 log_info "配置完成！建议步骤："
-echo "1. 复制上方的VLESS URI到客户端"
-echo "2. 或使用 /root/clash_config.yaml 导入Clash"
+echo "1. 继续优化防火墙 bash <(curl -fsSL https://raw.githubusercontent.com/bohong666/tools/refs/heads/main/firewall-manager.sh)"
+echo "2. 通过 https://omnitt.com 进行 tcp 调优"
 echo "3. 连接后访问 https://www.google.com 测试"
 echo "4. 查看日志: journalctl -u xray -f"
 log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
