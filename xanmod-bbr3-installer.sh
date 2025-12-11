@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
 # =========================================================
 # BBR Manager 网络栈管理工具
-# Version: 1.2.0
+# Version: 1.3.0
 # Author: ChatGPT
 # =========================================================
 
 set -e
 
-SCRIPT_VERSION="1.2.0"
+SCRIPT_VERSION="1.3.0"
 BACKUP_DIR="/etc/bbr-manager"
 BACKUP_FILE="$BACKUP_DIR/backup.json"
 BACKUP_CONF="$BACKUP_DIR/backup.conf"
 
 # ---------------------------------------------------------
-# Color
+# Colors
 # ---------------------------------------------------------
 RED="\e[31m"
 GREEN="\e[32m"
@@ -30,7 +30,7 @@ RESET="\e[0m"
 mkdir -p "$BACKUP_DIR"
 
 # ---------------------------------------------------------
-# Detect System Status
+# Detect system status
 # ---------------------------------------------------------
 detect_status() {
     CURRENT_KERNEL=$(uname -r)
@@ -59,11 +59,10 @@ detect_status() {
 }
 
 # ---------------------------------------------------------
-# Backup Current State
+# Backup
 # ---------------------------------------------------------
 backup_state() {
     echo -e "${YELLOW}正在备份当前系统状态...${RESET}"
-
     cat > "$BACKUP_FILE" <<EOF
 {
   "kernel": "$(uname -r)",
@@ -71,85 +70,69 @@ backup_state() {
   "qdisc": "$(sysctl net.core.default_qdisc | awk '{print $3}')"
 }
 EOF
-
     echo "KERNEL=$(uname -r)" > "$BACKUP_CONF"
     echo "CC=$(sysctl net.ipv4.tcp_congestion_control | awk '{print $3}')" >> "$BACKUP_CONF"
     echo "QDISC=$(sysctl net.core.default_qdisc | awk '{print $3}')" >> "$BACKUP_CONF"
-
     echo -e "${GREEN}备份完成：$BACKUP_FILE${RESET}\n"
 }
 
 # ---------------------------------------------------------
-# Restore Backup
+# Restore
 # ---------------------------------------------------------
 restore_backup() {
     [[ ! -f "$BACKUP_CONF" ]] && echo -e "${RED}没有找到备份文件！${RESET}" && return
-
     echo -e "${YELLOW}加载备份...${RESET}"
     source "$BACKUP_CONF"
-
     echo -e "${GREEN}恢复拥塞控制算法: $CC${RESET}"
     sysctl -w net.ipv4.tcp_congestion_control="$CC" >/dev/null
-
     echo -e "${GREEN}恢复队列调度算法: $QDISC${RESET}"
     sysctl -w net.core.default_qdisc="$QDISC" >/dev/null
-
     echo -e "${GREEN}恢复内核包信息: $KERNEL${RESET}"
     echo -e "${CYAN}恢复完成，建议重启系统${RESET}"
 }
 
 # ---------------------------------------------------------
-# Add XanMod Repo & Install
+# Install XanMod Mainline
 # ---------------------------------------------------------
 install_xanmod() {
     echo -e "${YELLOW}正在添加 XanMod 仓库...${RESET}"
-
     curl -fsSL https://dl.xanmod.org/gpg.key \
         | gpg --dearmor \
         | tee /usr/share/keyrings/xanmod.gpg >/dev/null
-
     echo "deb [signed-by=/usr/share/keyrings/xanmod.gpg] http://deb.xanmod.org releases main" \
         > /etc/apt/sources.list.d/xanmod.list
-
     apt-get update -y
 
-    PACKAGE_NAME=$(apt-cache search linux-xanmod | grep -E 'linux-xanmod(-lts|-mainline)?' | awk '{print $1}' | head -n1)
-
+    PACKAGE_NAME=$(apt-cache search linux-xanmod-mainline | awk '{print $1}' | head -n1)
     if [[ -z "$PACKAGE_NAME" ]]; then
-        echo -e "${RED}未找到可安装的 XanMod 内核包，请确认仓库是否支持当前 Ubuntu 版本${RESET}"
+        echo -e "${RED}未找到可安装的 XanMod Mainline 内核包，请确认仓库支持当前 Ubuntu${RESET}"
         return
     fi
-
     echo -e "${GREEN}找到可安装包: $PACKAGE_NAME${RESET}"
     apt-get install -y "$PACKAGE_NAME"
-
-    echo -e "${GREEN}XanMod 内核安装完成，请重启系统${RESET}"
+    echo -e "${GREEN}XanMod Mainline 内核安装完成，请重启系统${RESET}"
 }
 
 # ---------------------------------------------------------
 # Choose CC & QDISC
 # ---------------------------------------------------------
 select_cc_and_qdisc() {
-    echo -e "${CYAN}可用拥塞控制算法:${RESET}"
     AVAILABLE_CC=$(sysctl net.ipv4.tcp_available_congestion_control | awk -F'= ' '{print $2}')
     CC_LIST="$AVAILABLE_CC"
     [[ $BBR3_AVAILABLE -eq 1 ]] && CC_LIST="$CC_LIST bbr3"
+    echo -e "${CYAN}可用拥塞控制算法:${RESET}"
     echo "$CC_LIST"
 
-    echo -e "\n${CYAN}可用队列算法:${RESET}"
-    echo -e "常见: fq, fq_codel, cake"
-
-    echo -e "\n${YELLOW}请输入要使用的拥塞算法 (如 bbr, bbr3, cubic): ${RESET}"
+    echo -e "\n${YELLOW}请输入要使用的拥塞算法: ${RESET}"
     read -r CC_CHOICE
 
-    # 如果选择 bbr3，加载模块
     if [[ "$CC_CHOICE" == "bbr3" ]]; then
         if [[ $BBR3_AVAILABLE -eq 1 ]]; then
             modprobe tcp_bbr3
             sysctl -w net.ipv4.tcp_congestion_control=bbr3
             echo -e "${GREEN}已切换到 BBRv3${RESET}"
         else
-            echo -e "${RED}当前内核不支持 BBRv3${RESET}"
+            echo -e "${RED}当前内核不支持 BBRv3，请安装 Mainline 内核${RESET}"
             return
         fi
     else
@@ -158,20 +141,17 @@ select_cc_and_qdisc() {
 
     echo -e "${YELLOW}请输入队列调度算法 (如 cake, fq, fq_codel): ${RESET}"
     read -r QDISC
-
     if [[ "$QDISC" == "cake" ]]; then
-        echo -e "${CYAN}启用 CAKE 需要输入带宽值 (可分别输入 VPS 和本地带宽)：${RESET}"
+        echo -e "${CYAN}启用 CAKE 需要输入带宽值 (可分别输入 VPS 和本地):${RESET}"
         echo -e "${YELLOW}本地带宽 (例如 100mbit):${RESET}"
         read -r LOCAL_BW
         echo -e "${YELLOW}VPS 带宽 (例如 100mbit):${RESET}"
         read -r VPS_BW
-
-        BW="$LOCAL_BW"  # 可以自定义逻辑
+        BW="$LOCAL_BW"
         tc qdisc replace dev eth0 root cake bandwidth "$BW"
     else
         sysctl -w net.core.default_qdisc="$QDISC"
     fi
-
     echo -e "${GREEN}算法切换完毕！${RESET}\n"
 }
 
@@ -180,7 +160,6 @@ select_cc_and_qdisc() {
 # ---------------------------------------------------------
 uninstall_xanmod() {
     echo -e "${YELLOW}正在卸载 XanMod 内核...${RESET}"
-
     PACKAGE_NAME=$(dpkg -l | grep linux-xanmod | awk '{print $2}')
     if [[ -n "$PACKAGE_NAME" ]]; then
         apt-get purge -y $PACKAGE_NAME
@@ -192,12 +171,11 @@ uninstall_xanmod() {
 }
 
 # ---------------------------------------------------------
-# Show /boot kernels
+# Show /boot
 # ---------------------------------------------------------
 show_kernels() {
     echo -e "${CYAN}/boot 内容:${RESET}"
     ls -l /boot
-
     echo -e "\n${CYAN}已安装内核包:${RESET}"
     dpkg --list | grep linux-image || true
 }
@@ -214,7 +192,7 @@ echo -e "${CYAN}======================================================${RESET}"
 detect_status
 
 echo -e "${YELLOW}请选择操作:${RESET}"
-echo -e " ${GREEN}1${RESET}) 安装 XanMod 内核"
+echo -e " ${GREEN}1${RESET}) 安装 XanMod Mainline 内核 (带 BBRv3)"
 echo -e " ${GREEN}2${RESET}) 切换 拥塞控制算法 & qdisc"
 echo -e " ${GREEN}3${RESET}) 卸载 XanMod"
 echo -e " ${GREEN}4${RESET}) 手动备份当前系统状态"
