@@ -1,31 +1,33 @@
 #!/usr/bin/env bash
-# deploy-xray-vless.sh
-# 完整 Xray VLESS 双栈部署脚本
-# Usage: bash deploy-xray-vless.sh [NodeName]
+# deploy-xray-vless-xtls.sh
+# 完整 Xray VLESS + XTLS 部署脚本，支持 Clash Party 导入节点
+# Usage: bash deploy-xray-vless-xtls.sh [NodeName]
 
 set -e
 
 NODE_NAME=${1:-VLESS-$(date +%m%d%H%M)}
 CONFIG_DIR="/usr/local/etc/xray"
 CONFIG_FILE="${CONFIG_DIR}/config.json"
+CLASH_FILE="/root/${NODE_NAME}-clash.yaml"
 
+XRAY_VERSION="v25.12.8"
+
+echo "=============================="
 echo "节点名称: $NODE_NAME"
+echo "Xray 版本: $XRAY_VERSION"
+echo "=============================="
 
-# 1. 更新系统并安装依赖
-echo "更新系统并安装依赖..."
+# 1. 系统更新和依赖
 apt update -y
 apt upgrade -y
 apt install -y curl wget unzip lsof qrencode sudo
 
 # 2. 启用 BBR
-echo "启用 BBR..."
 modprobe tcp_bbr || true
 sysctl -w net.core.default_qdisc=fq
 sysctl -w net.ipv4.tcp_congestion_control=bbr
 
 # 3. 安装 Xray
-echo "安装 Xray..."
-XRAY_VERSION="v25.12.8"
 TMP_DIR=$(mktemp -d)
 curl -L -o "$TMP_DIR/xray.zip" "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/Xray-linux-64.zip"
 unzip -o "$TMP_DIR/xray.zip" -d "$TMP_DIR"
@@ -42,11 +44,11 @@ mkdir -p "$CONFIG_DIR"
 UUID=$(cat /proc/sys/kernel/random/uuid)
 echo "生成 UUID: $UUID"
 
-# 6. 自动获取本机 IPv4 和 IPv6（只取 eth0 第一条）
+# 6. 获取 IPv4 和 IPv6
 IPV4=$(ip -4 addr show eth0 | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
 IPV6=$(ip -6 addr show eth0 | grep -oP '(?<=inet6\s)[\da-f:]+(?=/64)' | head -1)
 
-# 7. 写配置文件
+# 7. 配置 VLESS + XTLS
 cat > "$CONFIG_FILE" <<EOF
 {
   "log": {
@@ -59,25 +61,28 @@ cat > "$CONFIG_FILE" <<EOF
       "port": 443,
       "protocol": "vless",
       "settings": {
-        "clients": [{"id": "$UUID"}],
-        "decryption": "none"
+        "clients": [
+          {
+            "id": "$UUID",
+            "flow": "xtls-rprx-vision",
+            "encryption": "none",
+            "client-fingerprint": "firefox",
+            "short-id": "auto",
+            "public-key": ""
+          }
+        ],
+        "decryption": "none",
+        "fallbacks": [
+          {"dest": "www.drymt.com:443"}
+        ]
       },
       "streamSettings": {
         "network": "tcp",
-        "security": "tls"
-      }
-    },
-    {
-      "port": 443,
-      "protocol": "vless",
-      "listen": "::",
-      "settings": {
-        "clients": [{"id": "$UUID"}],
-        "decryption": "none"
-      },
-      "streamSettings": {
-        "network": "tcp",
-        "security": "tls"
+        "security": "xtls",
+        "xtlsSettings": {
+          "serverName": "www.drymt.com",
+          "alpn": ["h2","http/1.1"]
+        }
       }
     }
   ],
@@ -87,7 +92,7 @@ cat > "$CONFIG_FILE" <<EOF
 }
 EOF
 
-# 8. 创建 systemd 服务
+# 8. systemd 服务
 cat > /etc/systemd/system/xray.service <<EOF
 [Unit]
 Description=Xray Service
@@ -108,20 +113,33 @@ LimitNOFILE=1000000
 WantedBy=multi-user.target
 EOF
 
-# 9. 启用并启动服务
 systemctl daemon-reload
 systemctl enable xray
 systemctl restart xray
 
-# 10. 输出节点信息
-echo "=================================================="
-echo "Xray VLESS 部署完成！"
-echo "节点名称: $NODE_NAME"
+# 9. 生成 Clash Party YAML
+cat > "$CLASH_FILE" <<EOF
+proxies:
+  - name: "$NODE_NAME"
+    type: vless
+    server: $IPV4
+    port: 443
+    uuid: $UUID
+    tls: true
+    skip-cert-verify: false
+    network: tcp
+    encryption: none
+    flow: xtls-rprx-vision
+    client-fingerprint: firefox
+    servername: www.drymt.com
+    dest: www.drymt.com:443
+EOF
+
+# 输出信息
+echo "=============================="
+echo "Xray VLESS+XTLS 部署完成！"
 echo "UUID: $UUID"
-echo "IPv4 VLESS: vless://$UUID@$IPV4:443?encryption=none&security=tls#$NODE_NAME"
-if [ -n "$IPV6" ]; then
-    echo "IPv6 VLESS: vless://$UUID@[$IPV6]:443?encryption=none&security=tls#$NODE_NAME"
-fi
-echo "日志路径: /var/log/xray/"
-echo "配置路径: $CONFIG_FILE"
-echo "=================================================="
+echo "IPv4: $IPV4"
+echo "IPv6: $IPV6"
+echo "Clash Party YAML 文件: $CLASH_FILE"
+echo "=============================="
