@@ -2,11 +2,12 @@
 
 # ============================================
 # Ubuntu Xray VLESS+Reality+Vision 配置脚本
-# 版本: v2.0.1
+# 版本: v2.0.2
 # 更新日期: 2024-12-11
+# 修复: 密钥解析问题
 # ============================================
 
-SCRIPT_VERSION="v2.0.1"
+SCRIPT_VERSION="v2.0.2"
 
 set -e
 
@@ -119,12 +120,35 @@ log_info "生成密钥对和UUID..."
 # 生成UUID
 UUID=$(cat /proc/sys/kernel/random/uuid)
 
-# 生成X25519密钥对
-KEY_PAIR=$(/usr/local/bin/xray x25519)
-PRIVATE_KEY=$(echo "$KEY_PAIR" | grep "Private key:" | awk '{print $3}')
-PUBLIC_KEY=$(echo "$KEY_PAIR" | grep "Public key:" | awk '{print $3}')
+# 生成X25519密钥对并正确解析
+log_info "正在生成X25519密钥对..."
+KEY_OUTPUT=$(/usr/local/bin/xray x25519 2>&1)
+echo "$KEY_OUTPUT"
 
-# 生成short_id（8位十六进制，不是16位）
+# 更精确的解析方式
+PRIVATE_KEY=$(echo "$KEY_OUTPUT" | grep -i "private key" | sed 's/.*: //' | tr -d ' \n\r')
+PUBLIC_KEY=$(echo "$KEY_OUTPUT" | grep -i "public key" | sed 's/.*: //' | tr -d ' \n\r')
+
+# 验证密钥是否生成成功
+if [ -z "$PRIVATE_KEY" ] || [ -z "$PUBLIC_KEY" ]; then
+    log_error "密钥生成失败，尝试使用备用方法..."
+    # 备用方法：使用临时文件
+    /usr/local/bin/xray x25519 > /tmp/xray_keys.txt 2>&1
+    PRIVATE_KEY=$(grep -i "private key" /tmp/xray_keys.txt | awk -F': ' '{print $2}' | tr -d ' \n\r')
+    PUBLIC_KEY=$(grep -i "public key" /tmp/xray_keys.txt | awk -F': ' '{print $2}' | tr -d ' \n\r')
+    rm -f /tmp/xray_keys.txt
+fi
+
+# 最终验证
+if [ -z "$PRIVATE_KEY" ] || [ -z "$PUBLIC_KEY" ]; then
+    log_error "无法生成密钥对，请手动检查xray安装"
+    exit 1
+fi
+
+log_info "Private Key: $PRIVATE_KEY"
+log_info "Public Key: $PUBLIC_KEY"
+
+# 生成short_id（8位十六进制）
 SHORT_ID=$(openssl rand -hex 8)
 
 # 获取服务器IP地址
