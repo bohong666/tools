@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # =========================================================
 # BBR Manager 网络栈管理工具
-# Version: 1.1.0
+# Version: 1.2.0
 # Author: ChatGPT
 # =========================================================
 
 set -e
 
-SCRIPT_VERSION="1.1.0"
+SCRIPT_VERSION="1.2.0"
 BACKUP_DIR="/etc/bbr-manager"
 BACKUP_FILE="$BACKUP_DIR/backup.json"
 BACKUP_CONF="$BACKUP_DIR/backup.conf"
@@ -37,8 +37,14 @@ detect_status() {
     CC=$(sysctl net.ipv4.tcp_congestion_control | awk '{print $3}')
     QDISC=$(sysctl net.core.default_qdisc | awk '{print $3}')
 
-    BBR_VER="未知"
-    modprobe tcp_bbr3 &>/dev/null && BBR_VER="BBRv3 可用"
+    # 检测 bbr3 模块
+    if modprobe tcp_bbr3 &>/dev/null; then
+        BBR_VER="v3 ✓"
+        BBR3_AVAILABLE=1
+    else
+        BBR_VER="未启用"
+        BBR3_AVAILABLE=0
+    fi
 
     XANMOD="未安装"
     echo "$CURRENT_KERNEL" | grep -qi xanmod && XANMOD="已安装"
@@ -98,7 +104,6 @@ restore_backup() {
 install_xanmod() {
     echo -e "${YELLOW}正在添加 XanMod 仓库...${RESET}"
 
-    # 使用正确 GPG Key
     curl -fsSL https://dl.xanmod.org/gpg.key \
         | gpg --dearmor \
         | tee /usr/share/keyrings/xanmod.gpg >/dev/null
@@ -108,7 +113,6 @@ install_xanmod() {
 
     apt-get update -y
 
-    # 自动查找可用 XanMod 内核包
     PACKAGE_NAME=$(apt-cache search linux-xanmod | grep -E 'linux-xanmod(-lts|-mainline)?' | awk '{print $1}' | head -n1)
 
     if [[ -z "$PACKAGE_NAME" ]]; then
@@ -127,14 +131,30 @@ install_xanmod() {
 # ---------------------------------------------------------
 select_cc_and_qdisc() {
     echo -e "${CYAN}可用拥塞控制算法:${RESET}"
-    sysctl net.ipv4.tcp_available_congestion_control
+    AVAILABLE_CC=$(sysctl net.ipv4.tcp_available_congestion_control | awk -F'= ' '{print $2}')
+    CC_LIST="$AVAILABLE_CC"
+    [[ $BBR3_AVAILABLE -eq 1 ]] && CC_LIST="$CC_LIST bbr3"
+    echo "$CC_LIST"
 
     echo -e "\n${CYAN}可用队列算法:${RESET}"
     echo -e "常见: fq, fq_codel, cake"
 
     echo -e "\n${YELLOW}请输入要使用的拥塞算法 (如 bbr, bbr3, cubic): ${RESET}"
-    read -r CC
-    sysctl -w net.ipv4.tcp_congestion_control="$CC"
+    read -r CC_CHOICE
+
+    # 如果选择 bbr3，加载模块
+    if [[ "$CC_CHOICE" == "bbr3" ]]; then
+        if [[ $BBR3_AVAILABLE -eq 1 ]]; then
+            modprobe tcp_bbr3
+            sysctl -w net.ipv4.tcp_congestion_control=bbr3
+            echo -e "${GREEN}已切换到 BBRv3${RESET}"
+        else
+            echo -e "${RED}当前内核不支持 BBRv3${RESET}"
+            return
+        fi
+    else
+        sysctl -w net.ipv4.tcp_congestion_control="$CC_CHOICE"
+    fi
 
     echo -e "${YELLOW}请输入队列调度算法 (如 cake, fq, fq_codel): ${RESET}"
     read -r QDISC
@@ -146,9 +166,7 @@ select_cc_and_qdisc() {
         echo -e "${YELLOW}VPS 带宽 (例如 100mbit):${RESET}"
         read -r VPS_BW
 
-        # 合并使用 (取最小值或单值可自行修改)
-        BW="$LOCAL_BW"
-
+        BW="$LOCAL_BW"  # 可以自定义逻辑
         tc qdisc replace dev eth0 root cake bandwidth "$BW"
     else
         sysctl -w net.core.default_qdisc="$QDISC"
