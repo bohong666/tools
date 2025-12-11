@@ -2,12 +2,12 @@
 
 # ============================================
 # Ubuntu Xray VLESS+Reality+Vision 配置脚本
-# 版本: v2.0.3
+# 版本: v2.1.0
 # 更新日期: 2024-12-11
-# 作者:hogue
+# 新增: 智能检测现有配置，支持重新生成或保留
 # ============================================
 
-SCRIPT_VERSION="v2.0.3"
+SCRIPT_VERSION="v2.1.0"
 
 set -e
 
@@ -44,13 +44,91 @@ if [[ $EUID -ne 0 ]]; then
    exit 1
 fi
 
+# ============================================
+# 检测现有配置
+# ============================================
+CONFIG_FILE="/usr/local/etc/xray/config.json"
+BACKUP_FILE="/root/xray_vless_links.txt"
+
+if [ -f "$CONFIG_FILE" ] && [ -f "$BACKUP_FILE" ]; then
+    echo ""
+    log_warn "检测到现有Xray配置！"
+    echo ""
+    echo "现有配置信息："
+    echo "----------------------------------------"
+    
+    # 提取现有配置信息
+    EXISTING_UUID=$(grep -oP '"id":\s*"\K[^"]+' "$CONFIG_FILE" | head -1)
+    EXISTING_PRIVATE=$(grep -oP '"privateKey":\s*"\K[^"]+' "$CONFIG_FILE" | head -1)
+    EXISTING_SHORT=$(grep -oP '"shortIds":\s*\[\s*"\K[^"]+' "$CONFIG_FILE" | head -1)
+    
+    if [ -n "$EXISTING_UUID" ]; then
+        echo "UUID: $EXISTING_UUID"
+    fi
+    if [ -n "$EXISTING_PRIVATE" ]; then
+        echo "Private Key: ${EXISTING_PRIVATE:0:20}..."
+    fi
+    if [ -n "$EXISTING_SHORT" ]; then
+        echo "Short ID: $EXISTING_SHORT"
+    fi
+    
+    # 显示现有配置创建时间
+    CONFIG_TIME=$(stat -c %y "$CONFIG_FILE" 2>/dev/null | cut -d'.' -f1)
+    if [ -n "$CONFIG_TIME" ]; then
+        echo "配置时间: $CONFIG_TIME"
+    fi
+    
+    echo "----------------------------------------"
+    echo ""
+    echo "请选择操作："
+    echo "1) 保留现有配置，仅显示连接信息"
+    echo "2) 生成新配置（旧配置将被备份）"
+    echo "3) 退出脚本"
+    echo ""
+    read -p "请输入选项 [1/2/3]: " CONFIG_CHOICE
+    
+    case $CONFIG_CHOICE in
+        1)
+            log_info "保留现有配置"
+            USE_EXISTING=true
+            ;;
+        2)
+            log_warn "将生成新配置"
+            # 备份旧配置
+            BACKUP_DIR="/root/xray_backups"
+            mkdir -p "$BACKUP_DIR"
+            TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+            cp "$CONFIG_FILE" "$BACKUP_DIR/config_${TIMESTAMP}.json"
+            cp "$BACKUP_FILE" "$BACKUP_DIR/links_${TIMESTAMP}.txt" 2>/dev/null || true
+            log_info "旧配置已备份到: $BACKUP_DIR/config_${TIMESTAMP}.json"
+            USE_EXISTING=false
+            ;;
+        3)
+            log_info "退出脚本"
+            exit 0
+            ;;
+        *)
+            log_error "无效选项，退出"
+            exit 1
+            ;;
+    esac
+else
+    log_info "未检测到现有配置，将创建新配置"
+    USE_EXISTING=false
+fi
+
 # 读取自定义节点名称
-read -p "请输入节点名称（直接回车使用默认名称）: " NODE_NAME
-if [ -z "$NODE_NAME" ]; then
-    NODE_NAME="Xray-Reality-$(date +%Y%m%d)"
+if [ "$USE_EXISTING" = false ]; then
+    read -p "请输入节点名称（直接回车使用默认名称）: " NODE_NAME
+    if [ -z "$NODE_NAME" ]; then
+        NODE_NAME="Xray-Reality-$(date +%Y%m%d)"
+    fi
 fi
 
 log_info "开始配置系统..."
+
+# 如果使用现有配置，跳过系统更新部分
+if [ "$USE_EXISTING" = false ]; then
 
 # ============================================
 # 1. 更新系统
@@ -112,58 +190,99 @@ apt install -y curl wget unzip jq qrencode
 log_info "安装Xray-core..."
 bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
 
-# ============================================
-# 7. 生成密钥和ID
-# ============================================
-log_info "生成密钥对和UUID..."
-
-# 生成UUID
-UUID=$(cat /proc/sys/kernel/random/uuid)
-
-# 生成X25519密钥对 - 新版Xray的输出格式
-log_info "正在生成X25519密钥对..."
-KEY_OUTPUT=$(/usr/local/bin/xray x25519 2>&1)
-
-# 解析新版Xray输出格式：
-# PrivateKey: xxx (不是 "Private key:")
-# Password: xxx (这个实际上是PublicKey)
-PRIVATE_KEY=$(echo "$KEY_OUTPUT" | grep "^PrivateKey:" | cut -d' ' -f2 | tr -d ' \n\r')
-PUBLIC_KEY=$(echo "$KEY_OUTPUT" | grep "^PublicKey:" | cut -d' ' -f2 | tr -d ' \n\r')
-
-# 如果没有PublicKey字段，检查Password字段（旧版本兼容）
-if [ -z "$PUBLIC_KEY" ]; then
-    PUBLIC_KEY=$(echo "$KEY_OUTPUT" | grep "^Password:" | cut -d' ' -f2 | tr -d ' \n\r')
+else
+    log_info "跳过系统更新和软件安装（使用现有配置）"
 fi
 
-# 验证密钥是否生成成功
-if [ -z "$PRIVATE_KEY" ] || [ -z "$PUBLIC_KEY" ]; then
-    log_error "密钥解析失败，原始输出："
-    echo "$KEY_OUTPUT"
-    log_error "尝试使用-i参数重新生成..."
+# ============================================
+# 7. 生成或读取密钥和ID
+# ============================================
+
+if [ "$USE_EXISTING" = true ]; then
+    log_info "读取现有配置信息..."
     
-    # 使用-i参数生成（指定私钥）
-    KEY_OUTPUT2=$(/usr/local/bin/xray x25519 -i "$PRIVATE_KEY" 2>&1) || true
-    if [ -n "$KEY_OUTPUT2" ]; then
-        PUBLIC_KEY=$(echo "$KEY_OUTPUT2" | grep "^PublicKey:" | cut -d' ' -f2 | tr -d ' \n\r')
+    # 从现有配置文件读取
+    UUID=$(grep -oP '"id":\s*"\K[^"]+' "$CONFIG_FILE" | head -1)
+    PRIVATE_KEY=$(grep -oP '"privateKey":\s*"\K[^"]+' "$CONFIG_FILE" | head -1)
+    SHORT_ID=$(grep -oP '"shortIds":\s*\[\s*"\K[^"]+' "$CONFIG_FILE" | head -1)
+    
+    # 从备份文件读取公钥和节点名称
+    if [ -f "$BACKUP_FILE" ]; then
+        PUBLIC_KEY=$(grep "^Public Key:" "$BACKUP_FILE" | awk '{print $3}')
+        NODE_NAME=$(grep "^节点名称:" "$BACKUP_FILE" | cut -d' ' -f2-)
+        
+        # 如果节点名称为空，使用默认
+        if [ -z "$NODE_NAME" ]; then
+            NODE_NAME="Xray-Reality-Existing"
+        fi
+    else
+        # 如果没有备份文件，通过私钥生成公钥
+        log_info "通过私钥重新生成公钥..."
+        KEY_OUTPUT=$(/usr/local/bin/xray x25519 -i "$PRIVATE_KEY" 2>&1)
+        PUBLIC_KEY=$(echo "$KEY_OUTPUT" | grep "^PublicKey:" | cut -d' ' -f2 | tr -d ' \n\r')
         if [ -z "$PUBLIC_KEY" ]; then
-            PUBLIC_KEY=$(echo "$KEY_OUTPUT2" | grep "^Password:" | cut -d' ' -f2 | tr -d ' \n\r')
+            PUBLIC_KEY=$(echo "$KEY_OUTPUT" | grep "^Password:" | cut -d' ' -f2 | tr -d ' \n\r')
+        fi
+        NODE_NAME="Xray-Reality-Existing"
+    fi
+    
+    log_info "✓ 已读取现有配置"
+    log_info "  UUID: $UUID"
+    log_info "  Private Key: ${PRIVATE_KEY:0:20}..."
+    log_info "  Public Key: ${PUBLIC_KEY:0:20}..."
+    log_info "  Short ID: $SHORT_ID"
+    
+else
+    log_info "生成密钥对和UUID..."
+
+    # 生成UUID
+    UUID=$(cat /proc/sys/kernel/random/uuid)
+
+    # 生成X25519密钥对 - 新版Xray的输出格式
+    log_info "正在生成X25519密钥对..."
+    KEY_OUTPUT=$(/usr/local/bin/xray x25519 2>&1)
+
+    # 解析新版Xray输出格式：
+    # PrivateKey: xxx (不是 "Private key:")
+    # Password: xxx (这个实际上是PublicKey)
+    PRIVATE_KEY=$(echo "$KEY_OUTPUT" | grep "^PrivateKey:" | cut -d' ' -f2 | tr -d ' \n\r')
+    PUBLIC_KEY=$(echo "$KEY_OUTPUT" | grep "^PublicKey:" | cut -d' ' -f2 | tr -d ' \n\r')
+
+    # 如果没有PublicKey字段，检查Password字段（旧版本兼容）
+    if [ -z "$PUBLIC_KEY" ]; then
+        PUBLIC_KEY=$(echo "$KEY_OUTPUT" | grep "^Password:" | cut -d' ' -f2 | tr -d ' \n\r')
+    fi
+
+    # 验证密钥是否生成成功
+    if [ -z "$PRIVATE_KEY" ] || [ -z "$PUBLIC_KEY" ]; then
+        log_error "密钥解析失败，原始输出："
+        echo "$KEY_OUTPUT"
+        log_error "尝试使用-i参数重新生成..."
+        
+        # 使用-i参数生成（指定私钥）
+        KEY_OUTPUT2=$(/usr/local/bin/xray x25519 -i "$PRIVATE_KEY" 2>&1) || true
+        if [ -n "$KEY_OUTPUT2" ]; then
+            PUBLIC_KEY=$(echo "$KEY_OUTPUT2" | grep "^PublicKey:" | cut -d' ' -f2 | tr -d ' \n\r')
+            if [ -z "$PUBLIC_KEY" ]; then
+                PUBLIC_KEY=$(echo "$KEY_OUTPUT2" | grep "^Password:" | cut -d' ' -f2 | tr -d ' \n\r')
+            fi
         fi
     fi
+
+    # 最终验证
+    if [ -z "$PRIVATE_KEY" ] || [ -z "$PUBLIC_KEY" ]; then
+        log_error "无法生成密钥对！"
+        log_error "原始输出："
+        echo "$KEY_OUTPUT"
+        exit 1
+    fi
+
+    log_info "✓ Private Key: $PRIVATE_KEY"
+    log_info "✓ Public Key: $PUBLIC_KEY"
+
+    # 生成short_id（8位十六进制）
+    SHORT_ID=$(openssl rand -hex 8)
 fi
-
-# 最终验证
-if [ -z "$PRIVATE_KEY" ] || [ -z "$PUBLIC_KEY" ]; then
-    log_error "无法生成密钥对！"
-    log_error "原始输出："
-    echo "$KEY_OUTPUT"
-    exit 1
-fi
-
-log_info "✓ Private Key: $PRIVATE_KEY"
-log_info "✓ Public Key: $PUBLIC_KEY"
-
-# 生成short_id（8位十六进制）
-SHORT_ID=$(openssl rand -hex 8)
 
 # 获取服务器IP地址
 IPV4=$(curl -s -4 ifconfig.me || curl -s -4 icanhazip.com || curl -s -4 api.ipify.org)
@@ -177,9 +296,11 @@ fi
 # ============================================
 # 8. 创建Xray配置文件
 # ============================================
-log_info "创建Xray配置文件..."
 
-cat > /usr/local/etc/xray/config.json <<EOF
+if [ "$USE_EXISTING" = false ]; then
+    log_info "创建Xray配置文件..."
+
+    cat > /usr/local/etc/xray/config.json <<EOF
 {
   "log": {
     "loglevel": "warning"
@@ -244,48 +365,52 @@ cat > /usr/local/etc/xray/config.json <<EOF
 }
 EOF
 
-# 验证配置文件
-log_info "验证Xray配置文件..."
-if /usr/local/bin/xray run -test -config /usr/local/etc/xray/config.json; then
-    log_info "配置文件验证成功"
-else
-    log_error "配置文件验证失败"
-    cat /usr/local/etc/xray/config.json
-    exit 1
-fi
+    # 验证配置文件
+    log_info "验证Xray配置文件..."
+    if /usr/local/bin/xray run -test -config /usr/local/etc/xray/config.json; then
+        log_info "配置文件验证成功"
+    else
+        log_error "配置文件验证失败"
+        cat /usr/local/etc/xray/config.json
+        exit 1
+    fi
 
-# ============================================
-# 9. 配置防火墙
-# ============================================
-log_info "配置防火墙规则..."
-if command -v ufw &> /dev/null; then
-    ufw allow 443/tcp
-    ufw --force enable
-    log_info "UFW防火墙已配置"
-elif command -v firewall-cmd &> /dev/null; then
-    firewall-cmd --permanent --add-port=443/tcp
-    firewall-cmd --reload
-    log_info "Firewalld已配置"
-else
-    log_warn "未检测到防火墙，跳过防火墙配置"
-fi
+    # ============================================
+    # 9. 配置防火墙
+    # ============================================
+    log_info "配置防火墙规则..."
+    if command -v ufw &> /dev/null; then
+        ufw allow 443/tcp
+        ufw --force enable
+        log_info "UFW防火墙已配置"
+    elif command -v firewall-cmd &> /dev/null; then
+        firewall-cmd --permanent --add-port=443/tcp
+        firewall-cmd --reload
+        log_info "Firewalld已配置"
+    else
+        log_warn "未检测到防火墙，跳过防火墙配置"
+    fi
 
-# ============================================
-# 10. 启动Xray服务
-# ============================================
-log_info "启动Xray服务..."
-systemctl daemon-reload
-systemctl enable xray
-systemctl restart xray
-sleep 3
+    # ============================================
+    # 10. 启动Xray服务
+    # ============================================
+    log_info "启动Xray服务..."
+    systemctl daemon-reload
+    systemctl enable xray
+    systemctl restart xray
+    sleep 3
 
-# 检查服务状态
-if systemctl is-active --quiet xray; then
-    log_info "Xray服务启动成功 ✓"
+    # 检查服务状态
+    if systemctl is-active --quiet xray; then
+        log_info "Xray服务启动成功 ✓"
+    else
+        log_error "Xray服务启动失败，查看详细日志："
+        journalctl -u xray -n 50 --no-pager
+        exit 1
+    fi
 else
-    log_error "Xray服务启动失败，查看详细日志："
-    journalctl -u xray -n 50 --no-pager
-    exit 1
+    log_info "使用现有配置，跳过配置文件创建"
+    log_info "Xray服务状态: $(systemctl is-active xray)"
 fi
 
 # ============================================
@@ -356,7 +481,11 @@ fi
 # ============================================
 echo ""
 echo "============================================"
-log_info "配置完成！脚本版本: ${SCRIPT_VERSION}"
+if [ "$USE_EXISTING" = true ]; then
+    log_info "现有配置信息显示完成！脚本版本: ${SCRIPT_VERSION}"
+else
+    log_info "配置完成！脚本版本: ${SCRIPT_VERSION}"
+fi
 echo "============================================"
 echo ""
 echo -e "${GREEN}节点信息：${NC}"
@@ -498,15 +627,25 @@ log_warn "支持的客户端: v2rayN, v2rayNG, Clash Meta, Clash Party等"
 log_warn "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 echo "============================================"
-log_info "系统优化完成摘要 (版本: ${SCRIPT_VERSION})："
+if [ "$USE_EXISTING" = true ]; then
+    log_info "系统状态 (版本: ${SCRIPT_VERSION})："
+else
+    log_info "系统优化完成摘要 (版本: ${SCRIPT_VERSION})："
+fi
 echo "============================================"
-echo "✓ 系统已更新到最新"
-echo "✓ 系统垃圾已清理"
-echo "✓ 已配置2GB交换空间 ($(free -h | grep Swap | awk '{print $2}'))"
-echo "✓ BBR加速已启用"
-echo "✓ Xray $(xray version | head -n 1 | awk '{print $2}') 已安装并运行"
-echo "✓ VLESS+Reality+Vision节点已配置"
-echo "✓ 防火墙规则已配置"
+if [ "$USE_EXISTING" = false ]; then
+    echo "✓ 系统已更新到最新"
+    echo "✓ 系统垃圾已清理"
+    echo "✓ 已配置2GB交换空间 ($(free -h | grep Swap | awk '{print $2}'))"
+    echo "✓ BBR加速已启用"
+    echo "✓ Xray $(xray version | head -n 1 | awk '{print $2}') 已安装并运行"
+    echo "✓ VLESS+Reality+Vision节点已配置"
+    echo "✓ 防火墙规则已配置"
+else
+    echo "✓ 使用现有配置"
+    echo "✓ Xray $(xray version | head -n 1 | awk '{print $2}') 运行中"
+    echo "✓ 配置信息已更新"
+fi
 echo "============================================"
 
 # BBR和服务验证
@@ -536,8 +675,8 @@ fi
 echo ""
 log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 log_info "配置完成！建议步骤："
-echo "1. 继续优化防火墙 bash <(curl -fsSL https://raw.githubusercontent.com/bohong666/tools/refs/heads/main/firewall-manager.sh)"
-echo "2. 通过 https://omnitt.com 进行 tcp 调优"
+echo "1. 复制上方的VLESS URI到客户端"
+echo "2. 或使用 /root/clash_config.yaml 导入Clash"
 echo "3. 连接后访问 https://www.google.com 测试"
 echo "4. 查看日志: journalctl -u xray -f"
 log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
