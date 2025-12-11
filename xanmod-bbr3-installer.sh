@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # xanmod-bbr3-installer.sh
 # One-shot installer + uninstaller for XanMod kernel + BBR3 support
-# Script version:
-SCRIPT_VERSION="Ver 3"
+# Version:
+SCRIPT_VERSION="1.0.0"
 
 set -euo pipefail
 IFS=$'\n\t'
@@ -24,11 +24,17 @@ err(){ printf "%b\n" "${RED}${1}${RESET}"; }
 WORKDIR="/var/tmp/xanmod-installer-$$"
 BACKUPDIR="/var/tmp/xanmod-backup-$$"
 LOGFILE="/var/log/xanmod-installer-$$.log"
+
+# Backup target paths (user requested default)
+BACKUP_DIR_CONF="/etc/bbr-manager"
+BACKUP_JSON="${BACKUP_DIR_CONF}/backup.json"
+BACKUP_CONF="${BACKUP_DIR_CONF}/backup.conf"   # shell sourced on restore
+
 XANMOD_LIST="/etc/apt/sources.list.d/xanmod.list"
 XANMOD_GPG="/etc/apt/trusted.gpg.d/xanmod.gpg"
 SYSCTL_CONF="/etc/sysctl.d/99-xanmod-bbr.conf"
 
-mkdir -p "$WORKDIR" "$BACKUPDIR"
+mkdir -p "$WORKDIR" "$BACKUPDIR" "$BACKUP_DIR_CONF"
 exec > >(tee -a "$LOGFILE") 2>&1
 
 # ----------------- Helpers -----------------
@@ -49,7 +55,7 @@ detect_distro(){
   KERNEL_UNAME=$(uname -r)
 }
 
-# ----------------- Status display -----------------
+# ----------------- Status gathering -----------------
 gather_status(){
   detect_distro
   CURRENT_KERNEL="$KERNEL_UNAME"
@@ -58,7 +64,7 @@ gather_status(){
     IS_XANMOD="Yes"
   elif [ -f "$XANMOD_LIST" ]; then
     IS_XANMOD="Repo"
-  elif dpkg -l 2>/dev/null | grep -qi xanmod; then
+  elif command_exists dpkg && dpkg -l 2>/dev/null | grep -qi xanmod; then
     IS_XANMOD="Yes"
   fi
 
@@ -97,9 +103,14 @@ gather_status(){
     CAKE_PRESENT="Available"
   fi
 
-  IFACES_RAW=$(ip -o link show | awk -F': ' '{print $2}')
-  # Filter plausible physical interfaces
+  IFACES_RAW=$(ip -o link show 2>/dev/null | awk -F': ' '{print $2}')
   IFACES=$(echo "$IFACES_RAW" | grep -Ev '^(lo|docker|veth|br-|virbr|tun|tap)' || true)
+
+  # detect installed kernel-packages (dpkg)
+  BACKUP_KERNEL_PACKAGES=""
+  if command_exists dpkg; then
+    BACKUP_KERNEL_PACKAGES=$(dpkg -l | awk '/linux-image|linux-headers/ {print $2}' | tr '\n' ' ' || true)
+  fi
 }
 
 print_status(){
@@ -107,7 +118,7 @@ print_status(){
   echo
   printf "%b\n" "${BOLD}======== 当前系统状态 ========${RESET}"
   printf "脚本版本: %s\n" "$SCRIPT_VERSION"
-  printf "系统: %s (%s)\n" "$DISTRO_NAME" "$DISTRO_ID"
+  printf "系统: %s (%s)\n" "${DISTRO_NAME:-unknown}" "${DISTRO_ID:-unknown}"
   printf "架构: %s\n" "$ARCH"
   printf "当前内核: %s\n" "$CURRENT_KERNEL"
   printf "是否 XanMod 内核: %s\n" "$IS_XANMOD"
@@ -123,26 +134,210 @@ print_status(){
   echo
 }
 
-# ----------------- Backup pre-install state -----------------
+# ----------------- Backup & Restore -----------------
+ensure_backup_dir(){
+  mkdir -p "$BACKUP_DIR_CONF"
+  chmod 0755 "$BACKUP_DIR_CONF"
+}
+
+escape_json_string(){
+  # $1 string -> escaped for JSON value
+  printf '%s' "$1" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read().rstrip("\n")))'
+}
+
 backup_preinstall(){
-  info "准备备份当前系统状态到：$BACKUPDIR"
-  mkdir -p "$BACKUPDIR"
-  echo "date: $(date -Iseconds)" > "$BACKUPDIR/metadata.txt"
-  echo "distro: $DISTRO_ID" >> "$BACKUPDIR/metadata.txt"
-  echo "arch: $ARCH" >> "$BACKUPDIR/metadata.txt"
-  echo "current_kernel: $CURRENT_KERNEL" >> "$BACKUPDIR/metadata.txt"
-  if command_exists dpkg; then
-    dpkg -l > "$BACKUPDIR/dpkg-list.txt" || true
-  elif command_exists rpm; then
-    rpm -qa > "$BACKUPDIR/rpm-list.txt" || true
+  gather_status
+  ensure_backup_dir
+
+  ok "正在备份当前系统状态到: $BACKUP_JSON (同时生成 $BACKUP_CONF)"
+  # create conf (shell-friendly)
+  cat > "$BACKUP_CONF" <<EOF
+# Backup created: $(date -Iseconds)
+BACKUP_DATE="$(date -Iseconds)"
+BACKUP_DISTRO="${DISTRO_NAME:-unknown}"
+BACKUP_DISTRO_ID="${DISTRO_ID:-unknown}"
+BACKUP_ARCH="${ARCH:-unknown}"
+BACKUP_CURRENT_KERNEL="${CURRENT_KERNEL:-unknown}"
+BACKUP_IS_XANMOD="${IS_XANMOD:-unknown}"
+BACKUP_TCP_CURRENT="${TCP_CURRENT:-unknown}"
+BACKUP_TCP_AVAILABLE="${TCP_AVAILABLE:-unknown}"
+BACKUP_QDISC_CURRENT="${QDISC_CURRENT:-unknown}"
+BACKUP_QDISC_AVAILABLE="${QDISC_AVAILABLE:-unknown}"
+BACKUP_BBR3_LOADED="${BBR3_LOADED:-unknown}"
+BACKUP_BBR_VERSION="${BBR_VERSION_DISPLAY:-unknown}"
+BACKUP_CAKE_PRESENT="${CAKE_PRESENT:-unknown}"
+BACKUP_IFACES="${IFACES:-}"
+BACKUP_KERNEL_PACKAGES="${BACKUP_KERNEL_PACKAGES:-}"
+EOF
+
+  # create json (best-effort, escape strings)
+  # Use python3 if available to ensure valid JSON; else create simple JSON with minimal escaping
+  if command_exists python3; then
+    python3 - <<PY > "$BACKUP_JSON"
+import json,sys
+d = {
+  "date":"$(date -Iseconds)",
+  "distro":"${DISTRO_NAME:-unknown}",
+  "distro_id":"${DISTRO_ID:-unknown}",
+  "arch":"${ARCH:-unknown}",
+  "current_kernel":"${CURRENT_KERNEL:-unknown}",
+  "is_xanmod":"${IS_XANMOD:-unknown}",
+  "tcp_current":"${TCP_CURRENT:-unknown}",
+  "tcp_available":"${TCP_AVAILABLE:-unknown}",
+  "qdisc_current":"${QDISC_CURRENT:-unknown}",
+  "qdisc_available":"${QDISC_AVAILABLE:-unknown}",
+  "bbr3_loaded":"${BBR3_LOADED:-unknown}",
+  "bbr_version":"${BBR_VERSION_DISPLAY:-unknown}",
+  "cake_present":"${CAKE_PRESENT:-unknown}",
+  "ifaces":"${IFACES:-}",
+  "kernel_packages":"${BACKUP_KERNEL_PACKAGES:-}"
+}
+json.dump(d,sys.stdout,indent=2)
+PY
+  else
+    # Fallback: rudimentary JSON (may not escape all characters)
+    cat > "$BACKUP_JSON" <<EOF
+{
+  "date":"$(date -Iseconds)",
+  "distro":"${DISTRO_NAME:-unknown}",
+  "distro_id":"${DISTRO_ID:-unknown}",
+  "arch":"${ARCH:-unknown}",
+  "current_kernel":"${CURRENT_KERNEL:-unknown}",
+  "is_xanmod":"${IS_XANMOD:-unknown}",
+  "tcp_current":"${TCP_CURRENT:-unknown}",
+  "tcp_available":"${TCP_AVAILABLE:-unknown}",
+  "qdisc_current":"${QDISC_CURRENT:-unknown}",
+  "qdisc_available":"${QDISC_AVAILABLE:-unknown}",
+  "bbr3_loaded":"${BBR3_LOADED:-unknown}",
+  "bbr_version":"${BBR_VERSION_DISPLAY:-unknown}",
+  "cake_present":"${CAKE_PRESENT:-unknown}",
+  "ifaces":"${IFACES:-}",
+  "kernel_packages":"${BACKUP_KERNEL_PACKAGES:-}"
+}
+EOF
   fi
-  mkdir -p "$BACKUPDIR/boot-snapshot"
-  find /boot -maxdepth 1 -type f -print0 | xargs -0 -I{} cp -av "{}" "$BACKUPDIR/boot-snapshot/" || true
-  cp -av /etc/default/grub "$BACKUPDIR/" 2>/dev/null || true
-  if command_exists grub-mkconfig; then
-    grub-mkconfig -o "$BACKUPDIR/grub.cfg.backup" 2>/dev/null || true
+
+  ok "备份已完成: $BACKUP_JSON  & $BACKUP_CONF"
+  echo
+  ok "请保留 $BACKUP_DIR_CONF 以便将来恢复。"
+}
+
+restore_from_backup(){
+  if [ ! -f "$BACKUP_CONF" ]; then
+    err "未找到备份配置文件: $BACKUP_CONF"
+    return 1
   fi
-  ok "备份已保存到 $BACKUPDIR （回滚时保留此目录）"
+
+  # make an additional snapshot of current state before restoring
+  info "将在恢复前再次备份当前状态（双保险）..."
+  cp -av "$BACKUP_CONF" "${BACKUP_CONF}.pre-restore.$(date +%s)" 2>/dev/null || true
+  cp -av "$BACKUP_JSON" "${BACKUP_JSON}.pre-restore.$(date +%s)" 2>/dev/null || true
+
+  # load backup conf (safe)
+  # shellcheck disable=SC1090
+  source "$BACKUP_CONF"
+
+  ok "读取备份：$BACKUP_CONF (创建于 $BACKUP_DATE)"
+  echo "备份记录的系统内核: $BACKUP_CURRENT_KERNEL"
+  echo "备份记录的拥塞控制: $BACKUP_TCP_CURRENT"
+  echo "备份记录的 qdisc: $BACKUP_QDISC_CURRENT"
+  echo "备份记录的网络接口: $BACKUP_IFACES"
+  echo
+
+  read -r -p "$(printf '%b' "${YELLOW}确认要按备份恢复 sysctl (TCP + qdisc)？[y/N]: ${RESET}")" ans
+  ans=${ans:-n}
+  if [[ "$ans" =~ ^[Yy]$ ]]; then
+    # restore sysctl
+    cat > "$SYSCTL_CONF" <<EOF
+# Restored by xanmod-bbr3-installer (backup date: ${BACKUP_DATE:-unknown})
+net.core.default_qdisc = ${BACKUP_QDISC_CURRENT:-fq}
+net.ipv4.tcp_congestion_control = ${BACKUP_TCP_CURRENT:-bbr}
+EOF
+    run "sysctl --system || true"
+    ok "sysctl 已恢复（可能需重启或重新加载内核模块生效）"
+  else
+    warn "跳过 sysctl 恢复"
+  fi
+
+  # attempt to restore qdisc (requires choosing interface)
+  read -r -p "$(printf '%b' "${YELLOW}是否要尝试恢复 qdisc 到备份时的状态？[y/N]: ${RESET}")" ans2
+  ans2=${ans2:-n}
+  if [[ "$ans2" =~ ^[Yy]$ ]]; then
+    # Ask which interface to apply (default to first saved)
+    SAVED_IFACE=$(echo "$BACKUP_IFACES" | awk '{print $1}')
+    if [ -z "$SAVED_IFACE" ]; then
+      warn "备份中未记录接口，无法自动恢复 qdisc"
+    else
+      echo "备份中记录的首个接口: $SAVED_IFACE"
+      read -r -p "$(printf '%b' "${YELLOW}确认在接口 $SAVED_IFACE 上恢复 qdisc ${BACKUP_QDISC_CURRENT:-fq}？[y/N]: ${RESET}")" ans3
+      ans3=${ans3:-n}
+      if [[ "$ans3" =~ ^[Yy]$ ]]; then
+        # apply restore (conservative)
+        if command_exists tc; then
+          run "tc qdisc del dev ${SAVED_IFACE} root 2>/dev/null || true"
+          run "tc qdisc replace dev ${SAVED_IFACE} root ${BACKUP_QDISC_CURRENT:-fq} || true"
+          ok "已尝试在 $SAVED_IFACE 上恢复 qdisc（可能需要内核模块支持或重启）"
+        else
+          warn "系统无 tc 命令，无法恢复 qdisc；请先安装 iproute2"
+        fi
+      fi
+    fi
+  else
+    warn "跳过 qdisc 恢复"
+  fi
+
+  # Attempt kernel package restore guidance / action
+  if [ -n "${BACKUP_KERNEL_PACKAGES:-}" ]; then
+    echo
+    warn "备份时记录了内核相关包（数量可能较多）。脚本可以尝试恢复这些包（若仍可从仓库安装）。"
+    read -r -p "$(printf '%b' "${YELLOW}是否尝试重新安装备份中记录的内核包？（需要网络并由 apt 提供）[y/N]: ${RESET}")" ansk
+    ansk=${ansk:-n}
+    if [[ "$ansk" =~ ^[Yy]$ ]]; then
+      if command_exists apt-get; then
+        # simple attempt: install listed packages (this may skip already-installed)
+        run "apt-get update -y || true"
+        # limit length to avoid extremely long apt invocation: split by space and install selectively
+        IFS=' ' read -r -a pkgarr <<< "${BACKUP_KERNEL_PACKAGES}"
+        toinstall=()
+        for p in "${pkgarr[@]}"; do
+          # skip empty
+          [ -z "$p" ] && continue
+          # check if installed now
+          if dpkg -l 2>/dev/null | awk '{print $2}' | grep -xq "$p"; then
+            continue
+          fi
+          toinstall+=("$p")
+        done
+        if [ ${#toinstall[@]} -gt 0 ]; then
+          warn "将尝试安装 ${#toinstall[@]} 个包（可能部分不存在于当前仓库）"
+          run "apt-get install -y ${toinstall[*]} || true"
+        else
+          ok "备份中记录的内核包已全部安装，无需操作"
+        fi
+      else
+        warn "系统不支持 apt-get，无法自动恢复内核包"
+      fi
+    fi
+  fi
+
+  # restore /boot files from boot-snapshot if present in /var/tmp backupdir
+  # earlier script stores /var/tmp/... backup; but for safety we only restore from BACKUPDIR that our script created in session
+  # The script earlier also saved search-backup in $BACKUPDIR; we'll prompt user to manually restore if present.
+  if [ -d "$BACKUPDIR/boot-snapshot" ]; then
+    echo
+    warn "脚本检测到会话临时备份 $BACKUPDIR/boot-snapshot（若存在可选恢复）。"
+    read -r -p "$(printf '%b' "${YELLOW}是否将 $BACKUPDIR/boot-snapshot/* 恢复覆盖到 /boot ?（谨慎）[y/N]: ${RESET}")" ansb
+    ansb=${ansb:-n}
+    if [[ "$ansb" =~ ^[Yy]$ ]]; then
+      run "cp -av $BACKUPDIR/boot-snapshot/* /boot/ || true"
+      ok "已尝试恢复 /boot 内容（请手动检查 /boot 并运行 update-grub，如有必要）"
+      run "update-grub || true"
+    else
+      warn "跳过 /boot 恢复"
+    fi
+  fi
+
+  ok "恢复流程完成（部分操作可能需要手动检查或重启以完全生效）"
 }
 
 # ----------------- XanMod repo & install -----------------
@@ -192,16 +387,19 @@ install_xanmod_kernel(){
   ok "已更新 grub 配置。请重启系统以切换内核（菜单有重启选项）。"
 }
 
-# ----------------- Apply sysctl and qdisc -----------------
+# ----------------- Qdisc & Sysctl application -----------------
 select_interface(){
   gather_status
-  # build array
   mapfile -t IF_ARR < <(echo "$IFACES" | tr ' ' '\n' | sed '/^$/d')
   if [ ${#IF_ARR[@]} -eq 0 ]; then
-    die "未检测到可用网络接口，请手动输入接口名（如 eth0）"
+    read -r -p "$(printf '%b' "${YELLOW}未自动检测到可用网卡，请手动输入接口名 (如 eth0): ${RESET}")" manif
+    if [ -z "$manif" ]; then
+      die "未提供接口，终止"
+    fi
+    SELECT_IF="$manif"
   elif [ ${#IF_ARR[@]} -eq 1 ]; then
-    echo "自动选择接口: ${IF_ARR[0]}"
     SELECT_IF="${IF_ARR[0]}"
+    echo "自动选择接口: $SELECT_IF"
   else
     echo "检测到多个接口，请选择接口（按编号）:"
     for i in "${!IF_ARR[@]}"; do
@@ -248,15 +446,11 @@ EOF
     fi
   fi
 
-  # apply qdisc
   if [[ "$qdisc" == "cake" ]]; then
     if [ -n "$cake_bw" ]; then
-      # apply same bandwidth for egress + ingress (用户选择 B：同数值)
       ok "将为接口 $iface 应用 CAKE 带宽模板: ${cake_bw}mbit (同时作为上/下行)"
-      # remove existing
       run "tc qdisc del dev $iface root 2>/dev/null || true"
       run "tc qdisc replace dev $iface root cake bandwidth ${cake_bw}mbit || { warn '在 root 上应用 cake 失败'; }"
-      # Try ingress (may fail on some kernels) — attempt and warn if fails
       run "tc qdisc del dev $iface ingress 2>/dev/null || true"
       if tc qdisc replace dev "$iface" ingress cake bandwidth ${cake_bw}mbit 2>/dev/null; then
         ok "已在 ingress 应用 cake bandwidth ${cake_bw}mbit"
@@ -264,19 +458,17 @@ EOF
         warn "在 ingress 应用 cake 失败（内核/平台可能不支持直接在 ingress 使用 cake），已在 egress(root) 应用。"
       fi
     else
-      # no bandwidth provided, try generic
       run "tc qdisc replace dev $iface root cake || true"
       warn "未提供 bandwidth，已在 root 应用 cake（无带宽限制）"
     fi
   else
-    # generic qdisc apply (replace)
     run "tc qdisc replace dev $iface root $qdisc || { warn '应用 qdisc 失败'; }"
   fi
 
   ok "尝试应用 qdisc 完成（部分操作可能需重启或内核模块支持）。"
 }
 
-# ----------------- Uninstall XanMod (conservative) -----------------
+# ----------------- Uninstall XanMod -----------------
 uninstall_xanmod(){
   info "开始卸载 XanMod（保守模式）"
   PX=$(dpkg -l 2>/dev/null | awk '/xanmod/ {print $2}' || true)
@@ -307,7 +499,7 @@ uninstall_xanmod(){
   ok "卸载完成。请检查 /boot 并在必要时重启。备份目录：$BACKUPDIR"
 }
 
-# ----------------- Interactive chooser (with CAKE bandwidth same-value) -----------------
+# ----------------- Interaction (CC & qdisc) -----------------
 choose_congestion_and_qdisc(){
   gather_status
   echo
@@ -318,7 +510,6 @@ choose_congestion_and_qdisc(){
   else
     options=(bbr bbr2 bbr3 cubic reno)
   fi
-  # unique
   local seen=(); local uniq=()
   for opt in "${options[@]}"; do
     if [[ ! " ${seen[*]} " =~ " ${opt} " ]]; then uniq+=("$opt"); seen+=("$opt"); fi
@@ -361,11 +552,10 @@ choose_congestion_and_qdisc(){
     fi
   fi
 
-  # if cake chosen, ask for single bandwidth number (same for up/down)
   CAKE_BW=""
   if [[ "$QD" == "cake" ]]; then
     echo
-    warn "你选择了 CAKE。根据你的设置 (选项 B)，脚本将使用 单一带宽数值 同时作为 上行/下行。"
+    warn "你选择了 CAKE。请按提示输入 单一 带宽值 (Mbps)，脚本会同时应用到上行/下行。"
     while true; do
       read -r -p "$(printf '%b' "${YELLOW}请输入带宽值 (Mbps, 仅数字，例如 100) 或回车取消: ${RESET}")" bw
       bw=${bw:-}
@@ -374,9 +564,7 @@ choose_congestion_and_qdisc(){
         CAKE_BW=""
         break
       fi
-      # validate integer or decimal
       if echo "$bw" | grep -Eq '^[0-9]+([.][0-9]+)?$'; then
-        # convert to integer if decimal (tc accepts decimals)
         CAKE_BW="$bw"
         ok "将使用带宽: ${CAKE_BW} Mbps（同时作为上/下行）"
         break
@@ -387,7 +575,7 @@ choose_congestion_and_qdisc(){
   fi
 
   select_interface
-  # apply
+  backup_preinstall
   apply_qdisc_and_sysctl "$CC" "$QD" "$SELECT_IF" "$CAKE_BW"
   ok "已尝试应用拥塞算法 $CC 与 qdisc $QD（部分更改可能在重启或模块加载后生效）。"
 }
@@ -399,11 +587,12 @@ main_menu(){
     cat <<EOF
 $(printf '%b' "${BOLD}请选择操作:${RESET}")
  1) 安装 XanMod 内核（添加官方 repo 并安装 linux-xanmod）
- 2) 选择/切换 拥塞控制算法 (CC) 与 qdisc（交互式；CAKE 使用单一带宽值作为上下行）
+ 2) 选择/切换 拥塞控制算法 (CC) 与 qdisc（交互式；CAKE 使用单一带宽值）
  3) 卸载 XanMod（保守模式）
  4) 备份当前系统状态（手动触发）
- 5) 显示 /boot 内容 & 已安装内核包
- 6) 直接重启系统
+ 5) 恢复备份（使用 ${BACKUP_JSON} / ${BACKUP_CONF}）
+ 6) 显示 /boot 内容 & 已安装内核包
+ 7) 直接重启系统
  0) 退出
 EOF
     read -r -p "$(printf '%b' "${YELLOW}输入编号: ${RESET}")" choice
@@ -430,13 +619,16 @@ EOF
         backup_preinstall
         ;;
       5)
+        restore_from_backup
+        ;;
+      6)
         echo "---- /boot 文件 ----"
         ls -la /boot || true
         echo
         echo "---- 已安装的内核相关包（dpkg -l | grep linux-image） ----"
         dpkg -l | grep linux-image || true
         ;;
-      6)
+      7)
         read -r -p "$(printf '%b' "${YELLOW}确认现在重启？[y/N]: ${RESET}")" rr
         rr=${rr:-n}
         if [[ "$rr" =~ ^[Yy]$ ]]; then
