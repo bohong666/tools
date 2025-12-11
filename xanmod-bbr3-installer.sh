@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # =========================================================
-# BBR Manager - Full Network Stack Manager for Ubuntu
-# Version: 1.0.0
+# BBR Manager 网络栈管理工具
+# Version: 1.1.0
 # Author: ChatGPT
 # =========================================================
 
 set -e
 
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.1.0"
 BACKUP_DIR="/etc/bbr-manager"
 BACKUP_FILE="$BACKUP_DIR/backup.json"
 BACKUP_CONF="$BACKUP_DIR/backup.conf"
@@ -88,12 +88,7 @@ restore_backup() {
     echo -e "${GREEN}恢复队列调度算法: $QDISC${RESET}"
     sysctl -w net.core.default_qdisc="$QDISC" >/dev/null
 
-    echo -e "${GREEN}恢复旧内核: $KERNEL${RESET}"
-    if [[ -d "/lib/modules/$KERNEL" ]]; then
-        echo -e "${YELLOW}设置 GRUB 默认启动旧内核...${RESET}"
-        grub-set-default 0 || true
-    fi
-
+    echo -e "${GREEN}恢复内核包信息: $KERNEL${RESET}"
     echo -e "${CYAN}恢复完成，建议重启系统${RESET}"
 }
 
@@ -103,6 +98,7 @@ restore_backup() {
 install_xanmod() {
     echo -e "${YELLOW}正在添加 XanMod 仓库...${RESET}"
 
+    # 使用正确 GPG Key
     curl -fsSL https://dl.xanmod.org/gpg.key \
         | gpg --dearmor \
         | tee /usr/share/keyrings/xanmod.gpg >/dev/null
@@ -111,7 +107,17 @@ install_xanmod() {
         > /etc/apt/sources.list.d/xanmod.list
 
     apt-get update -y
-    apt-get install -y linux-xanmod
+
+    # 自动查找可用 XanMod 内核包
+    PACKAGE_NAME=$(apt-cache search linux-xanmod | grep -E 'linux-xanmod(-lts|-mainline)?' | awk '{print $1}' | head -n1)
+
+    if [[ -z "$PACKAGE_NAME" ]]; then
+        echo -e "${RED}未找到可安装的 XanMod 内核包，请确认仓库是否支持当前 Ubuntu 版本${RESET}"
+        return
+    fi
+
+    echo -e "${GREEN}找到可安装包: $PACKAGE_NAME${RESET}"
+    apt-get install -y "$PACKAGE_NAME"
 
     echo -e "${GREEN}XanMod 内核安装完成，请重启系统${RESET}"
 }
@@ -124,7 +130,7 @@ select_cc_and_qdisc() {
     sysctl net.ipv4.tcp_available_congestion_control
 
     echo -e "\n${CYAN}可用队列算法:${RESET}"
-    lsmod | grep sch_ | awk '{print $1}' || echo "(可能需要 modprobe 加载模块)"
+    echo -e "常见: fq, fq_codel, cake"
 
     echo -e "\n${YELLOW}请输入要使用的拥塞算法 (如 bbr, bbr3, cubic): ${RESET}"
     read -r CC
@@ -134,9 +140,15 @@ select_cc_and_qdisc() {
     read -r QDISC
 
     if [[ "$QDISC" == "cake" ]]; then
-        echo -e "${CYAN}启用 CAKE 需要输入带宽值 (单一值)：${RESET}"
-        echo -e "${YELLOW}例如：100mbit / 50mbit${RESET}"
-        read -r BW
+        echo -e "${CYAN}启用 CAKE 需要输入带宽值 (可分别输入 VPS 和本地带宽)：${RESET}"
+        echo -e "${YELLOW}本地带宽 (例如 100mbit):${RESET}"
+        read -r LOCAL_BW
+        echo -e "${YELLOW}VPS 带宽 (例如 100mbit):${RESET}"
+        read -r VPS_BW
+
+        # 合并使用 (取最小值或单值可自行修改)
+        BW="$LOCAL_BW"
+
         tc qdisc replace dev eth0 root cake bandwidth "$BW"
     else
         sysctl -w net.core.default_qdisc="$QDISC"
@@ -151,10 +163,14 @@ select_cc_and_qdisc() {
 uninstall_xanmod() {
     echo -e "${YELLOW}正在卸载 XanMod 内核...${RESET}"
 
-    apt-get purge -y "linux-xanmod*" || true
-    apt-get autoremove -y
-
-    echo -e "${GREEN}卸载完成，请选择旧内核启动（如已安装）${RESET}"
+    PACKAGE_NAME=$(dpkg -l | grep linux-xanmod | awk '{print $2}')
+    if [[ -n "$PACKAGE_NAME" ]]; then
+        apt-get purge -y $PACKAGE_NAME
+        apt-get autoremove -y
+        echo -e "${GREEN}卸载完成，请选择旧内核启动${RESET}"
+    else
+        echo -e "${RED}未检测到 XanMod 内核已安装${RESET}"
+    fi
 }
 
 # ---------------------------------------------------------
