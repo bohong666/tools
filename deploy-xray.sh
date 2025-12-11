@@ -1,116 +1,127 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# deploy-xray-vless.sh
+# 完整 Xray VLESS 双栈部署脚本
+# Usage: bash deploy-xray-vless.sh [NodeName]
+
 set -e
 
-# ------------------------
-# 用户配置
-# ------------------------
-NODE_NAME=${1:-"VLESS-$(date +%s)"}  # 第一个参数可自定义节点名称，否则自动生成
+NODE_NAME=${1:-VLESS-$(date +%m%d%H%M)}
+CONFIG_DIR="/usr/local/etc/xray"
+CONFIG_FILE="${CONFIG_DIR}/config.json"
 
-# ------------------------
-# 系统更新 & 安装依赖
-# ------------------------
-echo "更新系统..."
-apt update -y && apt upgrade -y
-apt install -y curl wget unzip lsof sudo qrencode openssl
+echo "节点名称: $NODE_NAME"
 
-# ------------------------
-# 启用 BBR
-# ------------------------
+# 1. 更新系统并安装依赖
+echo "更新系统并安装依赖..."
+apt update -y
+apt upgrade -y
+apt install -y curl wget unzip lsof qrencode sudo
+
+# 2. 启用 BBR
 echo "启用 BBR..."
-echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
-echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
-sysctl -p
+modprobe tcp_bbr || true
+sysctl -w net.core.default_qdisc=fq
+sysctl -w net.ipv4.tcp_congestion_control=bbr
 
-# ------------------------
-# 安装 Xray-core
-# ------------------------
+# 3. 安装 Xray
 echo "安装 Xray..."
-bash <(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh) install
+XRAY_VERSION="v25.12.8"
+TMP_DIR=$(mktemp -d)
+curl -L -o "$TMP_DIR/xray.zip" "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/Xray-linux-64.zip"
+unzip -o "$TMP_DIR/xray.zip" -d "$TMP_DIR"
+install -m 755 "$TMP_DIR/xray" /usr/local/bin/xray
+mkdir -p /usr/local/share/xray
+install -m 644 "$TMP_DIR/geoip.dat" /usr/local/share/xray/
+install -m 644 "$TMP_DIR/geosite.dat" /usr/local/share/xray/
+rm -rf "$TMP_DIR"
 
-# ------------------------
-# 生成 UUID / Reality Key / shortId
-# ------------------------
-UUID=$(xray uuid)
-PRIV_KEY=$(xray x25519)
-SHORTID=$(openssl rand -hex 8)
+# 4. 创建配置目录
+mkdir -p "$CONFIG_DIR"
 
-# ------------------------
-# 设置 Xray 配置
-# ------------------------
-cat > /etc/xray/config.json <<EOF
+# 5. 生成 UUID
+UUID=$(cat /proc/sys/kernel/random/uuid)
+echo "生成 UUID: $UUID"
+
+# 6. 自动获取本机 IPv4 和 IPv6（只取 eth0 第一条）
+IPV4=$(ip -4 addr show eth0 | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
+IPV6=$(ip -6 addr show eth0 | grep -oP '(?<=inet6\s)[\da-f:]+(?=/64)' | head -1)
+
+# 7. 写配置文件
+cat > "$CONFIG_FILE" <<EOF
 {
-    "log": {"loglevel": "warning"},
-    "routing": {
-        "domainStrategy": "IPIfNonMatch",
-        "rules": [
-            {"type":"field","protocol":["bittorrent"],"outboundTag":"block"},
-            {"type":"field","ip":["geoip:private"],"outboundTag":"block"},
-            {"type":"field","ip":["geoip:cn"],"outboundTag":"block"},
-            {"type":"field","domain":["geosite:category-ads-all"],"outboundTag":"block"}
-        ]
+  "log": {
+    "loglevel": "info",
+    "access": "/var/log/xray/access.log",
+    "error": "/var/log/xray/error.log"
+  },
+  "inbounds": [
+    {
+      "port": 443,
+      "protocol": "vless",
+      "settings": {
+        "clients": [{"id": "$UUID"}],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "tls"
+      }
     },
-    "inbounds": [
-        {
-            "tag": "xray-xtls-reality",
-            "listen": "0.0.0.0",
-            "port": 443,
-            "protocol": "vless",
-            "settings": {
-                "clients": [{"id":"$UUID","flow":"xtls-rprx-vision"}],
-                "decryption": "none"
-            },
-            "streamSettings": {
-                "network": "tcp",
-                "security": "reality",
-                "realitySettings": {
-                    "dest": "www.drymt.com:443",
-                    "serverNames": ["www.drymt.com"],
-                    "privateKey": "$PRIV_KEY",
-                    "shortIds": ["$SHORTID"]
-                }
-            },
-            "sniffing": {"enabled":true,"destOverride":["http","tls","quic"]}
-        }
-    ],
-    "outbounds": [
-        {"protocol": "freedom","tag": "direct"},
-        {"protocol": "blackhole","tag": "block"}
-    ]
+    {
+      "port": 443,
+      "protocol": "vless",
+      "listen": "::",
+      "settings": {
+        "clients": [{"id": "$UUID"}],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "tls"
+      }
+    }
+  ],
+  "outbounds": [
+    {"protocol": "freedom", "settings": {}}
+  ]
 }
 EOF
 
-# ------------------------
-# 设置 systemd 并启动 Xray
-# ------------------------
+# 8. 创建 systemd 服务
+cat > /etc/systemd/system/xray.service <<EOF
+[Unit]
+Description=Xray Service
+After=network.target nss-lookup.target
+
+[Service]
+User=nobody
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ExecStart=/usr/local/bin/xray run -config $CONFIG_FILE
+Restart=on-failure
+RestartPreventExitStatus=23
+LimitNPROC=10000
+LimitNOFILE=1000000
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# 9. 启用并启动服务
+systemctl daemon-reload
 systemctl enable xray
 systemctl restart xray
 
-# ------------------------
-# 获取 IP
-# ------------------------
-IP4=$(curl -4 -s https://api.ipify.org)
-IP6=$(curl -6 -s https://api64.ipify.org || echo "")
-
-# ------------------------
-# 生成 VLESS 节点链接
-# ------------------------
-VLESS_LINK_IPV4="vless://$UUID@${IP4}:443?flow=xtls-rprx-vision&security=reality&encryption=none&type=tcp&reality=dest%3Dwww.drymt.com%3BserverNames%3Dwww.drymt.com%3BshortId%3D$SHORTID#$NODE_NAME"
-
-if [[ -n "$IP6" ]]; then
-  VLESS_LINK_IPV6="vless://$UUID@[$IP6]:443?flow=xtls-rprx-vision&security=reality&encryption=none&type=tcp&reality=dest%3Dwww.drymt.com%3BserverNames%3Dwww.drymt.com%3BshortId%3D$SHORTID#$NODE_NAME-IPv6"
-fi
-
-# ------------------------
-# 输出结果
-# ------------------------
-echo "------------------------"
-echo "Xray VLESS 节点已部署完成！"
+# 10. 输出节点信息
+echo "=================================================="
+echo "Xray VLESS 部署完成！"
 echo "节点名称: $NODE_NAME"
 echo "UUID: $UUID"
-echo "PrivateKey: $PRIV_KEY"
-echo "ShortId: $SHORTID"
-echo "IPv4 VLESS 节点链接: $VLESS_LINK_IPV4"
-if [[ -n "$IP6" ]]; then
-  echo "IPv6 VLESS 节点链接: $VLESS_LINK_IPV6"
+echo "IPv4 VLESS: vless://$UUID@$IPV4:443?encryption=none&security=tls#$NODE_NAME"
+if [ -n "$IPV6" ]; then
+    echo "IPv6 VLESS: vless://$UUID@[$IPV6]:443?encryption=none&security=tls#$NODE_NAME"
 fi
-echo "------------------------"
+echo "日志路径: /var/log/xray/"
+echo "配置路径: $CONFIG_FILE"
+echo "=================================================="
