@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # ================================================
-# 服务器监控系统 - 服务端一键安装脚本
-# 支持 Ubuntu/Debian/CentOS
+# 服务器监控系统 - 服务端一键安装脚本 v2
+# 修复 Ubuntu 18.04 兼容性问题
 # ================================================
 
 set -e
@@ -16,7 +16,7 @@ NC='\033[0m'
 echo -e "${BLUE}"
 cat << "EOF"
 ╔════════════════════════════════════════════════╗
-║     服务器监控系统 - 服务端一键安装            ║
+║     服务器监控系统 - 服务端一键安装 v2         ║
 ║     Server Monitor - Auto Installer            ║
 ╚════════════════════════════════════════════════╝
 EOF
@@ -40,11 +40,27 @@ install_nodejs() {
     echo -e "\n${YELLOW}→ 正在安装 Node.js...${NC}"
     
     if command -v node &> /dev/null; then
-        echo -e "${GREEN}✓ Node.js 已安装 ($(node -v))${NC}"
-        return
+        NODE_VERSION=$(node -v | cut -d'v' -f2 | cut -d'.' -f1)
+        if [ "$NODE_VERSION" -ge 14 ]; then
+            echo -e "${GREEN}✓ Node.js 已安装 ($(node -v))${NC}"
+            return
+        fi
     fi
 
-    if [[ "$OS" == "ubuntu" ]] || [[ "$OS" == "debian" ]]; then
+    # Ubuntu 18.04 使用 Node.js 16
+    if [[ "$OS" == "ubuntu" ]] && [[ "$VERSION" == "18.04" ]]; then
+        echo -e "${YELLOW}! Ubuntu 18.04 检测到，安装 Node.js 16 (兼容版本)${NC}"
+        curl -fsSL https://deb.nodesource.com/setup_16.x | sudo -E bash - || {
+            echo -e "${YELLOW}! 官方源失败，尝试备用方案...${NC}"
+            install_nodejs_via_nvm
+            return
+        }
+        sudo apt-get install -y nodejs || {
+            echo -e "${YELLOW}! apt 安装失败，使用 NVM...${NC}"
+            install_nodejs_via_nvm
+            return
+        }
+    elif [[ "$OS" == "ubuntu" ]] || [[ "$OS" == "debian" ]]; then
         curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -
         sudo apt-get install -y nodejs
     elif [[ "$OS" == "centos" ]] || [[ "$OS" == "rhel" ]]; then
@@ -52,7 +68,44 @@ install_nodejs() {
         sudo yum install -y nodejs
     fi
 
+    if ! command -v node &> /dev/null; then
+        echo -e "${RED}✗ Node.js 安装失败，尝试使用 NVM 安装...${NC}"
+        install_nodejs_via_nvm
+        return
+    fi
+
     echo -e "${GREEN}✓ Node.js 安装完成 ($(node -v))${NC}"
+}
+
+# 备用方案：使用 NVM 安装 Node.js
+install_nodejs_via_nvm() {
+    echo -e "${YELLOW}→ 使用 NVM 安装 Node.js 16...${NC}"
+    
+    # 安装 NVM
+    export HOME=/root
+    curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash
+    
+    # 加载 NVM
+    export NVM_DIR="$HOME/.nvm"
+    [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+    
+    # 安装 Node.js 16
+    nvm install 16
+    nvm use 16
+    nvm alias default 16
+    
+    # 创建系统级软链接
+    NODE_PATH=$(nvm which 16)
+    NPM_PATH=$(dirname $NODE_PATH)/npm
+    
+    sudo ln -sf "$NODE_PATH" /usr/local/bin/node
+    sudo ln -sf "$NPM_PATH" /usr/local/bin/npm
+    
+    # 更新 PATH
+    echo 'export PATH="/usr/local/bin:$PATH"' >> ~/.bashrc
+    export PATH="/usr/local/bin:$PATH"
+    
+    echo -e "${GREEN}✓ Node.js 通过 NVM 安装完成 ($(node -v))${NC}"
 }
 
 # 创建项目目录
@@ -63,7 +116,7 @@ create_project() {
     sudo mkdir -p $INSTALL_DIR
     cd $INSTALL_DIR
     
-    echo -e "${GREEN}✓ 项目目录创建完成: $INSTALL_DIR${NC}"
+    echo -e "${GREEN}✓ 项目目录: $INSTALL_DIR${NC}"
 }
 
 # 创建 package.json
@@ -77,8 +130,7 @@ create_package_json() {
   "description": "Server monitoring system",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "dev": "node server.js"
+    "start": "node server.js"
   },
   "dependencies": {
     "express": "^4.18.2",
@@ -103,7 +155,6 @@ const sqlite3 = require('sqlite3').verbose();
 const WebSocket = require('ws');
 const crypto = require('crypto');
 const http = require('http');
-const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -259,42 +310,6 @@ app.get('/api/servers', (req, res) => {
   });
 });
 
-app.get('/api/history/cpu/:token', (req, res) => {
-  db.all(
-    `SELECT timestamp, cpu_usage FROM metrics 
-     WHERE server_token = ? AND timestamp > datetime('now', '-24 hours')
-     ORDER BY timestamp ASC`,
-    [req.params.token],
-    (err, rows) => {
-      if (err) return res.status(500).json({ error: 'Fetch failed' });
-      res.json({ data: rows });
-    }
-  );
-});
-
-app.get('/api/history/traffic/:token', (req, res) => {
-  db.all(
-    `SELECT date, upload, download FROM traffic_daily 
-     WHERE server_token = ? AND date > date('now', '-30 days')
-     ORDER BY date ASC`,
-    [req.params.token],
-    (err, rows) => {
-      if (err) return res.status(500).json({ error: 'Fetch failed' });
-      res.json({ data: rows });
-    }
-  );
-});
-
-app.delete('/api/servers/:token', (req, res) => {
-  const { token } = req.params;
-  db.run('DELETE FROM servers WHERE token = ?', [token], function(err) {
-    if (err) return res.status(500).json({ error: 'Delete failed' });
-    db.run('DELETE FROM metrics WHERE server_token = ?', [token]);
-    db.run('DELETE FROM traffic_daily WHERE server_token = ?', [token]);
-    res.json({ success: true });
-  });
-});
-
 function updateDailyTraffic(token, upload, download) {
   const today = new Date().toISOString().split('T')[0];
   db.run(
@@ -324,12 +339,25 @@ function broadcastUpdate(token) {
 }
 
 server.listen(PORT, '0.0.0.0', () => {
+  const os = require('os');
+  const interfaces = os.networkInterfaces();
+  let serverIP = '0.0.0.0';
+  
+  for (const name of Object.keys(interfaces)) {
+    for (const iface of interfaces[name]) {
+      if (iface.family === 'IPv4' && !iface.internal) {
+        serverIP = iface.address;
+        break;
+      }
+    }
+  }
+  
   console.log(`
 ╔════════════════════════════════════════╗
 ║   服务器监控系统已启动                 ║
 ╠════════════════════════════════════════╣
-║  访问地址: http://your-ip:${PORT}       ║
-║  API 地址: http://your-ip:${PORT}/api  ║
+║  访问地址: http://${serverIP}:${PORT}
+║  本地访问: http://localhost:${PORT}
 ╚════════════════════════════════════════╝
   `);
 });
@@ -349,7 +377,7 @@ SERVER_EOF
 create_frontend() {
     echo -e "\n${YELLOW}→ 创建前端页面...${NC}"
     
-    sudo mkdir -p public
+    mkdir -p public
     
     cat > public/index.html << 'HTML_EOF'
 <!DOCTYPE html>
@@ -359,29 +387,21 @@ create_frontend() {
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>服务器监控面板</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <style>
-        body { background: #111827; color: #f3f4f6; }
-        .status-dot { width: 12px; height: 12px; border-radius: 50%; }
-        .bar { height: 16px; width: 12px; border-radius: 2px; }
-    </style>
 </head>
-<body class="p-4">
+<body class="bg-gray-900 text-gray-100 p-4">
     <div class="max-w-7xl mx-auto">
         <h1 class="text-3xl font-bold mb-6 text-center">🖥️ 服务器监控面板</h1>
         
-        <!-- 统计栏 -->
         <div class="bg-gray-800 rounded-lg p-4 mb-4 flex flex-wrap gap-4 text-sm">
-            <div>💰 全局资产：¥<span id="total-price">0</span></div>
             <div>🟢 在线: <span id="online-count">0</span></div>
             <div>🔴 离线: <span id="offline-count">0</span></div>
             <div>📍 区域: <span id="location-count">0</span></div>
         </div>
 
-        <!-- 服务器列表 -->
         <div id="servers-container" class="space-y-2"></div>
 
         <div class="mt-8 text-center text-sm text-gray-500">
-            <p>服务器监控系统 v1.0 | 自动刷新间隔: 30秒</p>
+            <p>服务器监控系统 v1.0 | 自动刷新: 30秒</p>
         </div>
     </div>
 
@@ -401,69 +421,53 @@ create_frontend() {
         function renderServers(servers) {
             const container = document.getElementById('servers-container');
             const online = servers.filter(s => s.status === 'online').length;
-            const offline = servers.length - online;
             
             document.getElementById('online-count').textContent = online;
-            document.getElementById('offline-count').textContent = offline;
+            document.getElementById('offline-count').textContent = servers.length - online;
             document.getElementById('location-count').textContent = new Set(servers.map(s => s.country)).size;
 
             container.innerHTML = servers.map(s => `
                 <div class="bg-gray-800 rounded-lg p-4 hover:bg-gray-700 transition">
-                    <div class="grid grid-cols-12 gap-4 items-center text-sm">
-                        <div class="col-span-1">
-                            <div class="status-dot ${s.status === 'online' ? 'bg-green-500' : 'bg-red-500'}"></div>
+                    <div class="grid grid-cols-1 md:grid-cols-6 gap-4 text-sm">
+                        <div class="flex items-center gap-2">
+                            <div class="w-3 h-3 rounded-full ${s.status === 'online' ? 'bg-green-500' : 'bg-red-500'}"></div>
+                            <div>
+                                <div class="font-semibold">${s.name}</div>
+                                <div class="text-xs text-gray-400">${s.merchant || 'Unknown'}</div>
+                            </div>
                         </div>
-                        <div class="col-span-2">
-                            <div class="font-semibold">${s.name}</div>
-                            <div class="text-xs text-gray-400">${s.merchant || 'Unknown'}</div>
+                        <div>
+                            <div class="text-xs text-gray-400">CPU</div>
+                            <div>${s.cpu.usage.toFixed(1)}% (${s.cpu.cores}核)</div>
                         </div>
-                        <div class="col-span-1">
-                            <div class="text-xs">CPU: ${s.cpu.usage.toFixed(1)}%</div>
-                            <div class="text-xs">核心: ${s.cpu.cores}</div>
-                        </div>
-                        <div class="col-span-1">
-                            <div class="text-xs">内存: ${s.memory.percent.toFixed(1)}%</div>
+                        <div>
+                            <div class="text-xs text-gray-400">内存</div>
+                            <div>${s.memory.percent.toFixed(1)}%</div>
                             <div class="text-xs">${s.memory.used.toFixed(1)}/${s.memory.total.toFixed(1)} GB</div>
                         </div>
-                        <div class="col-span-1">
-                            <div class="text-xs">硬盘: ${s.disk.percent.toFixed(1)}%</div>
-                            <div class="text-xs">${s.disk.used.toFixed(1)}/${s.disk.total.toFixed(1)} GB</div>
+                        <div>
+                            <div class="text-xs text-gray-400">硬盘</div>
+                            <div>${s.disk.percent.toFixed(1)}%</div>
                         </div>
-                        <div class="col-span-2">
+                        <div>
+                            <div class="text-xs text-gray-400">速率</div>
                             <div class="text-xs text-green-400">↑ ${s.speed.upload.toFixed(2)} MB/s</div>
                             <div class="text-xs text-red-400">↓ ${s.speed.download.toFixed(2)} MB/s</div>
                         </div>
-                        <div class="col-span-1">
-                            <div class="text-xs">电信: ${s.delays.ct}ms</div>
-                            <div class="text-xs">联通: ${s.delays.cu}ms</div>
-                        </div>
-                        <div class="col-span-1">
-                            <div class="text-xs">移动: ${s.delays.cm}ms</div>
-                        </div>
-                        <div class="col-span-1">
-                            <div class="text-xs">在线率</div>
-                            <div class="text-xs font-semibold">${s.uptime.toFixed(1)}%</div>
-                        </div>
-                        <div class="col-span-1 text-xs">
-                            ${s.price || '-'}
+                        <div>
+                            <div class="text-xs text-gray-400">延迟</div>
+                            <div class="text-xs">电信:${s.delays.ct}ms 联通:${s.delays.cu}ms</div>
                         </div>
                     </div>
                 </div>
             `).join('');
         }
 
-        // 初始加载
         fetchServers();
-        
-        // 每30秒刷新
         setInterval(fetchServers, 30000);
 
-        // WebSocket 实时更新
         const ws = new WebSocket(`ws://${window.location.host}`);
-        ws.onmessage = (e) => {
-            const data = JSON.parse(e.data);
-            if (data.type === 'update') fetchServers();
-        };
+        ws.onmessage = () => fetchServers();
     </script>
 </body>
 </html>
@@ -474,9 +478,25 @@ HTML_EOF
 
 # 安装依赖
 install_dependencies() {
-    echo -e "\n${YELLOW}→ 安装项目依赖...${NC}"
-    npm install
+    echo -e "\n${YELLOW}→ 安装项目依赖 (可能需要几分钟)...${NC}"
+    npm install --production
     echo -e "${GREEN}✓ 依赖安装完成${NC}"
+}
+
+# 创建启动脚本
+create_start_script() {
+    echo -e "\n${YELLOW}→ 创建启动脚本...${NC}"
+    
+    cat > start.sh << 'START_EOF'
+#!/bin/bash
+export NVM_DIR="$HOME/.nvm"
+[ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+cd /opt/server-monitor
+node server.js
+START_EOF
+
+    chmod +x start.sh
+    echo -e "${GREEN}✓ 启动脚本创建完成${NC}"
 }
 
 # 创建 systemd 服务
@@ -492,7 +512,7 @@ After=network.target
 Type=simple
 User=root
 WorkingDirectory=$INSTALL_DIR
-ExecStart=/usr/bin/node $INSTALL_DIR/server.js
+ExecStart=/bin/bash $INSTALL_DIR/start.sh
 Restart=always
 RestartSec=10
 
@@ -510,14 +530,14 @@ configure_firewall() {
     echo -e "\n${YELLOW}→ 配置防火墙...${NC}"
     
     if command -v ufw &> /dev/null; then
-        sudo ufw allow 3000/tcp
+        sudo ufw allow 3000/tcp 2>/dev/null || true
         echo -e "${GREEN}✓ UFW 防火墙规则已添加${NC}"
     elif command -v firewall-cmd &> /dev/null; then
-        sudo firewall-cmd --permanent --add-port=3000/tcp
-        sudo firewall-cmd --reload
-        echo -e "${GREEN}✓ Firewalld 防火墙规则已添加${NC}"
+        sudo firewall-cmd --permanent --add-port=3000/tcp 2>/dev/null || true
+        sudo firewall-cmd --reload 2>/dev/null || true
+        echo -e "${GREEN}✓ Firewalld 规则已添加${NC}"
     else
-        echo -e "${YELLOW}! 未检测到防火墙，请手动开放 3000 端口${NC}"
+        echo -e "${YELLOW}! 未检测到防火墙${NC}"
     fi
 }
 
@@ -525,19 +545,19 @@ configure_firewall() {
 start_service() {
     echo -e "\n${YELLOW}→ 启动服务...${NC}"
     sudo systemctl start server-monitor
-    sleep 2
+    sleep 3
     
     if sudo systemctl is-active --quiet server-monitor; then
         echo -e "${GREEN}✓ 服务启动成功${NC}"
     else
-        echo -e "${RED}✗ 服务启动失败，请检查日志: journalctl -u server-monitor${NC}"
+        echo -e "${RED}✗ 服务启动失败${NC}"
+        echo -e "${YELLOW}查看日志: journalctl -u server-monitor -n 50${NC}"
         exit 1
     fi
 }
 
 # 显示完成信息
 show_completion() {
-    # 获取本机 IP
     SERVER_IP=$(hostname -I | awk '{print $1}')
     
     echo -e "\n${GREEN}"
@@ -546,22 +566,15 @@ show_completion() {
 ║              🎉 安装完成！                     ║
 ╠════════════════════════════════════════════════╣
 ║                                                ║
-║  📱 Web 访问地址:                              ║
+║  📱 访问地址:                                  ║
 ║     http://$SERVER_IP:3000                ║
-║                                                ║
-║  🔌 API 地址:                                  ║
-║     http://$SERVER_IP:3000/api            ║
+║     http://localhost:3000 (本地)               ║
 ║                                                ║
 ║  📋 管理命令:                                  ║
-║     启动: systemctl start server-monitor      ║
-║     停止: systemctl stop server-monitor       ║
-║     重启: systemctl restart server-monitor    ║
-║     状态: systemctl status server-monitor     ║
-║     日志: journalctl -u server-monitor -f     ║
-║                                                ║
-║  📝 下一步:                                    ║
-║     1. 在客户端服务器上运行客户端脚本          ║
-║     2. 访问 Web 面板查看监控数据               ║
+║     systemctl start server-monitor            ║
+║     systemctl stop server-monitor             ║
+║     systemctl status server-monitor           ║
+║     journalctl -u server-monitor -f           ║
 ║                                                ║
 ╚════════════════════════════════════════════════╝
 EOF
@@ -577,6 +590,7 @@ main() {
     create_server_code
     create_frontend
     install_dependencies
+    create_start_script
     create_systemd_service
     configure_firewall
     start_service
