@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # ================================================
-# 服务器监控系统 - 客户端一键安装脚本
-# 支持 Linux/macOS (Python 3.6+)
+# 服务器监控系统 - 客户端一键安装脚本 v2
+# 修复 Debian 12 pip 安装问题
 # ================================================
 
 set -e
@@ -16,7 +16,7 @@ NC='\033[0m'
 echo -e "${BLUE}"
 cat << "EOF"
 ╔════════════════════════════════════════════════╗
-║     服务器监控系统 - 客户端一键安装            ║
+║     服务器监控系统 - 客户端一键安装 v2         ║
 ║     Server Monitor - Client Installer          ║
 ╚════════════════════════════════════════════════╝
 EOF
@@ -60,10 +60,10 @@ check_python() {
 install_python() {
     if [[ "$OS" == "ubuntu" ]] || [[ "$OS" == "debian" ]]; then
         sudo apt-get update
-        sudo apt-get install -y python3 python3-pip
+        sudo apt-get install -y python3 python3-pip python3-dev build-essential
         PYTHON_CMD="python3"
     elif [[ "$OS" == "centos" ]] || [[ "$OS" == "rhel" ]]; then
-        sudo yum install -y python3 python3-pip
+        sudo yum install -y python3 python3-pip python3-devel gcc
         PYTHON_CMD="python3"
     elif [[ "$OS" == "macos" ]]; then
         brew install python3
@@ -76,19 +76,54 @@ install_python() {
 install_dependencies() {
     echo -e "\n${YELLOW}→ 安装 Python 依赖...${NC}"
     
+    # 检查并安装 pip
+    if ! command -v pip3 &> /dev/null && ! command -v pip &> /dev/null; then
+        echo -e "${YELLOW}! 未找到 pip，正在安装...${NC}"
+        
+        if [[ "$OS" == "ubuntu" ]] || [[ "$OS" == "debian" ]]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y python3-pip python3-dev build-essential
+        elif [[ "$OS" == "centos" ]] || [[ "$OS" == "rhel" ]]; then
+            sudo yum install -y python3-pip python3-devel gcc
+        elif [[ "$OS" == "macos" ]]; then
+            $PYTHON_CMD -m ensurepip --upgrade
+        fi
+        
+        if ! command -v pip3 &> /dev/null && ! command -v pip &> /dev/null; then
+            echo -e "${RED}✗ pip 安装失败${NC}"
+            exit 1
+        fi
+        echo -e "${GREEN}✓ pip 安装完成${NC}"
+    fi
+    
+    # 确定 pip 命令
     if command -v pip3 &> /dev/null; then
         PIP_CMD="pip3"
     elif command -v pip &> /dev/null; then
         PIP_CMD="pip"
-    else
-        echo -e "${RED}✗ 未找到 pip，请手动安装${NC}"
-        exit 1
     fi
     
-    $PIP_CMD install --upgrade pip
-    $PIP_CMD install psutil requests
+    echo -e "${YELLOW}→ 升级 pip...${NC}"
+    $PIP_CMD install --upgrade pip --break-system-packages 2>/dev/null || \
+    $PIP_CMD install --upgrade pip 2>/dev/null || \
+    $PYTHON_CMD -m pip install --upgrade pip 2>/dev/null || true
     
-    echo -e "${GREEN}✓ 依赖安装完成${NC}"
+    echo -e "${YELLOW}→ 安装 psutil 和 requests...${NC}"
+    
+    # 尝试多种安装方式
+    if $PIP_CMD install psutil requests --break-system-packages 2>/dev/null; then
+        echo -e "${GREEN}✓ 依赖安装完成 (使用 --break-system-packages)${NC}"
+    elif $PIP_CMD install psutil requests 2>/dev/null; then
+        echo -e "${GREEN}✓ 依赖安装完成${NC}"
+    elif $PYTHON_CMD -m pip install psutil requests --break-system-packages 2>/dev/null; then
+        echo -e "${GREEN}✓ 依赖安装完成 (使用 python -m pip)${NC}"
+    elif sudo apt-get install -y python3-psutil python3-requests 2>/dev/null; then
+        echo -e "${GREEN}✓ 依赖安装完成 (使用系统包管理器)${NC}"
+    else
+        echo -e "${RED}✗ 依赖安装失败${NC}"
+        echo -e "${YELLOW}尝试手动安装: pip3 install --break-system-packages psutil requests${NC}"
+        exit 1
+    fi
 }
 
 # 获取用户配置
@@ -116,11 +151,11 @@ get_user_config() {
     fi
     
     # 商家名称
-    echo -e "\n${YELLOW}请输入商家名称 (例: Vultr, 可选):${NC}"
+    echo -e "\n${YELLOW}请输入商家名称 (例: Vultr, 可选，直接回车跳过):${NC}"
     read -p "商家名称: " MERCHANT
     
     # 国家代码
-    echo -e "\n${YELLOW}请输入国家代码 (例: US, CN, JP, 默认: US):${NC}"
+    echo -e "\n${YELLOW}请输入国家代码 (例: US, CN, JP, HK, 默认: US):${NC}"
     read -p "国家代码: " COUNTRY
     COUNTRY=${COUNTRY:-US}
     
@@ -136,15 +171,15 @@ get_user_config() {
     echo -e "${GREEN}→ 操作系统: $OS_TYPE${NC}"
     
     # 价格
-    echo -e "\n${YELLOW}请输入价格 (例: ¥50/月, 可选):${NC}"
+    echo -e "\n${YELLOW}请输入价格 (例: ¥50/月, 可选，直接回车跳过):${NC}"
     read -p "价格: " PRICE
     
     # 博客链接
-    echo -e "\n${YELLOW}请输入博客链接 (可选):${NC}"
+    echo -e "\n${YELLOW}请输入博客链接 (可选，直接回车跳过):${NC}"
     read -p "博客链接: " BLOG_LINK
     
     # 采集间隔
-    echo -e "\n${YELLOW}请输入采集间隔（秒，默认: 60）:${NC}"
+    echo -e "\n${YELLOW}请输入采集间隔（秒，默认: 60，建议 30-120）:${NC}"
     read -p "采集间隔: " INTERVAL
     INTERVAL=${INTERVAL:-60}
     
@@ -167,19 +202,26 @@ register_server() {
 REGISTER_EOF
 )
     
+    echo -e "${YELLOW}→ 连接到: $SERVER_URL/api/register${NC}"
+    
     REGISTER_RESPONSE=$(curl -s -X POST "$SERVER_URL/api/register" \
         -H "Content-Type: application/json" \
-        -d "$REGISTER_DATA")
+        -d "$REGISTER_DATA" 2>&1)
     
     TOKEN=$(echo $REGISTER_RESPONSE | grep -o '"token":"[^"]*"' | cut -d'"' -f4)
     
     if [ -z "$TOKEN" ]; then
-        echo -e "${RED}✗ 注册失败，请检查服务端地址是否正确${NC}"
+        echo -e "${RED}✗ 注册失败${NC}"
         echo -e "${RED}错误信息: $REGISTER_RESPONSE${NC}"
+        echo -e "${YELLOW}请检查:${NC}"
+        echo -e "${YELLOW}1. 服务端地址是否正确${NC}"
+        echo -e "${YELLOW}2. 服务端是否正在运行${NC}"
+        echo -e "${YELLOW}3. 网络是否连通: ping $(echo $SERVER_URL | sed 's|http://||' | sed 's|:.*||')${NC}"
         exit 1
     fi
     
-    echo -e "${GREEN}✓ 注册成功，Token: $TOKEN${NC}"
+    echo -e "${GREEN}✓ 注册成功${NC}"
+    echo -e "${GREEN}✓ Token: ${TOKEN:0:16}...${NC}"
 }
 
 # 创建监控客户端
@@ -409,12 +451,13 @@ SERVICE_EOF
 start_service() {
     echo -e "\n${YELLOW}→ 启动监控客户端...${NC}"
     sudo systemctl start monitor-client
-    sleep 2
+    sleep 3
     
     if sudo systemctl is-active --quiet monitor-client; then
         echo -e "${GREEN}✓ 客户端启动成功${NC}"
     else
-        echo -e "${RED}✗ 客户端启动失败，请检查日志: journalctl -u monitor-client${NC}"
+        echo -e "${RED}✗ 客户端启动失败${NC}"
+        echo -e "${YELLOW}查看日志: journalctl -u monitor-client -n 50${NC}"
         exit 1
     fi
 }
@@ -430,19 +473,18 @@ show_completion() {
 ║  ✅ 客户端已成功安装并启动                     ║
 ║                                                ║
 ║  📋 管理命令:                                  ║
-║     启动: systemctl start monitor-client      ║
-║     停止: systemctl stop monitor-client       ║
-║     重启: systemctl restart monitor-client    ║
-║     状态: systemctl status monitor-client     ║
-║     日志: journalctl -u monitor-client -f     ║
+║     systemctl start monitor-client            ║
+║     systemctl stop monitor-client             ║
+║     systemctl status monitor-client           ║
+║     journalctl -u monitor-client -f           ║
 ║                                                ║
 ║  📝 配置信息:                                  ║
 ║     服务端: $SERVER_URL
-║     服务器名称: $SERVER_NAME
+║     服务器名: $SERVER_NAME
 ║     Token: ${TOKEN:0:16}...
-║     采集间隔: ${INTERVAL}秒
+║     间隔: ${INTERVAL}秒
 ║                                                ║
-║  🌐 现在可以访问 Web 面板查看监控数据了！      ║
+║  🌐 现在访问 Web 面板查看监控数据！            ║
 ║                                                ║
 ╚════════════════════════════════════════════════╝
 EOF
