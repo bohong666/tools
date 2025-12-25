@@ -325,11 +325,22 @@ class ServerMonitorClient:
             return 0
     
     def get_network_delays(self):
-        return {
-            'ct': self.ping_test('www.189.cn'),
-            'cu': self.ping_test('www.10010.com'),
-            'cm': self.ping_test('www.10086.cn')
+        print("正在测试三网延迟...")
+        delays = {
+            'ct': self.ping_test('www.189.cn'),      # 电信
+            'cu': self.ping_test('www.10010.com'),   # 联通
+            'cm': self.ping_test('www.10086.cn')     # 移动
         }
+        print(f"延迟结果: 电信={delays['ct']}ms, 联通={delays['cu']}ms, 移动={delays['cm']}ms")
+        
+        # 如果移动失败，尝试备用地址
+        if delays['cm'] == 0:
+            print("移动延迟检测失败，尝试备用地址...")
+            delays['cm'] = self.ping_test('www.cmcc.com')
+            if delays['cm'] == 0:
+                delays['cm'] = self.ping_test('8.8.8.8')  # 最后尝试Google DNS
+        
+        return delays
     
     def collect_all_metrics(self):
         print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 正在采集数据...")
