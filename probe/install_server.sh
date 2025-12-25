@@ -6,23 +6,38 @@ BASE_DIR=/opt/monitor-server
 
 echo "===> Installing Monitor Server on port ${PORT}"
 
-# 1. 安装基础依赖
+# ---------- 基础依赖 ----------
 if command -v apt >/dev/null 2>&1; then
   apt update
-  apt install -y curl ca-certificates nodejs npm sqlite3
+  apt install -y curl ca-certificates sqlite3
+
+  # 只在 node 不存在时安装
+  if ! command -v node >/dev/null 2>&1; then
+    echo "Installing Node.js via NodeSource"
+    curl -fsSL https://deb.nodesource.com/setup_16.x | bash -
+    apt install -y nodejs
+  fi
+
 elif command -v yum >/dev/null 2>&1; then
-  yum install -y curl ca-certificates nodejs npm sqlite
+  yum install -y curl ca-certificates sqlite
+  if ! command -v node >/dev/null 2>&1; then
+    curl -fsSL https://rpm.nodesource.com/setup_16.x | bash -
+    yum install -y nodejs
+  fi
 else
   echo "Unsupported system"
   exit 1
 fi
 
-# 2. 创建目录
+node -v
+npm -v
+
+# ---------- 目录 ----------
 rm -rf ${BASE_DIR}
 mkdir -p ${BASE_DIR}/public
 cd ${BASE_DIR}
 
-# 3. package.json
+# ---------- package.json ----------
 cat > package.json <<'EOF'
 {
   "name": "monitor-server",
@@ -36,7 +51,7 @@ cat > package.json <<'EOF'
 }
 EOF
 
-# 4. server.js
+# ---------- server.js ----------
 cat > server.js <<'EOF'
 const express=require('express');
 const sqlite3=require('sqlite3').verbose();
@@ -48,9 +63,11 @@ const path=require('path');
 const PORT=6666;
 const JWT_SECRET=crypto.randomBytes(32).toString('hex');
 const app=express();
+
 app.use(express.json());
 app.use(express.urlencoded({extended:true}));
 app.use(express.static(path.join(__dirname,'public')));
+
 const db=new sqlite3.Database('./monitor.db');
 
 db.serialize(()=>{
@@ -147,7 +164,7 @@ app.post('/api/metrics',authClient,(req,res)=>{
 app.listen(PORT,()=>console.log('Monitor server on',PORT));
 EOF
 
-# 5. 前端
+# ---------- 前端 ----------
 cat > public/login.html <<'EOF'
 <!doctype html><body>
 <h3>Admin Login</h3>
@@ -177,10 +194,10 @@ Authorization:'Bearer '+localStorage.token}})
 </body>
 EOF
 
-# 6. 安装依赖
+# ---------- 安装依赖 ----------
 npm install --silent
 
-# 7. systemd
+# ---------- systemd ----------
 cat >/etc/systemd/system/monitor-server.service <<EOF
 [Unit]
 Description=Monitor Server
@@ -196,6 +213,6 @@ EOF
 systemctl daemon-reload
 systemctl enable --now monitor-server
 
-echo "===> Server installed"
+echo "===> Server installed successfully"
 echo "Login: http://IP:${PORT}/login.html"
 echo "Admin: admin / admin123"
