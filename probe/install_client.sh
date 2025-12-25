@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-VERSION="2025.12.25-002"
+VERSION="2025.12.25-003"
 echo "===> Installing Monitor Client, version: $VERSION"
 
-SERVER="http://YOUR_SERVER_IP:6666"
+SERVER="http://YOUR_SERVER_IP"
 NAME=$(hostname)
 
 cat > /usr/local/bin/monitor-client.sh <<EOF
