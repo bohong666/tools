@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -e
 
-VERSION="2025.12.25-002"
-PORT=6666
+VERSION="2025.12.25-003"
+PORT=80
 APP_DIR=/opt/monitor-server
 DB_FILE=$APP_DIR/data.db
 
@@ -39,7 +39,7 @@ const crypto = require('crypto');
 const sqlite3 = require('sqlite3').verbose();
 const url = require('url');
 
-const PORT = 6666;
+const PORT = 80;
 const db = new sqlite3.Database('./data.db');
 
 function hash(p) { return crypto.createHash('sha256').update(p).digest('hex'); }
@@ -164,6 +164,8 @@ After=network.target
 ExecStart=/usr/bin/node $APP_DIR/server.js
 WorkingDirectory=$APP_DIR
 Restart=always
+User=root
+Group=root
 
 [Install]
 WantedBy=multi-user.target
@@ -180,6 +182,6 @@ IPV6=$(ip -6 route get 2400:3200::1 2>/dev/null | awk '{print $7}')
 echo
 echo "===> Server installed successfully"
 echo "Version: $VERSION"
-[ -n "$IPV4" ] && echo "IPv4: http://$IPV4:$PORT/login.html"
-[ -n "$IPV6" ] && echo "IPv6: http://[$IPV6]:$PORT/login.html"
+[ -n "$IPV4" ] && echo "IPv4: http://$IPV4/login.html"
+[ -n "$IPV6" ] && echo "IPv6: http://[$IPV6]/login.html"
 echo "Admin: admin / admin123"
