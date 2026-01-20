@@ -79,8 +79,9 @@ UUID=$(cat /proc/sys/kernel/random/uuid)
 # 生成 Reality 密钥
 echo -e "${YELLOW}生成 Reality 密钥对...${NC}"
 KEYS_OUTPUT=$(xray x25519 2>&1)
-PRIVATE_KEY=$(echo "$KEYS_OUTPUT" | grep -oP '(?<=Private key: ).*' || echo "$KEYS_OUTPUT" | grep -i private | awk '{print $NF}')
-PUBLIC_KEY=$(echo "$KEYS_OUTPUT" | grep -oP '(?<=Public key: ).*' || echo "$KEYS_OUTPUT" | grep -i public | awk '{print $NF}')
+# 兼容新旧版本 xray 输出格式
+PRIVATE_KEY=$(echo "$KEYS_OUTPUT" | grep -oP '(?<=PrivateKey: ).*' || echo "$KEYS_OUTPUT" | grep -oP '(?<=Private key: ).*' || echo "$KEYS_OUTPUT" | grep -i private | awk '{print $NF}')
+PUBLIC_KEY=$(echo "$KEYS_OUTPUT" | grep -oP '(?<=Password: ).*' || echo "$KEYS_OUTPUT" | grep -oP '(?<=Public key: ).*' || echo "$KEYS_OUTPUT" | grep -i public | awk '{print $NF}')
 
 if [ -z "$PRIVATE_KEY" ] || [ -z "$PUBLIC_KEY" ]; then
     echo -e "${RED}密钥生成失败，请手动输入${NC}"
