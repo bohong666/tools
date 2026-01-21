@@ -94,7 +94,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/bohong666/tools/refs/heads/m
 A lightweight tool to **detect, switch, and verify IPv4 / IPv6 outbound priority** on VPS. Designed for **proxy nodes, relay servers, and dual‑stack environments**, no reboot required.
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/bohong666/tools/refs/heads/main/ip-priority.sh）
+bash <(curl -fsSL https://raw.githubusercontent.com/bohong666/tools/refs/heads/main/ip-priority.sh)
 ```
 ---
 
