@@ -122,7 +122,7 @@ gen_config() {
     "port": $SS_PORT,
     "protocol": "shadowsocks",
     "settings": {
-      "method": "2022-blake3-aes-128-gcm",
+      "method": "aes-128-gcm",
       "password": "$SS_PASS",
       "network": "tcp,udp"
     }
