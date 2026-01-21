@@ -74,7 +74,16 @@ Handcrafted Xray script with Reality and Vision support.
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/bohong666/tools/refs/heads/main/xray.sh)
 ```
+---
 
+### 🚪 中转服务（任意门） | Relay Gateway (Any‑Door)
+
+用于快速部署 任意门中转服务（Realm），支持多协议中转、低资源占用，适合多节点链路优化与流量中继场景。
+Deploy a lightweight relay gateway (Realm) for multi‑protocol forwarding, ideal for traffic relay, routing optimization, and chained nodes.
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/bohong666/tools/refs/heads/main/realm.sh)
+```
 ---
 
 ## ⚠️ 使用说明 | Usage Notes
