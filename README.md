@@ -79,10 +79,22 @@ bash <(curl -fsSL https://raw.githubusercontent.com/bohong666/tools/refs/heads/m
 ### 🚪 中转服务（任意门） | Relay Gateway (Any‑Door)
 
 用于快速部署 任意门中转服务（Realm），支持多协议中转、低资源占用，适合多节点链路优化与流量中继场景。
+
 Deploy a lightweight relay gateway (Realm) for multi‑protocol forwarding, ideal for traffic relay, routing optimization, and chained nodes.
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/bohong666/tools/refs/heads/main/realm.sh)
+```
+---
+
+### 🌐 VPS IPv4 / IPv6 Priority Manager 
+
+用于 **快速检测、切换并验证 VPS 对外访问 IPv4 / IPv6 优先级** 的轻量级工具脚本。 适用于 **代理节点、中转 VPS、多栈网络环境**，无需重启系统。 
+
+A lightweight tool to **detect, switch, and verify IPv4 / IPv6 outbound priority** on VPS. Designed for **proxy nodes, relay servers, and dual‑stack environments**, no reboot required.
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/bohong666/tools/refs/heads/main/ip-priority.sh）
 ```
 ---
 
