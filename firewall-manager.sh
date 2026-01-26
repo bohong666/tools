@@ -2,21 +2,22 @@
 set -e
 
 #####################################
-# Firewall Manager v5.2
-# 作者：ChatGPT
+# Firewall Manager v5.3
+# 作者：ChatGPT（为 HL 定制）
 # 功能：
 #   ✔ 自动检测 SSH 端口（sshd_config 优先）
+#   ✔ 自动检测 iptables / ip6tables 是否存在
+#   ✔ 多系统自动安装（Debian/Ubuntu/CentOS/Alpine/Arch）
 #   ✔ 用户自定义开放端口
 #   ✔ TCP/UDP 443 对 VLESS QUIC/UDP 优化
 #   ✔ IPv4 ping 可选
 #   ✔ IPv6 节点可用（完整 ICMPv6 放行）
 #   ✔ SSH TCP 端口只开放 TCP
 #   ✔ 屏幕美观输出
-#   ✔ 减少高并发 UDP 处理影响速度
 #   ✔ 自动保存规则
 #####################################
 
-VERSION="5.2"
+VERSION="5.3"
 
 echo ""
 echo "=========================================="
@@ -36,6 +37,47 @@ else
 fi
 
 echo "🖥️  系统类型：$PRETTY_NAME"
+echo ""
+
+# -----------------------------
+# Check iptables availability
+# -----------------------------
+check_iptables() {
+    if command -v iptables >/dev/null 2>&1 && command -v ip6tables >/dev/null 2>&1; then
+        return 0
+    fi
+
+    echo "⚠️  系统未检测到 iptables / ip6tables，正在尝试安装..."
+
+    case "$OS" in
+        ubuntu|debian)
+            apt-get update -y
+            apt-get install -y iptables iptables-persistent
+            ;;
+        centos|rhel)
+            yum install -y iptables iptables-services
+            ;;
+        alpine)
+            apk update
+            apk add iptables ip6tables
+            ;;
+        arch)
+            pacman -Sy --noconfirm iptables
+            ;;
+        *)
+            echo "❌ 未知系统：$OS，无法自动安装 iptables，请手动安装后重试。"
+            exit 1
+            ;;
+    esac
+
+    if ! command -v iptables >/dev/null 2>&1; then
+        echo "❌ iptables 安装失败，请手动检查系统环境。"
+        exit 1
+    fi
+}
+
+check_iptables
+echo "✅ iptables 已就绪"
 echo ""
 
 # -----------------------------
@@ -156,6 +198,9 @@ if [[ $OS == "ubuntu" || $OS == "debian" ]]; then
     netfilter-persistent save
 elif [[ $OS == "centos" ]]; then
     service iptables save
+elif [[ $OS == "alpine" ]]; then
+    rc-update add iptables
+    rc-service iptables save
 fi
 
 # -----------------------------
@@ -168,7 +213,7 @@ echo "=========================================="
 echo "🔐 SSH 端口已保留：$SSH_PORT (仅 TCP)"
 echo "🌐 自定义端口 TCP/UDP 支持 VLESS QUIC：$USER_PORTS_RAW"
 echo "🌐 IPv4 Ping：$PING_STATUS"
-echo "🌐 IPv6 节点可用（完整 ICMPv6 放行，保证 TCP/UDP+QUIC）"
+echo "🌐 IPv6 节点可用（完整 ICMPv6 放行）"
 echo "🔒 其他所有端口默认关闭"
 echo ""
 echo "建议测试端口："
