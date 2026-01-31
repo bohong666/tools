@@ -2,16 +2,11 @@
 
 # ============================================
 # Ubuntu/Alpine Xray VLESS+Reality+Vision 配置脚本
-# 版本: v3.1.0 (多系统支持版 - 修复Alpine安装)
-# 更新日期: 2026-01-24
-# 新增功能:
-# - Alpine 手动安装 Xray (官方脚本不支持 OpenRC)
-# - 自动检测系统类型
-# - Alpine 智能资源管理(内存<256MB, 硬盘可能<5GB)
-# - 保留 Ubuntu 所有原有功能
+# 版本: v3.2.0 (智能 Swap 修复版)
+# 修复内容: 增加磁盘空间检测，防止小硬盘 VPS 崩溃
 # ============================================
 
-SCRIPT_VERSION="v3.1.0-MultiOS-Fixed"
+SCRIPT_VERSION="v3.2.0-SmartSwap"
 
 set -e
 
@@ -79,14 +74,11 @@ detect_os() {
     TOTAL_MEM=$(free -m | awk '/^Mem:/{print $2}')
     TOTAL_DISK=$(df -BG / | awk 'NR==2 {print $2}' | sed 's/G//')
     
-    log_info "系统资源: 内存 ${TOTAL_MEM}MB, 硬盘 ${TOTAL_DISK}GB"
+    log_info "系统资源: 内存 ${TOTAL_MEM}MB, 硬盘总大小 ${TOTAL_DISK}GB"
     
     if [ "$OS_TYPE" = "alpine" ]; then
         if [ "$TOTAL_MEM" -lt 256 ]; then
             log_warn "低内存环境 (<256MB), 将使用极简模式"
-        fi
-        if [ "$TOTAL_DISK" -lt 5 ]; then
-            log_warn "低存储环境 (<5GB), 将跳过交换空间配置"
         fi
     fi
 }
@@ -554,7 +546,7 @@ fresh_install() {
 }
 
 # ============================================
-# 系统设置（Ubuntu）
+# 系统设置（Ubuntu）- 智能 Swap 修复版
 # ============================================
 perform_system_setup_ubuntu() {
     log_info "开始配置Ubuntu系统..."
@@ -598,20 +590,50 @@ perform_system_setup_ubuntu() {
     journalctl --vacuum-time=3d 2>/dev/null || true
     rm -rf /tmp/* /var/tmp/* 2>/dev/null || true
     
-    log_info "配置2GB交换空间..."
+    # ----------------------------------------------------
+    # 修复：智能 Swap 配置逻辑 (替换了原有的强制 2G)
+    # ----------------------------------------------------
+    log_info "正在智能配置交换空间 (Swap)..."
+    
+    # 清理旧 Swap
     if [ -f /swapfile ]; then
         swapoff /swapfile 2>/dev/null || true
         rm -f /swapfile
     fi
+
+    # 获取根分区可用空间 (单位 KB)
+    AVAIL_KB=$(df -k / | awk 'NR==2 {print $4}')
     
-    fallocate -l 2G /swapfile
-    chmod 600 /swapfile
-    mkswap /swapfile
-    swapon /swapfile
-    
-    if ! grep -q '/swapfile' /etc/fstab; then
-        echo '/swapfile none swap sw 0 0' >> /etc/fstab
+    # 定义阈值: 3GB = 3145728 KB, 1GB = 1048576 KB
+    DO_SWAP=false
+
+    if [ -z "$AVAIL_KB" ]; then
+        log_warn "无法检测剩余空间，跳过 Swap 创建以保安全。"
+    elif [ "$AVAIL_KB" -gt 3145728 ]; then
+        log_info "磁盘剩余空间充足 ($((AVAIL_KB/1024))MB)，创建标准 2GB Swap..."
+        fallocate -l 2G /swapfile
+        DO_SWAP=true
+    elif [ "$AVAIL_KB" -gt 1048576 ]; then
+        log_warn "磁盘剩余空间有限 ($((AVAIL_KB/1024))MB)，降级创建 512MB Swap..."
+        fallocate -l 512M /swapfile
+        DO_SWAP=true
+    else
+        log_error "磁盘剩余空间极低 ($((AVAIL_KB/1024))MB)！"
+        log_error "跳过 Swap 创建以防止系统崩溃。"
+        DO_SWAP=false
     fi
+
+    if [ "$DO_SWAP" = true ]; then
+        chmod 600 /swapfile
+        mkswap /swapfile
+        swapon /swapfile
+        
+        if ! grep -q '/swapfile' /etc/fstab; then
+            echo '/swapfile none swap sw 0 0' >> /etc/fstab
+        fi
+        log_success "Swap 配置成功"
+    fi
+    # ----------------------------------------------------
     
     log_info "启用BBR TCP加速..."
     if ! grep -q "net.core.default_qdisc=fq" /etc/sysctl.conf; then
@@ -627,7 +649,7 @@ perform_system_setup_ubuntu() {
 }
 
 # ============================================
-# 系统设置（Alpine）
+# 系统设置（Alpine）- 智能 Swap 修复版
 # ============================================
 perform_system_setup_alpine() {
     log_info "开始配置Alpine系统（轻量化模式）..."
@@ -635,29 +657,40 @@ perform_system_setup_alpine() {
     log_info "更新软件包索引..."
     apk update
     
-    # 检查硬盘空间，决定是否配置交换
-    if [ "$TOTAL_DISK" -ge 5 ]; then
-        log_info "检测到足够硬盘空间(${TOTAL_DISK}GB)，配置交换空间..."
-        
-        if [ -f /swapfile ]; then
-            swapoff /swapfile 2>/dev/null || true
-            rm -f /swapfile
-        fi
-        
+    # ----------------------------------------------------
+    # 修复：Alpine 智能 Swap 配置逻辑
+    # ----------------------------------------------------
+    # 获取可用空间 (KB)
+    AVAIL_KB=$(df -k / | awk 'NR==2 {print $4}')
+    DO_SWAP=false
+
+    if [ -f /swapfile ]; then
+        swapoff /swapfile 2>/dev/null || true
+        rm -f /swapfile
+    fi
+
+    # 1GB = 1048576 KB
+    if [ "$AVAIL_KB" -ge 1048576 ]; then
+        log_info "检测到足够剩余空间($((AVAIL_KB/1024))MB)，配置 512MB 交换空间..."
         # Alpine使用dd创建swap
         dd if=/dev/zero of=/swapfile bs=1M count=512 2>/dev/null || log_warn "交换空间创建失败"
         if [ -f /swapfile ]; then
-            chmod 600 /swapfile
-            mkswap /swapfile 2>/dev/null && swapon /swapfile 2>/dev/null
-            
-            if ! grep -q '/swapfile' /etc/fstab; then
-                echo '/swapfile none swap sw 0 0' >> /etc/fstab
-            fi
-            log_success "已配置512MB交换空间"
+            DO_SWAP=true
         fi
     else
-        log_warn "硬盘空间不足(<5GB)，跳过交换空间配置"
+        log_warn "硬盘可用空间不足 1GB ($((AVAIL_KB/1024))MB)，跳过交换空间配置"
     fi
+    
+    if [ "$DO_SWAP" = true ]; then
+        chmod 600 /swapfile
+        mkswap /swapfile 2>/dev/null && swapon /swapfile 2>/dev/null
+        
+        if ! grep -q '/swapfile' /etc/fstab; then
+            echo '/swapfile none swap sw 0 0' >> /etc/fstab
+        fi
+        log_success "已配置512MB交换空间"
+    fi
+    # ----------------------------------------------------
     
     log_info "启用BBR TCP加速..."
     if ! grep -q "net.core.default_qdisc=fq" /etc/sysctl.conf 2>/dev/null; then
@@ -1285,14 +1318,20 @@ show_completion_summary() {
         if [ "$OS_TYPE" = "ubuntu" ]; then
             echo "✓ 系统已更新到最新"
             echo "✓ 系统垃圾已清理"
-            echo "✓ 已配置2GB交换空间"
+            # 动态显示 swap 状态
+            if grep -q '/swapfile' /etc/fstab; then
+                SWAP_SIZE=$(free -m | grep Swap | awk '{print $2}')
+                echo "✓ 已配置 ${SWAP_SIZE}MB 交换空间"
+            else
+                echo "✓ 磁盘空间不足，跳过交换空间"
+            fi
             echo "✓ BBR加速已启用"
         else
             echo "✓ 系统已更新（轻量化模式）"
-            if [ "$TOTAL_DISK" -ge 5 ]; then
-                echo "✓ 已配置512MB交换空间"
+            if grep -q '/swapfile' /etc/fstab; then
+                 echo "✓ 已配置512MB交换空间"
             else
-                echo "✓ 跳过交换空间（硬盘<5GB）"
+                 echo "✓ 磁盘空间不足，跳过交换空间"
             fi
             echo "✓ BBR加速已启用"
         fi
