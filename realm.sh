@@ -55,9 +55,6 @@ detect_arch_asset() {
   local arch
   arch="$(uname -m)"
 
-  # 说明：
-  # - 这里优先选用 GNU 构建的常见发行版包名（realm-ARCH-unknown-linux-gnu.tar.gz）
-  # - 若你是 Alpine（musl），可能需要改为 musl 包（如果 release 提供）
   case "$arch" in
     x86_64|amd64) echo "realm-x86_64-unknown-linux-gnu.tar.gz" ;;
     aarch64|arm64) echo "realm-aarch64-unknown-linux-gnu.tar.gz" ;;
@@ -70,7 +67,6 @@ detect_arch_asset() {
 }
 
 get_primary_ipv4() {
-  # 优先用路由探测拿出口源 IP，失败则回退到第一个全局 IPv4
   local ip=""
   ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}' || true)"
   if [[ -n "${ip:-}" ]]; then
@@ -143,7 +139,7 @@ use_udp = true
 
 EOF
 
-  local line listen_port remote_host remote_port
+  local line listen_port remote_host remote_port config_rh
   while IFS= read -r line || [[ -n "${line:-}" ]]; do
     [[ -z "${line// /}" ]] && continue
     [[ "${line:0:1}" == "#" ]] && continue
@@ -166,24 +162,21 @@ EOF
       continue
     fi
 
+    # 针对 IPv6 地址的格式化处理：包含冒号且未被中括号包裹的，自动加上中括号
+    config_rh="$remote_host"
+    if [[ "$config_rh" =~ : ]] && [[ ! "$config_rh" =~ ^\[.*\]$ ]]; then
+      config_rh="[${config_rh}]"
+    fi
+
     cat >>"$CFG" <<EOF
 [[endpoints]]
-listen = "0.0.0.0:${listen_port}"
-remote = "${remote_host}:${remote_port}"
+listen = "[::]:${listen_port}"
+remote = "${config_rh}:${remote_port}"
 
 EOF
   done <"$EP_DB"
 
-  # 如果没有任何 endpoints，给个提示注释，避免 realm 启动看起来“什么也没干”
-  if ! grep -q '^
-
-\[
-
-\[endpoints\]
-
-\]
-
-' "$CFG"; then
+  if ! grep -q '^\[\[endpoints\]\]' "$CFG"; then
     cat >>"$CFG" <<'EOF'
 # No endpoints configured yet.
 # Use realm.sh -> 配置管理 -> 添加转发
@@ -200,14 +193,13 @@ install_realm() {
   local asset tag url tmp
   asset="$(detect_arch_asset)"
 
-  # GitHub API 获取最新 release tag（不要求 jq）
   tag="$(curl -fsSL "https://api.github.com/repos/zhboner/realm/releases/latest" \
     | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
     | head -n1 || true)"
 
   if [[ -z "${tag:-}" ]]; then
     err "获取最新版本失败（GitHub API）。你可以："
-    err "1) 检查网络 / DNS"
+    err "1) 检查网络 / DNS（纯 IPv6 机器请确保可通过 NAT64 或 Warp 访问 GitHub）"
     err "2) 手动下载 realm 放到 $BIN，然后继续使用本脚本管理配置"
     exit 1
   fi
@@ -251,7 +243,6 @@ uninstall_realm() {
 
   rm -f "$BIN"
 
-  # 配置是否删除给你选择
   echo
   read -r -p "是否删除配置目录 $ETC_DIR ？（会删 endpoints 配置）[y/N]: " ans
   case "${ans:-N}" in
@@ -293,7 +284,6 @@ add_endpoint() {
     return 1
   fi
 
-  # 防止重复 listen_port
   if awk '{print $1}' "$EP_DB" | grep -qx "$lp"; then
     err "本地端口 $lp 已存在。请用“修改/删除”功能。"
     return 1
@@ -301,7 +291,7 @@ add_endpoint() {
 
   echo "${lp} ${rh} ${rp}" >>"$EP_DB"
   regen_config_from_db
-  say "已添加：0.0.0.0:${lp} -> ${rh}:${rp}"
+  say "已添加：[::]:${lp} -> ${rh}:${rp}"
 
   systemctl restart realm.service || true
   show_status
@@ -404,7 +394,6 @@ edit_endpoint() {
     return 1
   fi
 
-  # 如果改了本地端口，检查是否与其他行冲突
   if [[ "$nlp" != "$lp" ]]; then
     if awk -v n="$n" 'NR!=n{print $1}' "$EP_DB" | grep -qx "$nlp"; then
       err "本地端口 $nlp 已被其他规则使用。"
@@ -470,10 +459,7 @@ show_status() {
 }
 
 tcp_connect_test() {
-  # 使用 bash /dev/tcp 做一个轻量 TCP 探测（不会发送业务数据）
   local host="$1" port="$2" timeout_s="${3:-3}"
-
-  # timeout 可能不存在，尽量兼容
   if cmd_exists timeout; then
     timeout "${timeout_s}" bash -c "cat < /dev/null > /dev/tcp/${host}/${port}" >/dev/null 2>&1
   else
@@ -506,14 +492,13 @@ link_test() {
     rh="$(awk '{print $2}' <<<"$line")"
     rp="$(awk '{print $3}' <<<"$line")"
 
-    echo "---- 规则：0.0.0.0:${lp} -> ${rh}:${rp}"
+    echo "---- 规则：[::]:${lp} -> ${rh}:${rp}"
 
     resolved=""
     if [[ "$rh" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || [[ "$rh" =~ : ]]; then
       resolved="$rh"
       echo "解析：IP（无需解析）"
     else
-      # getent ahosts 兼容性好
       resolved="$(getent ahosts "$rh" 2>/dev/null | awk '{print $1}' | head -n1 || true)"
       if [[ -n "${resolved:-}" ]]; then
         echo "解析：$rh -> $resolved"
@@ -522,7 +507,6 @@ link_test() {
       fi
     fi
 
-    # 本地端口监听提示（不强依赖 ss）
     if cmd_exists ss; then
       if ss -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)$lp$"; then
         echo "本地端口：$lp 已有 TCP 监听（可能冲突，也可能是 realm）"
