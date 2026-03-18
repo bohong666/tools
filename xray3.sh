@@ -2,14 +2,15 @@
 
 # ============================================
 # Ubuntu/Alpine Xray VLESS+Reality+Vision 配置脚本
-# 版本: v3.3.0 (智能 Swap 修复 + IPv6-Only 支持版)
+# 版本: v3.3.1 (容器环境 Swap 适配版)
 # 修复内容: 
 # 1. 增加磁盘空间检测，防止小硬盘 VPS 崩溃
 # 2. 增加对纯 IPv6 (IPv6-only) VPS 的全面支持
 # 3. 增加 GitHub 连通性检测及备用下载节点
+# 4. 修复 LXC/Docker 容器环境下因 swapon 权限问题导致的安装中断
 # ============================================
 
-SCRIPT_VERSION="v3.3.0-IPv6-Support"
+SCRIPT_VERSION="v3.3.1-Container-Fix"
 
 set -e
 
@@ -558,7 +559,7 @@ fresh_install() {
 }
 
 # ============================================
-# 系统设置（Ubuntu）- 智能 Swap 修复版
+# 系统设置（Ubuntu）- 容器 Swap 修复版
 # ============================================
 perform_system_setup_ubuntu() {
     log_info "开始配置Ubuntu系统..."
@@ -603,7 +604,7 @@ perform_system_setup_ubuntu() {
     rm -rf /tmp/* /var/tmp/* 2>/dev/null || true
     
     # ----------------------------------------------------
-    # 修复：智能 Swap 配置逻辑 (替换了原有的强制 2G)
+    # 修复：容器 Swap 配置逻辑
     # ----------------------------------------------------
     log_info "正在智能配置交换空间 (Swap)..."
     
@@ -638,12 +639,16 @@ perform_system_setup_ubuntu() {
     if [ "$DO_SWAP" = true ]; then
         chmod 600 /swapfile
         mkswap /swapfile
-        swapon /swapfile
-        
-        if ! grep -q '/swapfile' /etc/fstab; then
-            echo '/swapfile none swap sw 0 0' >> /etc/fstab
+        # 捕获 swapon 错误以兼容容器环境
+        if swapon /swapfile 2>/dev/null; then
+            if ! grep -q '/swapfile' /etc/fstab; then
+                echo '/swapfile none swap sw 0 0' >> /etc/fstab
+            fi
+            log_success "Swap 配置成功"
+        else
+            log_warn "当前环境不支持启用 Swap (可能是 LXC/Docker 容器等)，已清理并跳过"
+            rm -f /swapfile
         fi
-        log_success "Swap 配置成功"
     fi
     # ----------------------------------------------------
     
@@ -661,7 +666,7 @@ perform_system_setup_ubuntu() {
 }
 
 # ============================================
-# 系统设置（Alpine）- 智能 Swap 修复版
+# 系统设置（Alpine）- 容器 Swap 修复版
 # ============================================
 perform_system_setup_alpine() {
     log_info "开始配置Alpine系统（轻量化模式）..."
@@ -670,7 +675,7 @@ perform_system_setup_alpine() {
     apk update
     
     # ----------------------------------------------------
-    # 修复：Alpine 智能 Swap 配置逻辑
+    # 修复：Alpine 容器 Swap 配置逻辑
     # ----------------------------------------------------
     # 获取可用空间 (KB)
     AVAIL_KB=$(df -k / | awk 'NR==2 {print $4}')
@@ -695,12 +700,18 @@ perform_system_setup_alpine() {
     
     if [ "$DO_SWAP" = true ]; then
         chmod 600 /swapfile
-        mkswap /swapfile 2>/dev/null && swapon /swapfile 2>/dev/null
+        mkswap /swapfile 2>/dev/null || true
         
-        if ! grep -q '/swapfile' /etc/fstab; then
-            echo '/swapfile none swap sw 0 0' >> /etc/fstab
+        # 捕获 swapon 错误以兼容容器环境
+        if swapon /swapfile 2>/dev/null; then
+            if ! grep -q '/swapfile' /etc/fstab; then
+                echo '/swapfile none swap sw 0 0' >> /etc/fstab
+            fi
+            log_success "已配置512MB交换空间"
+        else
+            log_warn "当前环境不支持启用 Swap (可能是 LXC/Docker 容器等)，已清理并跳过"
+            rm -f /swapfile
         fi
-        log_success "已配置512MB交换空间"
     fi
     # ----------------------------------------------------
     
@@ -1400,7 +1411,7 @@ show_completion_summary() {
                 SWAP_SIZE=$(free -m | grep Swap | awk '{print $2}')
                 echo "✓ 已配置 ${SWAP_SIZE}MB 交换空间"
             else
-                echo "✓ 磁盘空间不足，跳过交换空间"
+                echo "✓ 磁盘空间不足或为容器环境，已跳过交换空间"
             fi
             echo "✓ BBR加速已启用"
         else
@@ -1408,7 +1419,7 @@ show_completion_summary() {
             if grep -q '/swapfile' /etc/fstab; then
                  echo "✓ 已配置512MB交换空间"
             else
-                 echo "✓ 磁盘空间不足，跳过交换空间"
+                 echo "✓ 磁盘空间不足或为容器环境，已跳过交换空间"
             fi
             echo "✓ BBR加速已启用"
         fi
