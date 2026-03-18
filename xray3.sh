@@ -2,15 +2,16 @@
 
 # ============================================
 # Ubuntu/Alpine Xray VLESS+Reality+Vision 配置脚本
-# 版本: v3.3.1 (容器环境 Swap 适配版)
+# 版本: v3.3.2 (容器环境全面兼容版)
 # 修复内容: 
 # 1. 增加磁盘空间检测，防止小硬盘 VPS 崩溃
 # 2. 增加对纯 IPv6 (IPv6-only) VPS 的全面支持
 # 3. 增加 GitHub 连通性检测及备用下载节点
 # 4. 修复 LXC/Docker 容器环境下因 swapon 权限问题导致的安装中断
+# 5. 修复 LXC/Docker 容器环境下因 sysctl 权限问题导致的 BBR 安装中断
 # ============================================
 
-SCRIPT_VERSION="v3.3.1-Container-Fix"
+SCRIPT_VERSION="v3.3.2-Container-Fix"
 
 set -e
 
@@ -378,7 +379,7 @@ EOF
     restart_xray_service
     
     # 生成新的连接信息
-    generate_connection_info "$NEW_UUID" "$NEW_PRIVATE_KEY" "$NEW_PUBLIC_KEY" "$NEW_SHORT_ID" "$NODE_NAME" "$SERVER_NAME" "$DEST"
+    generate_connection_info "$NEW_UUID" "$NEW_PRIVATE_KEY" "$PUBLIC_KEY" "$NEW_SHORT_ID" "$NODE_NAME" "$SERVER_NAME" "$DEST"
     
     echo ""
     log_success "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -559,7 +560,7 @@ fresh_install() {
 }
 
 # ============================================
-# 系统设置（Ubuntu）- 容器 Swap 修复版
+# 系统设置（Ubuntu）- BBR/Swap 容器修复版
 # ============================================
 perform_system_setup_ubuntu() {
     log_info "开始配置Ubuntu系统..."
@@ -604,7 +605,7 @@ perform_system_setup_ubuntu() {
     rm -rf /tmp/* /var/tmp/* 2>/dev/null || true
     
     # ----------------------------------------------------
-    # 修复：容器 Swap 配置逻辑
+    # Swap 配置逻辑
     # ----------------------------------------------------
     log_info "正在智能配置交换空间 (Swap)..."
     
@@ -616,33 +617,30 @@ perform_system_setup_ubuntu() {
 
     # 获取根分区可用空间 (单位 KB)
     AVAIL_KB=$(df -k / | awk 'NR==2 {print $4}')
-    
-    # 定义阈值: 3GB = 3145728 KB, 1GB = 1048576 KB
     DO_SWAP=false
 
     if [ -z "$AVAIL_KB" ]; then
         log_warn "无法检测剩余空间，跳过 Swap 创建以保安全。"
     elif [ "$AVAIL_KB" -gt 3145728 ]; then
         log_info "磁盘剩余空间充足 ($((AVAIL_KB/1024))MB)，创建标准 2GB Swap..."
-        fallocate -l 2G /swapfile
+        fallocate -l 2G /swapfile 2>/dev/null || true
         DO_SWAP=true
     elif [ "$AVAIL_KB" -gt 1048576 ]; then
         log_warn "磁盘剩余空间有限 ($((AVAIL_KB/1024))MB)，降级创建 512MB Swap..."
-        fallocate -l 512M /swapfile
+        fallocate -l 512M /swapfile 2>/dev/null || true
         DO_SWAP=true
     else
-        log_error "磁盘剩余空间极低 ($((AVAIL_KB/1024))MB)！"
-        log_error "跳过 Swap 创建以防止系统崩溃。"
+        log_warn "磁盘剩余空间极低 ($((AVAIL_KB/1024))MB)，跳过 Swap 创建"
         DO_SWAP=false
     fi
 
     if [ "$DO_SWAP" = true ]; then
         chmod 600 /swapfile
-        mkswap /swapfile
+        mkswap /swapfile 2>/dev/null || true
         # 捕获 swapon 错误以兼容容器环境
         if swapon /swapfile 2>/dev/null; then
-            if ! grep -q '/swapfile' /etc/fstab; then
-                echo '/swapfile none swap sw 0 0' >> /etc/fstab
+            if ! grep -q '/swapfile' /etc/fstab 2>/dev/null; then
+                echo '/swapfile none swap sw 0 0' >> /etc/fstab 2>/dev/null || true
             fi
             log_success "Swap 配置成功"
         else
@@ -650,23 +648,33 @@ perform_system_setup_ubuntu() {
             rm -f /swapfile
         fi
     fi
-    # ----------------------------------------------------
     
+    # ----------------------------------------------------
+    # 修复：BBR 容器配置逻辑
+    # ----------------------------------------------------
     log_info "启用BBR TCP加速..."
-    if ! grep -q "net.core.default_qdisc=fq" /etc/sysctl.conf; then
-        echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
+    touch /etc/sysctl.conf 2>/dev/null || true
+    
+    if ! grep -q "net.core.default_qdisc=fq" /etc/sysctl.conf 2>/dev/null; then
+        echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf 2>/dev/null || true
     fi
-    if ! grep -q "net.ipv4.tcp_congestion_control=bbr" /etc/sysctl.conf; then
-        echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
+    if ! grep -q "net.ipv4.tcp_congestion_control=bbr" /etc/sysctl.conf 2>/dev/null; then
+        echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf 2>/dev/null || true
     fi
-    sysctl -p
+    
+    # 尝试加载内核参数，失败则友好跳过
+    if sysctl -p 2>/dev/null; then
+        log_success "BBR TCP加速已启用"
+    else
+        log_warn "当前容器环境权限不足，无法修改内核参数(BBR)，已自动跳过"
+    fi
     
     log_info "安装必要依赖..."
     apt install -y curl wget unzip jq qrencode 2>/dev/null || apt install -y curl wget unzip
 }
 
 # ============================================
-# 系统设置（Alpine）- 容器 Swap 修复版
+# 系统设置（Alpine）- BBR/Swap 容器修复版
 # ============================================
 perform_system_setup_alpine() {
     log_info "开始配置Alpine系统（轻量化模式）..."
@@ -675,9 +683,8 @@ perform_system_setup_alpine() {
     apk update
     
     # ----------------------------------------------------
-    # 修复：Alpine 容器 Swap 配置逻辑
+    # Swap 配置逻辑
     # ----------------------------------------------------
-    # 获取可用空间 (KB)
     AVAIL_KB=$(df -k / | awk 'NR==2 {print $4}')
     DO_SWAP=false
 
@@ -686,11 +693,9 @@ perform_system_setup_alpine() {
         rm -f /swapfile
     fi
 
-    # 1GB = 1048576 KB
     if [ "$AVAIL_KB" -ge 1048576 ]; then
         log_info "检测到足够剩余空间($((AVAIL_KB/1024))MB)，配置 512MB 交换空间..."
-        # Alpine使用dd创建swap
-        dd if=/dev/zero of=/swapfile bs=1M count=512 2>/dev/null || log_warn "交换空间创建失败"
+        dd if=/dev/zero of=/swapfile bs=1M count=512 2>/dev/null || true
         if [ -f /swapfile ]; then
             DO_SWAP=true
         fi
@@ -701,11 +706,9 @@ perform_system_setup_alpine() {
     if [ "$DO_SWAP" = true ]; then
         chmod 600 /swapfile
         mkswap /swapfile 2>/dev/null || true
-        
-        # 捕获 swapon 错误以兼容容器环境
         if swapon /swapfile 2>/dev/null; then
-            if ! grep -q '/swapfile' /etc/fstab; then
-                echo '/swapfile none swap sw 0 0' >> /etc/fstab
+            if ! grep -q '/swapfile' /etc/fstab 2>/dev/null; then
+                echo '/swapfile none swap sw 0 0' >> /etc/fstab 2>/dev/null || true
             fi
             log_success "已配置512MB交换空间"
         else
@@ -713,22 +716,29 @@ perform_system_setup_alpine() {
             rm -f /swapfile
         fi
     fi
-    # ----------------------------------------------------
     
+    # ----------------------------------------------------
+    # 修复：BBR 容器配置逻辑
+    # ----------------------------------------------------
     log_info "启用BBR TCP加速..."
+    touch /etc/sysctl.conf 2>/dev/null || true
+    
     if ! grep -q "net.core.default_qdisc=fq" /etc/sysctl.conf 2>/dev/null; then
-        echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
+        echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf 2>/dev/null || true
     fi
     if ! grep -q "net.ipv4.tcp_congestion_control=bbr" /etc/sysctl.conf 2>/dev/null; then
-        echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
+        echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf 2>/dev/null || true
     fi
-    sysctl -p 2>/dev/null || true
+    
+    if sysctl -p 2>/dev/null; then
+        log_success "BBR TCP加速已启用"
+    else
+        log_warn "当前容器环境权限不足，无法修改内核参数(BBR)，已自动跳过"
+    fi
     
     log_info "安装必要依赖（极简模式）..."
-    # Alpine最小化安装 - 添加bash和其他必要工具
     apk add --no-cache bash curl wget unzip openssl coreutils util-linux
     
-    # 清理缓存
     rm -rf /var/cache/apk/*
     rm -rf /tmp/* 2>/dev/null || true
 }
@@ -750,7 +760,6 @@ perform_system_setup() {
 install_xray_alpine() {
     log_info "为Alpine手动安装Xray-core..."
     
-    # 获取最新版本 - 考虑 IPv6 Only 的 Github 访问限制
     log_info "获取Xray最新版本..."
     if curl -sI -m 5 https://api.github.com > /dev/null; then
         XRAY_VERSION=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
@@ -766,7 +775,6 @@ install_xray_alpine() {
     
     log_info "目标版本: $XRAY_VERSION"
     
-    # 检测架构
     ARCH=$(uname -m)
     case $ARCH in
         x86_64)
@@ -786,7 +794,6 @@ install_xray_alpine() {
     
     log_info "系统架构: $ARCH -> Xray架构: $XRAY_ARCH"
     
-    # 下载Xray
     DOWNLOAD_URL="https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/Xray-linux-${XRAY_ARCH}.zip"
     if ! curl -sI -m 5 https://github.com > /dev/null; then
         log_warn "检测到无法直接访问 GitHub (可能为 IPv6-only)，使用 ghp.ci 代理下载..."
@@ -802,11 +809,9 @@ install_xray_alpine() {
         exit 1
     fi
     
-    # 解压
     log_info "解压Xray..."
     unzip -o Xray-linux-${XRAY_ARCH}.zip -d /tmp/xray_tmp
     
-    # 安装文件
     log_info "安装Xray文件..."
     mkdir -p /usr/local/bin
     mkdir -p /usr/local/etc/xray
@@ -814,14 +819,11 @@ install_xray_alpine() {
     
     install -m 755 /tmp/xray_tmp/xray /usr/local/bin/xray
     
-    # 复制geoip和geosite数据文件（如果存在）
     [ -f /tmp/xray_tmp/geoip.dat ] && cp /tmp/xray_tmp/geoip.dat /usr/local/share/xray/ 2>/dev/null || mkdir -p /usr/local/share/xray
     [ -f /tmp/xray_tmp/geosite.dat ] && cp /tmp/xray_tmp/geosite.dat /usr/local/share/xray/ 2>/dev/null || true
     
-    # 清理临时文件
     rm -rf /tmp/xray_tmp /tmp/Xray-linux-${XRAY_ARCH}.zip
     
-    # 验证安装
     if ! /usr/local/bin/xray version; then
         log_error "Xray安装失败"
         exit 1
@@ -829,7 +831,6 @@ install_xray_alpine() {
     
     log_success "Xray安装成功"
     
-    # 创建OpenRC服务文件
     log_info "创建OpenRC服务..."
     cat > /etc/init.d/xray <<'EOFSERVICE'
 #!/sbin/openrc-run
@@ -993,19 +994,15 @@ configure_firewall() {
     log_info "配置防火墙规则..."
     
     if [ "$OS_TYPE" = "alpine" ]; then
-        # Alpine通常使用iptables
         if command -v iptables &> /dev/null; then
-            # 检查规则是否已存在
             if ! iptables -C INPUT -p tcp --dport 443 -j ACCEPT 2>/dev/null; then
                 iptables -I INPUT -p tcp --dport 443 -j ACCEPT 2>/dev/null || true
             fi
-            # ip6tables 支持
             if command -v ip6tables &> /dev/null; then
                 if ! ip6tables -C INPUT -p tcp --dport 443 -j ACCEPT 2>/dev/null; then
                     ip6tables -I INPUT -p tcp --dport 443 -j ACCEPT 2>/dev/null || true
                 fi
             fi
-            # 尝试保存规则
             if command -v rc-service &> /dev/null && rc-service iptables status &>/dev/null; then
                 /etc/init.d/iptables save 2>/dev/null || true
                 /etc/init.d/ip6tables save 2>/dev/null || true
@@ -1015,14 +1012,13 @@ configure_firewall() {
             log_warn "未检测到iptables，跳过防火墙配置"
         fi
     else
-        # Ubuntu防火墙
         if command -v ufw &> /dev/null; then
-            ufw allow 443/tcp
-            ufw --force enable
+            ufw allow 443/tcp 2>/dev/null || true
+            ufw --force enable 2>/dev/null || true
             log_info "UFW防火墙已配置"
         elif command -v firewall-cmd &> /dev/null; then
-            firewall-cmd --permanent --add-port=443/tcp
-            firewall-cmd --reload
+            firewall-cmd --permanent --add-port=443/tcp 2>/dev/null || true
+            firewall-cmd --reload 2>/dev/null || true
             log_info "Firewalld已配置"
         else
             log_warn "未检测到防火墙，跳过"
@@ -1038,7 +1034,7 @@ start_xray_service() {
     
     if [ "$SERVICE_MANAGER" = "systemd" ]; then
         systemctl daemon-reload
-        systemctl enable xray
+        systemctl enable xray 2>/dev/null || true
         systemctl restart xray
         sleep 3
         
@@ -1050,8 +1046,7 @@ start_xray_service() {
             exit 1
         fi
     else
-        # Alpine OpenRC
-        rc-update add xray default
+        rc-update add xray default 2>/dev/null || true
         /etc/init.d/xray start
         sleep 3
         
@@ -1060,7 +1055,6 @@ start_xray_service() {
         else
             log_error "Xray服务启动失败，检查日志..."
             tail -n 50 /var/log/xray/error.log 2>/dev/null || echo "无法读取日志文件"
-            # 尝试手动启动查看错误
             /usr/local/bin/xray run -test -config "$CONFIG_FILE" || true
             exit 1
         fi
@@ -1148,7 +1142,6 @@ generate_connection_info() {
     fi
     
     if [ -n "$IPV6" ]; then
-        # 如果没有 IPv4，将 IPv6 节点直接命名为默认名称，而不是带 -IPv6 后缀
         if [ -z "$IPV4" ]; then
             VLESS_IPV6="vless://${uuid}@[${IPV6}]:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${server_name}&fp=firefox&pbk=${public_key}&sid=${short_id}&type=tcp&headerType=none#${ENCODED_NAME}"
         else
@@ -1156,7 +1149,6 @@ generate_connection_info() {
         fi
     fi
     
-    # 生成Clash配置
     cat > /root/clash_config.yaml <<EOF
 proxies:
 EOF
@@ -1202,7 +1194,6 @@ EOF
 EOF
     fi
     
-    # 显示连接信息
     echo ""
     echo "============================================"
     log_info "节点配置完成！"
@@ -1243,7 +1234,6 @@ EOF
         echo ""
     fi
     
-    # 保存到文件
     cat > "$BACKUP_FILE" <<EOFBACKUP
 ========================================
 Xray VLESS+Reality+Vision 节点信息
@@ -1294,7 +1284,6 @@ $VLESS_IPV6
 EOFBACKUP
     fi
 
-    # 决定主要IP展示给手动配置客户端使用
     MAIN_IP=${IPV4:-$IPV6}
 
     cat >> "$BACKUP_FILE" <<EOFBACKUP
@@ -1406,22 +1395,29 @@ show_completion_summary() {
         if [ "$OS_TYPE" = "ubuntu" ]; then
             echo "✓ 系统已更新到最新"
             echo "✓ 系统垃圾已清理"
-            # 动态显示 swap 状态
-            if grep -q '/swapfile' /etc/fstab; then
+            if grep -q '/swapfile' /etc/fstab 2>/dev/null; then
                 SWAP_SIZE=$(free -m | grep Swap | awk '{print $2}')
                 echo "✓ 已配置 ${SWAP_SIZE}MB 交换空间"
             else
                 echo "✓ 磁盘空间不足或为容器环境，已跳过交换空间"
             fi
-            echo "✓ BBR加速已启用"
+            if sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q bbr; then
+                echo "✓ BBR加速已启用"
+            else
+                echo "✓ 容器环境不支持BBR，已跳过"
+            fi
         else
             echo "✓ 系统已更新（轻量化模式）"
-            if grep -q '/swapfile' /etc/fstab; then
+            if grep -q '/swapfile' /etc/fstab 2>/dev/null; then
                  echo "✓ 已配置512MB交换空间"
             else
                  echo "✓ 磁盘空间不足或为容器环境，已跳过交换空间"
             fi
-            echo "✓ BBR加速已启用"
+            if sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q bbr; then
+                echo "✓ BBR加速已启用"
+            else
+                echo "✓ 容器环境不支持BBR，已跳过"
+            fi
         fi
         echo "✓ Xray 已安装并运行"
         echo "✓ VLESS+Reality+Vision节点已配置"
@@ -1438,6 +1434,8 @@ show_completion_summary() {
     BBR_STATUS=$(sysctl net.ipv4.tcp_congestion_control 2>/dev/null | awk '{print $3}')
     if [ "$BBR_STATUS" = "bbr" ]; then
         echo "✓ BBR状态: 已启用"
+    elif [ -z "$BBR_STATUS" ]; then
+        log_warn "⚠ BBR状态: 未知 (容器限制)"
     else
         log_warn "⚠ BBR状态: $BBR_STATUS"
     fi
@@ -1511,7 +1509,6 @@ uninstall_xray() {
     
     log_info "卸载Xray..."
     if [ "$OS_TYPE" = "alpine" ]; then
-        # Alpine手动卸载
         rm -f /usr/local/bin/xray
         rm -rf /usr/local/etc/xray
         rm -f /etc/init.d/xray
@@ -1519,7 +1516,6 @@ uninstall_xray() {
         rm -rf /usr/local/share/xray
         log_success "Xray文件已删除"
     else
-        # Ubuntu使用官方卸载脚本
         bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ remove --purge
     fi
     
