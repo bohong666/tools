@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================
 # sing-box v1.13+ 全功能管理器（RFC 专用）
-# 作者：HL 专用定制版
 # 功能：
 #   - 单 443 入口（mixed + SNI 分流）
 #   - 多本机 Reality 落地节点
@@ -53,6 +52,7 @@ detect_os() {
     log_err "无法识别系统（缺少 /etc/os-release）"
     exit 1
   fi
+  # shellcheck source=/dev/null
   source /etc/os-release
   case "${ID:-}" in
     ubuntu|debian) PKG_MGR="apt" ;;
@@ -145,25 +145,40 @@ make_vless_uri() {
   local enc_name; enc_name=$(urlencode "$name")
   echo "vless://${uuid}@${host}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=${fp}&pbk=${pbk}&sid=${sid}&type=tcp#${enc_name}"
 }
+
+create_service() {
+  if [[ -f /etc/systemd/system/sing-box.service ]]; then
+    systemctl daemon-reload
+    return
+  fi
+  cat >/etc/systemd/system/sing-box.service <<EOF
+[Unit]
+Description=sing-box Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=root
+ExecStart=${SB_BIN} run -c ${SB_CFG}
+Restart=on-failure
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable sing-box >/dev/null 2>&1 || true
+}
+
 # ==============================================================
-# Part 2 - 数据库结构 + Python JSON 生成器（sing-box 1.13+）
+# 使用 Python 生成 sing-box 1.13+ 配置
+# local.db: uuid|port|sni|private_key|public_key|short_id|name|fingerprint
+# relay.db: label|sni|remote_host|remote_port|uuid|public_key|short_id|fingerprint
 # ==============================================================
 
-# local.db 每行结构：
-# uuid|port|sni|private_key|public_key|short_id|name|fingerprint
-#
-# relay.db 每行结构：
-# label|sni|remote_host|remote_port|uuid|public_key|short_id|fingerprint
-
-# ── 使用 Python 生成 sing-box 1.13+ 配置 ───────────────────────
 regen_config() {
   log_step "重新生成 sing-box 配置..."
 
-  local ipv4 ipv6
-  ipv4=$(get_ipv4)
-  ipv6=$(get_ipv6)
-
-  # Python 生成 JSON
   python3 - "$LOCAL_DB" "$RELAY_DB" "$SB_CFG" <<'EOF'
 import json, sys
 
@@ -187,12 +202,9 @@ def read_db(path):
 local_nodes = read_db(local_db)
 relay_nodes = read_db(relay_db)
 
-# -------------------------
-# 构造 mixed 443 inbound
-# -------------------------
+# mixed 443 inbound + fallbacks
 fallbacks = []
 
-# 本机 Reality → fallback 到 127.0.0.1:port
 for row in local_nodes:
     uuid, port, sni, priv, pub, sid, name, fp = row
     fallbacks.append({
@@ -200,7 +212,6 @@ for row in local_nodes:
         "dest": f"127.0.0.1:{port}"
     })
 
-# 中转 Reality → fallback 到 remote_host:remote_port
 for row in relay_nodes:
     label, sni, rhost, rport, uuid, pub, sid, fp = row
     fallbacks.append({
@@ -220,9 +231,7 @@ inbounds = [
     }
 ]
 
-# -------------------------
-# 构造本机 Reality inbounds
-# -------------------------
+# 本机 Reality inbounds
 for row in local_nodes:
     uuid, port, sni, priv, pub, sid, name, fp = row
     inbounds.append({
@@ -250,9 +259,6 @@ for row in local_nodes:
         }
     })
 
-# -------------------------
-# outbounds
-# -------------------------
 outbounds = [
     {"type": "direct", "tag": "direct"},
     {"type": "block",  "tag": "block"}
@@ -281,8 +287,9 @@ EOF
 
   log_info "配置校验通过"
 }
+
 # ==============================================================
-# Part 3 - 添加本机 Reality 节点（RFC 落地）
+# 本机 Reality 节点（RFC 落地）
 # ==============================================================
 
 show_local_node_detail() {
@@ -378,8 +385,9 @@ add_local_node() {
   log_info "本机节点添加完成"
   show_local_node_detail "$uuid" "$port" "$sni" "$priv" "$pub" "$sid" "$name" "$fp"
 }
+
 # ==============================================================
-# Part 4 - 添加中转 Reality 节点（IIJ / 其他 VPS） + 导出 VLESS
+# 中转 Reality 节点（IIJ / 其他 VPS）
 # ==============================================================
 
 show_relay_detail() {
@@ -455,7 +463,6 @@ add_relay_target() {
   read -rp "client-fingerprint [默认 chrome]: " fp
   [[ -z "$fp" ]] && fp="chrome"
 
-  # IPv6 目标加 []
   if [[ "$rhost" == *:* ]]; then
     rhost="[$rhost]"
   fi
@@ -495,7 +502,6 @@ export_all_vless() {
     echo "# 入口服务器: $host:443"
     echo ""
 
-    # 本机节点
     if [[ -s "$LOCAL_DB" ]]; then
       echo "## 本机 Reality 节点"
       while IFS='|' read -r uuid port sni priv pub sid name fp || [[ -n "${uuid:-}" ]]; do
@@ -509,7 +515,6 @@ export_all_vless() {
       echo ""
     fi
 
-    # 中转节点
     if [[ -s "$RELAY_DB" ]]; then
       echo "## 中转 Reality 节点"
       while IFS='|' read -r label sni rhost rport uuid pub sid fp || [[ -n "${label:-}" ]]; do
@@ -528,11 +533,11 @@ export_all_vless() {
   log_info "已导出到：$out"
   cat "$out"
 }
+
 # ==============================================================
-# Part 5 - 菜单系统 + 删除节点 + 服务管理
+# 删除节点
 # ==============================================================
 
-# ── 删除本机 Reality 节点 ─────────────────────────────────────
 delete_local_node() {
   list_local_nodes
   [[ ! -s "$LOCAL_DB" ]] && return
@@ -565,7 +570,6 @@ delete_local_node() {
   log_info "本机节点 '$name' 已删除"
 }
 
-# ── 删除中转 Reality 节点 ─────────────────────────────────────
 delete_relay_target() {
   list_relay_targets
   [[ ! -s "$RELAY_DB" ]] && return
@@ -597,14 +601,16 @@ delete_relay_target() {
   log_info "中转节点 '$label' 已删除"
 }
 
-# ── 服务状态 ───────────────────────────────────────────────────
+# ==============================================================
+# 服务管理
+# ==============================================================
+
 sb_status() {
   echo ""
   echo -e "${CYAN}── sing-box 服务状态 ─────────────────────${NC}"
   systemctl status sing-box --no-pager -n 20 2>/dev/null || log_warn "sing-box 服务不存在"
 }
 
-# ── 重启服务 ───────────────────────────────────────────────────
 sb_restart() {
   log_step "重启 sing-box..."
   systemctl restart sing-box 2>/dev/null || log_warn "无法重启 sing-box"
@@ -617,7 +623,10 @@ sb_restart() {
   fi
 }
 
-# ── 主菜单 ─────────────────────────────────────────────────────
+# ==============================================================
+# 主菜单
+# ==============================================================
+
 main_menu() {
   while true; do
     echo ""
@@ -691,6 +700,9 @@ main_menu() {
   done
 }
 
-# ── 脚本入口 ───────────────────────────────────────────────────
+# ==============================================================
+# 入口
+# ==============================================================
+
 need_root
 main_menu
