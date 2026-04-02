@@ -417,135 +417,155 @@ EOF
 # Realm数据库字段: listen_port|remote_host|remote_port|label|xray_sni|xray_local_port
 # （当 listen_port=443 时，由 Xray routing + Realm 实现 443 复用）
 
-# ── 重新生成 Xray 主配置（合并所有节点 + Realm 路由）──────────
+# ── 重新生成 Xray 主配置（用 Python 生成合法 JSON，彻底杜绝拼接 bug）──
 regen_xray_config() {
     log_step "重新生成 Xray 主配置..."
     mkdir -p "$XRAY_ETC"
 
-    # 收集节点
-    local inbounds="[]"
-    local outbounds='[{"protocol":"freedom","tag":"direct","settings":{}},{"protocol":"blackhole","tag":"block"}]'
-    local routing_rules='[{"type":"field","protocol":["bittorrent"],"outboundTag":"block"}]'
-
-    local inbounds_arr=()
-    local realm_outbounds=()
-    local realm_rules=()
-
-    # ── 从 NODE_DB 读取所有 VLESS 节点 ──────────────────────────
-    if [[ -s "$NODE_DB" ]]; then
-        while IFS='|' read -r uuid port sni short_id private_key name fingerprint || [[ -n "$uuid" ]]; do
-            [[ -z "$uuid" ]] && continue
-            [[ "${uuid:0:1}" == "#" ]] && continue
-            local fp="${fingerprint:-firefox}"
-            inbounds_arr+=("$(cat <<EOF
-    {
-      "tag": "vless-in-${port}-$(echo "$uuid" | cut -c1-8)",
-      "port": ${port},
-      "listen": "::",
-      "protocol": "vless",
-      "settings": {
-        "clients": [{"id": "${uuid}", "flow": "xtls-rprx-vision"}],
-        "decryption": "none"
-      },
-      "streamSettings": {
-        "network": "tcp",
-        "security": "reality",
-        "realitySettings": {
-          "show": false,
-          "dest": "${sni}:443",
-          "serverNames": ["${sni}"],
-          "privateKey": "${private_key}",
-          "shortIds": ["${short_id}"]
-        }
-      },
-      "sniffing": {"enabled": true, "destOverride": ["http","tls","quic"]}
-    }
-EOF
-)")
-        done < "$NODE_DB"
-    fi
-
-    # ── 从 REALM_EP_DB 读取 443 复用的 Realm 转发 ───────────────
-    # 字段: listen_port|remote_host|remote_port|label|xray_sni|xray_local_port
-    # 当 xray_sni 非空时 → 443复用模式：Xray 用 SNI 分流到 xray_local_port，Realm 监听 xray_local_port
-    local ob_idx=0
-    if [[ -s "$REALM_EP_DB" ]]; then
-        while IFS='|' read -r listen_port remote_host remote_port label xray_sni xray_local_port || [[ -n "$listen_port" ]]; do
-            [[ -z "$listen_port" ]] && continue
-            [[ "${listen_port:0:1}" == "#" ]] && continue
-            if [[ -n "$xray_sni" && "$listen_port" == "443" ]]; then
-                ob_idx=$(( ob_idx + 1 ))
-                local ob_tag="realm-out-${ob_idx}"
-                realm_outbounds+=("$(cat <<EOF
-    {
-      "tag": "${ob_tag}",
-      "protocol": "freedom",
-      "settings": {
-        "redirect": "127.0.0.1:${xray_local_port}"
-      }
-    }
-EOF
-)")
-                realm_rules+=("$(cat <<EOF
-    {
-      "type": "field",
-      "inboundTag": ["vless-in-443-*"],
-      "domain": ["${xray_sni}"],
-      "outboundTag": "${ob_tag}"
-    }
-EOF
-)")
-            fi
-        done < "$REALM_EP_DB"
-    fi
-
-    # ── 组装 JSON ────────────────────────────────────────────────
-    # 使用 Python 或 jq 拼接（更可靠），fallback 到 heredoc
-    local inbounds_json
-    if (( ${#inbounds_arr[@]} > 0 )); then
-        inbounds_json=$(printf '%s\n' "${inbounds_arr[@]}" | paste -sd ',' -)
-        inbounds_json="[${inbounds_json}]"
+    # ── 将数据库内容透传给 Python，让 Python 负责生成 JSON ────────
+    # 优先 python3，fallback python2
+    local PY
+    if command -v python3 >/dev/null 2>&1; then
+        PY=python3
+    elif command -v python >/dev/null 2>&1; then
+        PY=python
     else
-        inbounds_json="[]"
+        # 没有 Python：安装它
+        log_warn "未检测到 Python，正在安装..."
+        if [[ "$PKG_MGR" == "apt" ]]; then
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3 >/dev/null 2>&1
+        else
+            apk add --no-cache -q python3 >/dev/null 2>&1
+        fi
+        PY=python3
     fi
 
-    local extra_outbounds=""
-    if (( ${#realm_outbounds[@]} > 0 )); then
-        extra_outbounds=",$(printf '%s\n' "${realm_outbounds[@]}" | paste -sd ',' -)"
-    fi
+    # 将两个 DB 文件路径和日志目录传给 Python
+    local cfg
+    cfg=$($PY - "$NODE_DB" "$REALM_EP_DB" "$XRAY_LOG_DIR" "$XRAY_BIN" <<'PYEOF'
+import sys, json, os
 
-    local extra_rules=""
-    if (( ${#realm_rules[@]} > 0 )); then
-        extra_rules=",$(printf '%s\n' "${realm_rules[@]}" | paste -sd ',' -)"
-    fi
+node_db     = sys.argv[1]
+realm_db    = sys.argv[2]
+log_dir     = sys.argv[3]
+xray_bin    = sys.argv[4]  # unused in py, for reference
 
-    cat > "$XRAY_MAIN_CONFIG" <<EOF
-{
-  "log": {
-    "loglevel": "warning",
-    "access": "${XRAY_LOG_DIR}/access.log",
-    "error":  "${XRAY_LOG_DIR}/error.log"
-  },
-  "inbounds": ${inbounds_json},
-  "outbounds": [
-    {"protocol":"freedom","tag":"direct","settings":{}},
-    {"protocol":"blackhole","tag":"block"}
-    ${extra_outbounds}
-  ],
-  "routing": {
-    "domainStrategy": "IPIfNonMatch",
-    "rules": [
-      {"type":"field","protocol":["bittorrent"],"outboundTag":"block"}
-      ${extra_rules}
-    ]
-  }
+def read_db(path):
+    rows = []
+    if not os.path.isfile(path):
+        return rows
+    with open(path, 'r') as f:
+        for line in f:
+            line = line.rstrip('\n')
+            if not line or line.startswith('#'):
+                continue
+            rows.append(line)
+    return rows
+
+inbounds  = []
+outbounds = [
+    {"protocol": "freedom",   "tag": "direct", "settings": {}},
+    {"protocol": "blackhole", "tag": "block",  "settings": {}}
+]
+rules = [
+    {"type": "field", "protocol": ["bittorrent"], "outboundTag": "block"}
+]
+
+# ── VLESS 节点 ────────────────────────────────────────────────
+for line in read_db(node_db):
+    parts = line.split('|')
+    if len(parts) < 7:
+        continue
+    uuid, port, sni, short_id, private_key, name, fp = parts[0], parts[1], parts[2], parts[3], parts[4], parts[5], parts[6]
+    fp = fp.strip() or 'firefox'
+    tag = "vless-in-{}-{}".format(port, uuid[:8])
+    ib = {
+        "tag": tag,
+        "port": int(port),
+        "listen": "::",
+        "protocol": "vless",
+        "settings": {
+            "clients": [{"id": uuid, "flow": "xtls-rprx-vision"}],
+            "decryption": "none"
+        },
+        "streamSettings": {
+            "network": "tcp",
+            "security": "reality",
+            "realitySettings": {
+                "show": False,
+                "dest": "{}:443".format(sni),
+                "serverNames": [sni],
+                "privateKey": private_key,
+                "shortIds": [short_id]
+            }
+        },
+        "sniffing": {"enabled": True, "destOverride": ["http", "tls", "quic"]}
+    }
+    inbounds.append(ib)
+
+# ── Realm 443 复用路由 ────────────────────────────────────────
+ob_idx = 0
+for line in read_db(realm_db):
+    parts = line.split('|')
+    if len(parts) < 6:
+        continue
+    listen_port, remote_host, remote_port, label, xray_sni, xray_local_port = \
+        parts[0], parts[1], parts[2], parts[3], parts[4], parts[5]
+    xray_sni        = xray_sni.strip()
+    xray_local_port = xray_local_port.strip()
+    if xray_sni and listen_port == "443" and xray_local_port:
+        ob_idx += 1
+        ob_tag = "realm-out-{}".format(ob_idx)
+        outbounds.append({
+            "tag": ob_tag,
+            "protocol": "freedom",
+            "settings": {
+                "redirect": "127.0.0.1:{}".format(xray_local_port)
+            }
+        })
+        # 找到所有 443 入站的 tag
+        vless_443_tags = [ib["tag"] for ib in inbounds if ib.get("port") == 443]
+        rule = {
+            "type": "field",
+            "domain": [xray_sni],
+            "outboundTag": ob_tag
+        }
+        if vless_443_tags:
+            rule["inboundTag"] = vless_443_tags
+        rules.append(rule)
+
+config = {
+    "log": {
+        "loglevel": "warning",
+        "access":   "{}/access.log".format(log_dir),
+        "error":    "{}/error.log".format(log_dir)
+    },
+    "inbounds":  inbounds,
+    "outbounds": outbounds,
+    "routing": {
+        "domainStrategy": "IPIfNonMatch",
+        "rules": rules
+    }
 }
-EOF
+
+print(json.dumps(config, indent=2, ensure_ascii=False))
+PYEOF
+)
+
+    if [[ -z "$cfg" ]]; then
+        log_error "Python 配置生成失败（输出为空）"
+        return 1
+    fi
+
+    echo "$cfg" > "$XRAY_MAIN_CONFIG"
 
     # 验证配置
-    if ! "$XRAY_BIN" run -test -config "$XRAY_MAIN_CONFIG" >/dev/null 2>&1; then
+    local test_out
+    if ! test_out=$("$XRAY_BIN" run -test -config "$XRAY_MAIN_CONFIG" 2>&1); then
         log_error "Xray 配置验证失败，详细信息:"
-        "$XRAY_BIN" run -test -config "$XRAY_MAIN_CONFIG" 2>&1 | head -20
+        echo "$test_out" | head -20
+        log_error "生成的配置内容（供排查）:"
+        cat "$XRAY_MAIN_CONFIG"
         return 1
     fi
     log_success "Xray 配置生成并验证通过"
