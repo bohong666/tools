@@ -1,4 +1,3 @@
-```bash
 #!/bin/bash
 #
 # VLESS SNI 本地服务器发现脚本（增强版）
@@ -591,4 +590,3 @@ main() {
 }
 
 main
-```
