@@ -90,7 +90,7 @@ function start_service() {
         return
     fi
     echo "正在启动保活进程..."
-    nohup "$0" --daemon > /dev/null 2>&1 &
+    nohup bash "$(readlink -f "$0")" --daemon > /dev/null 2>&1 &
     echo $! > "$PID_FILE"
     echo -e "${GREEN}启动成功！预计占用内存: ${MEM_TARGET_MB} MB。${NC}"
 }
