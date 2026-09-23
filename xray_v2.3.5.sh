@@ -4,15 +4,16 @@
 # 功能: Xray VLESS+Reality+Vision  本地直连 + 链式中转
 # 架构: XTLS 官方内部 dokodemo-door 终极防偷流量 + 极客级健壮性
 #
-# 更新日志 v2.3.4:
-#   1. 新增: 版本感知启动。/etc/vps_manager/version 记录已安装版本；
-#           低版本 → 提示升级；无版本/版本相同 → 直接进入菜单
-#   2. 新增: ver_cmp 版本号比较函数 (正确处理 v2.3.10 > v2.3.9 这类情况)
-#   3. 保留: 升级 / 清空重装 / 跳过 三个选项，原有功能一个不少
-#   4. 继承: v2.3.3 全部特性 (中转增删改查、防偷架构、端口避让等)
+# 更新日志 v2.3.5:
+#   1. 修复: 查看节点时若公网 IP 自动检测失败，vless 链接不再消失
+#           (之前检测不到 IP 就整段不打印，这是本次报障的根因)
+#   2. 改进: IP 检测增加多个备用源 + 严格格式校验，防止错误页面污染
+#   3. 改进: 检测成功的 IP 自动缓存，检测失败时用缓存兜底；
+#           实在拿不到则用「你的服务器IP」占位符照常输出链接并提示替换
+#   4. 继承: v2.3.4 全部功能，一个没删
 # ==============================================================
 
-SCRIPT_VERSION="v2.3.4"
+SCRIPT_VERSION="v2.3.5"
 
 # ── 颜色与日志 ────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -204,18 +205,25 @@ ensure_python() {
 
 get_ipv4() {
     local ip url
-    for url in https://api4.ipify.org https://ifconfig.me https://icanhazip.com; do
+    for url in https://api4.ipify.org https://ipv4.icanhazip.com https://ifconfig.me https://api.ip.sb https://icanhazip.com; do
         ip=$(curl -s -4 --max-time 5 "$url" 2>/dev/null | tr -d '[:space:]')
-        [ -n "$ip" ] && { echo "$ip"; return 0; }
+        # 严格校验确为 IPv4，防止错误页面污染
+        if echo "$ip" | grep -Eq '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'; then
+            echo "$ip"; return 0
+        fi
     done
+    return 1
 }
 
 get_ipv6() {
     local ip url
-    for url in https://api6.ipify.org https://ifconfig.me https://icanhazip.com; do
+    for url in https://api6.ipify.org https://ipv6.icanhazip.com https://ifconfig.me https://icanhazip.com; do
         ip=$(curl -s -6 --max-time 5 "$url" 2>/dev/null | tr -d '[:space:]')
-        [ -n "$ip" ] && { echo "$ip"; return 0; }
+        if echo "$ip" | grep -q ':' && echo "$ip" | grep -Eq '^[0-9a-fA-F:]{2,}$'; then
+            echo "$ip"; return 0
+        fi
     done
+    return 1
 }
 
 check_github() { curl -sI --max-time 6 https://api.github.com >/dev/null 2>&1; return $?; }
@@ -803,15 +811,32 @@ view_all_nodes() {
 
 show_node_info() {
     local uuid="$1" port="$2" sni="$3" sid="$4" priv="$5" pub="$6" name="$7" fp="${8:-chrome}"
-    local ipv4 ipv6; ipv4=$(get_ipv4); ipv6=$(get_ipv6)
+    local ipv4 ipv6
+    ipv4=$(get_ipv4); ipv6=$(get_ipv6)
+
+    # 检测成功就缓存 IP，检测失败则用缓存兜底
+    [ -n "$ipv4" ] && echo "$ipv4" > "$DATA_DIR/server_ip" 2>/dev/null
+    if [ -z "$ipv4" ] && [ -f "$DATA_DIR/server_ip" ]; then
+        ipv4=$(tr -d ' \r\n' < "$DATA_DIR/server_ip" 2>/dev/null)
+    fi
+
     echo -e "\n${CYAN}════ 节点: $name ════${NC}"
     echo "UUID:        $uuid"
     echo "Port:        $port"
     echo "SNI:         $sni"
     echo "Public Key:  $pub"
     echo "Short ID:    $sid"
-    [ -n "$ipv4" ] && echo -e "\n${GREEN}── VLESS URI (IPv4) ──${NC}\n${YELLOW}$(make_uri "$uuid" "$ipv4" "$port" "$sni" "$pub" "$sid" "$name" "$fp" "0")${NC}"
-    [ -n "$ipv6" ] && echo -e "\n${GREEN}── VLESS URI (IPv6) ──${NC}\n${YELLOW}$(make_uri "$uuid" "$ipv6" "$port" "$sni" "$pub" "$sid" "${name}-v6" "$fp" "1")${NC}"
+
+    # IPv4 链接永远输出：拿不到 IP 就用占位符，保证链接可见
+    local host4="$ipv4"
+    if [ -z "$host4" ]; then
+        host4="你的服务器IP"
+        echo -e "${YELLOW}提示: 未能自动检测公网 IP，已用占位符生成链接，请把「你的服务器IP」替换为实际 IP${NC}"
+    fi
+    echo -e "\n${GREEN}── VLESS URI (IPv4) ──${NC}\n${YELLOW}$(make_uri "$uuid" "$host4" "$port" "$sni" "$pub" "$sid" "$name" "$fp" "0")${NC}"
+    if [ -n "$ipv6" ]; then
+        echo -e "\n${GREEN}── VLESS URI (IPv6) ──${NC}\n${YELLOW}$(make_uri "$uuid" "$ipv6" "$port" "$sni" "$pub" "$sid" "${name}-v6" "$fp" "1")${NC}"
+    fi
     echo -e "${CYAN}═════════════════════${NC}\n"
 }
 
