@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
 # ==============================================================
-# VPS 一键管理脚本  v2.3.3 (终极大师版 - 补完版)
+# VPS 一键管理脚本  v2.3.4 (终极大师版 - 版本感知版)
 # 功能: Xray VLESS+Reality+Vision  本地直连 + 链式中转
 # 架构: XTLS 官方内部 dokodemo-door 终极防偷流量 + 极客级健壮性
 #
-# 更新日志 v2.3.3:
-#   1. 补完: 新增 edit_relay / delete_relay，中转落地支持完整增删改查
-#   2. 修复: BBR 开启前先 modprobe tcp_bbr 并检测内核是否支持，避免静默失败
-#   3. 统一: 落地序号计数逻辑对齐列表显示 (非空且非#开头行)
-#   4. 继承: v2.3.2 全部特性 (全局端口避让、分隔符过滤、端口重复预检等)
+# 更新日志 v2.3.4:
+#   1. 新增: 版本感知启动。/etc/vps_manager/version 记录已安装版本；
+#           低版本 → 提示升级；无版本/版本相同 → 直接进入菜单
+#   2. 新增: ver_cmp 版本号比较函数 (正确处理 v2.3.10 > v2.3.9 这类情况)
+#   3. 保留: 升级 / 清空重装 / 跳过 三个选项，原有功能一个不少
+#   4. 继承: v2.3.3 全部特性 (中转增删改查、防偷架构、端口避让等)
 # ==============================================================
 
-SCRIPT_VERSION="v2.3.3"
+SCRIPT_VERSION="v2.3.4"
 
 # ── 颜色与日志 ────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -42,6 +43,7 @@ XRAY_LOG_DIR="/var/log/xray"
 DATA_DIR="/etc/vps_manager"
 NODE_DB="$DATA_DIR/nodes.db"
 RELAY_DB="$DATA_DIR/relay.db"
+VERSION_FILE="$DATA_DIR/version"
 BACKUP_DIR="/root/vps_manager_backups"
 
 # 内层防偷端口基数 (改用冷僻高位段)
@@ -76,45 +78,99 @@ sanitize_field() {
     echo "$1" | tr -d '|' | tr -d '\r' | tr -d '\n'
 }
 
-check_upgrade() {
-    if [ "$UPGRADE_CHECKED" = "1" ]; then return 0; fi
-    export UPGRADE_CHECKED=1
+# 比较两个版本号 (格式 vX.Y.Z，可处理 v2.3.10 > v2.3.9)
+# 返回值: 0 相等 | 1 第一个更大 | 2 第一个更小
+ver_cmp() {
+    local v1 v2
+    v1=$(echo "${1#v}" | tr -cd '0-9.')
+    v2=$(echo "${2#v}" | tr -cd '0-9.')
+    [ -z "$v1" ] && v1="0.0.0"
+    [ -z "$v2" ] && v2="0.0.0"
+    local IFS='.'
+    local -a a b
+    read -ra a <<< "$v1"
+    read -ra b <<< "$v2"
+    local i x y
+    for i in 0 1 2; do
+        x="${a[$i]:-0}"; y="${b[$i]:-0}"
+        x=$((10#$x)); y=$((10#$y))   # 10# 防止 08 被当成八进制
+        (( x > y )) && return 1
+        (( x < y )) && return 2
+    done
+    return 0
+}
 
-    if [ -s "$NODE_DB" ] || [ -s "$RELAY_DB" ]; then
-        log_title "检测到历史节点数据"
-        echo -e "${YELLOW}当前为新版防偷流量脚本(v$SCRIPT_VERSION)，请选择操作：${NC}"
-        echo "  1) 保留原有节点并 平滑升级配置 (推荐)"
-        echo "  2) 彻底清空旧数据并 全新安装 (危险)"
-        echo "  0) 稍后决定 (返回主菜单)"
+# 版本感知：低版本提示升级，无版本/版本相同直接进菜单
+check_version() {
+    if [ "$UPGRADE_CHECKED" = "1" ]; then return 0; fi
+    UPGRADE_CHECKED=1
+
+    local installed=""
+    [ -f "$VERSION_FILE" ] && installed=$(tr -d ' \r\n' < "$VERSION_FILE" 2>/dev/null || true)
+
+    # 无版本记录
+    if [ -z "$installed" ]; then
+        if [ -s "$NODE_DB" ] || [ -s "$RELAY_DB" ]; then
+            installed="v0.0.0"   # 有老数据但无版本文件 → 视为远古版本，走升级流程
+        else
+            echo "$SCRIPT_VERSION" > "$VERSION_FILE" 2>/dev/null || true
+            return 0             # 全新安装，直接进菜单
+        fi
+    fi
+
+    ver_cmp "$installed" "$SCRIPT_VERSION"
+    local cmp=$?
+
+    if [ "$cmp" -eq 2 ]; then
+        # ── 低版本 → 提示升级 ──
+        log_title "检测到旧版本"
+        echo -e " VPS 已安装版本: ${YELLOW}$installed${NC}"
+        echo -e " 当前脚本版本: ${GREEN}$SCRIPT_VERSION${NC}"
+        echo ""
+        echo "  1) 平滑升级 (保留节点与落地，推荐)"
+        echo "  2) 清空重装 (删除所有数据，危险)"
+        echo "  0) 暂不升级，直接进入菜单"
         read -rp "请选择 [1/2/0]: " ch
         case "$ch" in
             1)
-                log_info "正在为您保留数据并平滑升级..."
+                log_info "正在平滑升级 $installed → $SCRIPT_VERSION ..."
                 sanitize_db
                 ensure_python
                 if regen_config; then
                     start_xray
-                    log_success "平滑升级完成！新架构已生效。"
+                    echo "$SCRIPT_VERSION" > "$VERSION_FILE" 2>/dev/null || true
+                    log_success "升级完成！新版本已生效。"
                 else
-                    log_warn "配置重新生成失败，请在主菜单选[强制修复配置]。"
+                    log_error "配置重新生成失败，版本未更新，下次启动会再次提示升级。"
+                    log_warn "可尝试主菜单 [9) 强制修复配置]。"
                 fi
                 sleep 2
                 ;;
             2)
-                read -rp "警告: 将删除所有历史节点和配置！确定吗？[y/N]: " confirm
+                read -rp "警告: 将删除所有节点、落地和配置！确定吗？[y/N]: " confirm
                 if [ "${confirm:-N}" = "y" ] || [ "${confirm:-N}" = "Y" ]; then
                     rm -rf "${DATA_DIR:?}" "${XRAY_ETC:?}"
                     mkdir -p "$DATA_DIR" "$BACKUP_DIR" "$XRAY_LOG_DIR" "$XRAY_ETC"
                     touch "$NODE_DB" "$RELAY_DB"
-                    log_success "已彻底清理旧数据。"
+                    echo "$SCRIPT_VERSION" > "$VERSION_FILE" 2>/dev/null || true
+                    log_success "已清空重装，当前版本 $SCRIPT_VERSION。"
                     sleep 1
                 else
-                    log_info "已取消清理"
+                    log_info "已取消清空，版本保持 $installed。"
                 fi
                 ;;
-            *) return 0 ;;
+            *)
+                log_info "已跳过升级，下次启动将再次提示。"
+                return 0
+                ;;
         esac
+    elif [ "$cmp" -eq 1 ]; then
+        # 版本记录比脚本还新 (极端情况) → 同步记录，直接进菜单
+        log_warn "版本记录($installed)高于脚本($SCRIPT_VERSION)，已同步记录"
+        echo "$SCRIPT_VERSION" > "$VERSION_FILE" 2>/dev/null || true
     fi
+    # cmp == 0 → 版本相同，直接进菜单，什么都不做
+    return 0
 }
 
 detect_os() {
@@ -1063,11 +1119,10 @@ main_menu() {
     need_root
     detect_os
 
-    sanitize_db
-    check_upgrade
-
     mkdir -p "$DATA_DIR" "$BACKUP_DIR" "$XRAY_LOG_DIR" "$XRAY_ETC" 2>/dev/null || true
-    touch "$NODE_DB" "$RELAY_DB" 2>/dev/null || true
+    touch "$NODE_DB" "$RELAY_DB" "$VERSION_FILE" 2>/dev/null || true
+    sanitize_db
+    check_version
 
     while true; do
         echo ""
