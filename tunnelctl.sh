@@ -16,13 +16,18 @@
 #
 #  1) 本脚本【从不读写你的 Xray / V2Ray / Nginx 配置】。
 #     所有涉及 443 的改动都只做「检测 + 提示你手工改」，绝不代改。
-#  2) 本脚本只往两处写 sshd 相关文件：
-#       /etc/ssh/sshd_config.d/10-tunnel.conf   （整文件由本脚本管理）
-#       /etc/ssh/sshd_config 末尾的 Match 块    （用 BEGIN/END 标记圈起来）
+#  2) 本脚本只往三处写 sshd 相关文件：
+#       /etc/ssh/sshd_config.d/10-tunnel.conf        （整文件由本脚本管理）
+#       /etc/ssh/sshd_config 末尾的 Match 块         （用 BEGIN/END 标记圈起来）
+#       /etc/systemd/system/ssh.socket.d/10-tunnel.conf
+#         └─ 只在【socket 激活】模式下才写（Ubuntu 22.10+ 默认）。
+#            那种模式下 sshd_config 的 Port 指令不生效，端口必须写这里。
 #     动手前自动备份 sshd_config 到 sshd_config.igtunnel.bak。
-#  3) 每次重启 sshd 之前都会「快照」当前监听端口；重启之后逐项核对：
-#     原有端口是否都还在、sshd 是否还活着、其他服务的监听是否被波及。
-#     任何一项不对就【自动回滚】并恢复 sshd。
+#  3) 每次重启 sshd 之前都会「快照」当前【实际在监听】的端口；重启之后逐项核对：
+#     原有端口是否都还在、新端口是否真的起来了、sshd 是否还活着、
+#     其他服务的监听是否被波及。任何一项不对就【自动回滚】并恢复 sshd。
+#     ★ 注意用的是内核视角（ss / ssh.socket），不是 `sshd -T` ——
+#        socket 激活时 `sshd -T` 报的是配置里的端口，和真正 bind 的可以完全不一样。
 #  4) 已知的锁死风险只有一种：sshd 配置里的端口【全部】绑不上时，
 #     sshd 会以 "Cannot bind any address" 退出。所以本脚本在写配置时
 #     一定会把当前所有生效端口（含默认的 22）都显式写进 dropin，
@@ -41,6 +46,10 @@ CLIENT_DIR="$CA_DIR/clients"
 STATE_DIR="/var/lib/igtunnel"
 CONF_FILE="$CA_DIR/igtunnel.conf"
 DROPIN="/etc/ssh/sshd_config.d/10-tunnel.conf"
+# ★ systemd socket 激活模式下的监听端口配置（Ubuntu 22.10+ 默认走这条路）。
+#   做成变量同样是为了让测试能把它指向沙盒，而不是真去动 /etc/systemd/system。
+SOCKET_DROPIN_DIR="${SOCKET_DROPIN_DIR:-/etc/systemd/system/ssh.socket.d}"
+SOCKET_DROPIN="$SOCKET_DROPIN_DIR/10-tunnel.conf"
 SSHD_CONF="/etc/ssh/sshd_config"
 OTP_SECRET="$CA_DIR/otp_secret"
 OTP_FLAG="$STATE_DIR/otp_enabled"
@@ -57,7 +66,7 @@ DIST_DIR="${DIST_DIR:-/root/igtunnel-dist}"   # 授权包输出目录（可用�
 # 为什么值得占一行：你经常要把新脚本传到一台【已经有旧脚本】的机器上覆盖，
 # 而覆盖成功与否、跑的是哪一版，以前完全没有办法确认 —— 只能靠"我记得传过了"。
 # 现在：菜单最下面一行会显示它，`--version` 也能直接问。
-SCRIPT_VER="2026.09.30-2"
+SCRIPT_VER="2026.09.30-4"
 
 # 本脚本自己的目录（客户端模板还原在这里）。卸载时整体删除。
 # 单独定义成一个变量、而不是从 TEMPLATE_DIR 反推父目录，是为了让测试能安全覆盖：
@@ -132,12 +141,176 @@ ssh_service() {
   fi
 }
 
+# ============================================================
+#  socket 激活（Ubuntu 22.10+ 默认）—— 本脚本最容易漏、后果最严重的坑
+# ============================================================
+#
+# Ubuntu 22.10 起，sshd 默认由 systemd 的 ssh.socket 拉起。此时：
+#
+#   · 监听端口归【ssh.socket】管，sshd_config 里的 Port 指令【完全不生效】
+#   · 但 `sshd -T` 仍然会把它读到的 Port 原样报出来 —— 配置"看起来是对的"
+#   · 于是：配置里写着 2222，内核那边一个端口都没多
+#     → 家人的客户端收到 Connection refused
+#
+# 实测踩过（Oracle 上的 Ubuntu 实例）：
+#     sudo sshd -T | grep ^port     →  port 22 / port 2222   ← sshd 以为的
+#     sudo ss -tlnp | grep :2222    →  （空）                 ← 内核实际的
+#
+# 判据：看 LISTEN 那行 fd 的持有者 —— 是 systemd(pid=1) 就是 socket 激活。
+# 教训：`sshd -T` 说的是"sshd 以为的"，`ss` 说的才是"内核在做的"。
+#       两者不一致时，看谁持有 fd。
+ssh_socket_activated() {
+  # 只有 Debian/Ubuntu 的 ssh 用这套；RHEL 系的 sshd 没有 socket 激活
+  [ "$(ssh_service)" = "ssh" ] || return 1
+  systemctl is-active  --quiet ssh.socket 2>/dev/null && return 0
+  systemctl is-enabled --quiet ssh.socket 2>/dev/null && return 0
+  return 1
+}
+
+# ssh.socket 当前真正在监听的端口（问 systemd，权威）
+socket_listen_ports() {
+  local raw ports
+  raw="$(systemctl show ssh.socket -p Listen 2>/dev/null)" || return 1
+  [ -n "$raw" ] || return 1
+  ports="$(printf '%s\n' "$raw" | sed -E 's/^Listen=//' | tr ' ' '\n' \
+    | sed -E 's/^.*[:.]([0-9]+)$/\1/' | grep -E '^[0-9]+$' | sort -un)"
+  # ★ 必须检查结果非空。`systemctl show` 在 socket 没监听任何东西时
+  #   会返回 "Listen="（非空字符串），只判 raw 非空会漏过去，
+  #   然后调用方拿到一个"成功但空"的结果 —— 又是一种静默失败。
+  [ -n "$ports" ] || return 1
+  printf '%s\n' "$ports"
+}
+
+# 从现有 ssh.socket 的 Listen 里取出地址前缀（如 0.0.0.0 / [::]）。
+# 目的：沿用系统原本的绑定方式，不自己发明 IPv6 —— 在没开 IPv6 的机器上
+# 硬写 [::]:port 会让 socket 起不来，那样 SSH 就真的断了。
+socket_addr_prefixes() {
+  local raw
+  raw="$(systemctl show ssh.socket -p Listen 2>/dev/null | sed -E 's/^Listen=//')"
+  [ -n "$raw" ] || return 0
+  printf '%s\n' "$raw" | tr ' ' '\n' | grep -E '[:.]' \
+    | sed -E 's/[:.]([0-9]+)$//' | grep -v '^$' | sort -u
+}
+
+# sshd 真正在监听的端口（★ 内核视角，校验必须用这个）
+#
+# socket 激活模式下要格外小心，这里有个"看着能跑、其实会锁死自己"的陷阱：
+#
+#   · 监听 fd 归 systemd(pid=1) 所有，已触发的 sshd 实例自己不再 listen，
+#     所以【不能】像传统模式那样按进程名筛 `ss -p | grep sshd`。
+#   · 那改成 grep systemd 行不行？更糟 —— `ss -p` 只写进程名，
+#     systemd-resolved(53)、systemd-timesyncd 和持有 ssh.socket 的 systemd
+#     长得一模一样。按名字筛会把别人的端口当成我们的，最坏情况是往
+#     ssh.socket 的 drop-in 里写一个 53，socket 直接起不来 —— 那才是真的断连。
+#
+# 做法：拿 ssh.socket 配置里的端口，逐个去内核里核对，只保留【真的在监听】的。
+#       这样只会少报、绝不会多报。少报的代价是回滚（安全），
+#       多报的代价是锁死自己（不可接受）。
+ssh_real_ports() {
+  if ssh_socket_activated; then
+    local cfg kern p out=""
+    cfg="$(socket_listen_ports)" || return 1
+    kern="$(ss -tlnpH 2>/dev/null | awk '{print $4}' \
+      | sed -E 's/^.*[:.]([0-9]+)$/\1/' | grep -E '^[0-9]+$' | sort -un)"
+    # 内核视角读不到 → 宁可判失败，也不拿配置文件糊弄自己
+    [ -n "$kern" ] || return 1
+    for p in $cfg; do
+      printf '%s\n' "$kern" | grep -qx "$p" && out="${out}${p} "
+    done
+    out="$(printf '%s\n' $out | grep -E '^[0-9]+$' | sort -un)"
+    [ -n "$out" ] || return 1
+    printf '%s\n' "$out"
+    return 0
+  fi
+  local k
+  k="$(ss -tlnpH 2>/dev/null | grep -i 'sshd')"
+  [ -n "$k" ] || return 1
+  printf '%s\n' "$k" | awk '{print $4}' \
+    | sed -E 's/^.*[:.]([0-9]+)$/\1/' | grep -E '^[0-9]+$' | sort -un
+}
+
+# 写 ssh.socket 的 drop-in（socket 激活模式下，真正决定监听端口的地方）。
+#
+# ★ 那行【空的】`ListenStream=` 是必须的：systemd 的列表型指令是累加的，
+#   不先清空就会把新端口"追加"到原来的 22 上 —— 你以为只监听 2222，
+#   实际两个都在监听，而且不报任何错、不留任何提示。
+build_socket_dropin() {
+  local ports="$1" prefixes
+  [ -n "$(printf '%s' "$ports" | tr -d ' ')" ] || { err "socket 端口列表为空，拒绝写入"; return 1; }
+
+  mkdir -p "$SOCKET_DROPIN_DIR" || { err "建不了目录 $SOCKET_DROPIN_DIR"; return 1; }
+
+  prefixes="$(socket_addr_prefixes)"
+  {
+    echo "# 由 tunnelctl.sh 生成，请勿手工编辑"
+    echo "#"
+    echo "# 你的 sshd 由 systemd 的 ssh.socket 拉起（Ubuntu 22.10+ 默认）。"
+    echo "# 这种模式下 /etc/ssh/sshd_config 里的 Port 指令【不生效】，"
+    echo "# 监听端口只认这里。所以要加端口，必须写进这个文件。"
+    echo "#"
+    echo "# 第一行空赋值是【必须的】：systemd 列表型指令是累加的，"
+    echo "# 不清空的话新端口只会被追加，而不是替换掉原来的。"
+    echo "[Socket]"
+    echo "ListenStream="
+    for p in $ports; do
+      if [ -n "$prefixes" ]; then
+        printf '%s\n' $prefixes | while IFS= read -r _a; do
+          [ -n "$_a" ] && echo "ListenStream=${_a}:${p}"
+        done
+      else
+        echo "ListenStream=${p}"
+      fi
+    done
+  } > "$SOCKET_DROPIN" || { err "写不了 $SOCKET_DROPIN"; return 1; }
+  chmod 644 "$SOCKET_DROPIN" 2>/dev/null
+  return 0
+}
+
+# 把「当前真实在监听的端口 − 旧端口 + 新端口」同步进 ssh.socket。
+# 非 socket 激活时什么都不做、返回 0（空操作）—— 这样调用方可以无脑 `&&` 串起来。
+#
+# ★ 一定要带上现有端口：漏掉登录口 = 把自己关在门外。
+sync_socket_ports() {
+  local newp="$1" oldp="${2:-}" p ports="" cur
+  ssh_socket_activated || return 0
+
+  # ★★ 读不到当前端口就【绝对不许写】★★
+  #   下面这段是"当前端口 − 旧端口 + 新端口"。如果当前端口读成了空，
+  #   结果就只剩新端口一个 —— 登录口会被静默摘掉，写完重启 socket，
+  #   你当前这条连接还活着（已建立的连接不受影响），但下次登录就上不去了。
+  #   这是本脚本里唯一能真正把人关在门外的路径，所以在这里硬拦一道。
+  if ! cur="$(ssh_real_ports 2>/dev/null)" || [ -z "$cur" ]; then
+    err "读不到 ssh.socket 当前正在监听的端口，拒绝改写配置（怕把你的登录口弄丢）"
+    err "  请先手工确认这两条："
+    err "    systemctl show ssh.socket -p Listen"
+    err "    sudo ss -tlnp | grep -E 'systemd|sshd'"
+    return 1
+  fi
+
+  for p in $cur; do
+    [ -n "$p" ] || continue
+    [ -n "$oldp" ] && [ "$p" = "$oldp" ] && continue
+    [ "$p" = "$newp" ] && continue
+    ports="${ports}${p} "
+  done
+  [ -n "$newp" ] && ports="${ports}${newp}"
+  ports="$(printf '%s\n' $ports | grep -E '^[0-9]+$' | sort -un)"
+  [ -n "$ports" ] || { err "socket 端口列表为空，拒绝写入"; return 1; }
+  build_socket_dropin "$ports" || return 1
+  info "已同步 ssh.socket 端口列表：$(printf '%s ' $ports)"
+  return 0
+}
+
 # 安全的 sshd 重启：校验配置 -> 拍快照 -> 重启 -> 逐项核对 -> 不对就回滚。
 #
-# 可选参数 $1 = 本次【预期会消失】的端口（换端口 / 卸载时会用到），
-# 这样核对时就不会把它当成"端口丢了"。
+# 参数：
+#   $1 = 本次【预期会消失】的端口（换端口 / 卸载时会用到）
+#   $2 = 本次【预期会新出现】的端口（安装 / 换端口时用）。
+#        这个参数很关键：它专门抓"socket 激活导致 Port 指令静默失效"——
+#        配置写了、sshd -T 也认了，但内核那边根本没监听。
 restart_ssh() {
   local expected_gone="${1:-}"
+  local expected_new="${2:-}"
   local svc; svc="$(ssh_service)"
 
   if ! sshd -t 2>/tmp/sshd_test_err; then
@@ -148,14 +321,32 @@ restart_ssh() {
 
   snapshot_ssh
 
-  if ! systemctl restart "$svc"; then
-    err "重启 $svc 失败"
-    return 1
+  if ssh_socket_activated; then
+    # ★ socket 激活：监听端口归 ssh.socket 管，重启 ssh.service【没有任何用】。
+    #   必须先 daemon-reload（让 systemd 重新读 drop-in），再重启 socket。
+    #   实测就是这样翻车的：脚本重启了 ssh.service、校验也过了，
+    #   但内核那边一个端口都没多，家人拿到 Connection refused。
+    if ! systemctl daemon-reload; then
+      err "systemctl daemon-reload 失败"
+      return 1
+    fi
+    if ! systemctl restart ssh.socket; then
+      err "重启 ssh.socket 失败"
+      return 1
+    fi
+    sleep 1
+    # socket 重启后 ssh.service 未必被自动拉起，补一下（已在跑则是空操作）
+    systemctl start "$svc" >/dev/null 2>&1 || true
+  else
+    if ! systemctl restart "$svc"; then
+      err "重启 $svc 失败"
+      return 1
+    fi
   fi
   sleep 1
 
-  if verify_ssh_intact "$expected_gone"; then
-    ok "sshd 已重启，核对通过（当前端口：$(sshd_ports | tr '\n' ' '))"
+  if verify_ssh_intact "$expected_gone" "$expected_new"; then
+    ok "sshd 已重启，核对通过（实际监听：$(ssh_real_ports | tr '\n' ' '))"
     return 0
   fi
 
@@ -752,42 +943,81 @@ fw_cloud_hint() {
 snapshot_ssh() {
   mkdir -p "$SNAPDIR" 2>/dev/null
   sshd_ports         > "$SNAPDIR/sshd_ports.before" 2>/dev/null || : > "$SNAPDIR/sshd_ports.before"
+  # ★ 内核视角的真实监听端口。校验用这个，不用 sshd -T ——
+  #   socket 激活时 sshd -T 报的是配置里的端口，和真正 bind 的可以完全不一样。
+  ssh_real_ports     > "$SNAPDIR/real.before"       2>/dev/null || : > "$SNAPDIR/real.before"
   listen_ports_all   > "$SNAPDIR/listen.before"     2>/dev/null || : > "$SNAPDIR/listen.before"
   ssh_service        > "$SNAPDIR/svc.before"        2>/dev/null || true
-  info "已拍下改动前的快照（sshd 端口：$(tr '\n' ' ' < "$SNAPDIR/sshd_ports.before")）"
+  info "已拍下改动前的快照（sshd 实际监听：$(tr '\n' ' ' < "$SNAPDIR/real.before")）"
 }
 
-# verify_ssh_intact [预期会消失的端口]
+# verify_ssh_intact [预期会消失的端口] [预期会新出现的端口]
 verify_ssh_intact() {
-  local expected_gone="${1:-}"
+  local expected_gone="${1:-}" expected_new="${2:-}"
   local svc; svc="$(cat "$SNAPDIR/svc.before" 2>/dev/null || ssh_service)"
   local bad=0 p
-
-  if ! systemctl is-active --quiet "$svc"; then
+  local svc_up=0
+  if systemctl is-active --quiet "$svc"; then
+    svc_up=1
+  fi
+  # socket 激活模式下 ssh.service 是"按需拉起"的：如果是从 VPS 厂商的
+  # 网页控制台（不是 SSH）在跑这个脚本，ssh.service 可能压根没启动过，
+  # 但 ssh.socket 活得好好的、端口也都在监听 —— 这种情况不该判失败。
+  if [ "$svc_up" = 0 ] && ssh_socket_activated \
+     && systemctl is-active --quiet ssh.socket; then
+    svc_up=1
+  fi
+  if [ "$svc_up" = 0 ]; then
     err "$svc 没有在运行"
     return 1
   fi
 
-  local now; now="$(sshd_ports || true)"
+  # ★ 用【内核视角】的监听端口核对，不用 `sshd -T`。
+  #   socket 激活时 sshd -T 报的是配置里的端口，和真正 bind 的可以完全不一样。
+  #   旧版只看 sshd -T，于是"校验通过"而实际上一个端口都没在监听 —— 这个坑
+  #   让家人拿到了 Connection refused，却在服务端看起来一切正常。
+  local now; now="$(ssh_real_ports || true)"
   if [ -z "$now" ]; then
-    err "读不到 sshd 生效端口（sshd -T 失败）"
+    err "读不到 sshd 实际监听的端口"
     return 1
   fi
 
-  # 1) 原来有的 sshd 端口，除了预期消失的那个，其余必须还在
-  while read -r p; do
-    [ -n "$p" ] || continue
-    [ "$p" = "$expected_gone" ] && continue
-    if ! printf '%s\n' "$now" | grep -qx "$p"; then
-      err "原本的 sshd 端口 ${p} 不见了"
+  # 1) 原来【真实在监听】的 sshd 端口，除了预期消失的那个，其余必须还在
+  if [ -s "$SNAPDIR/real.before" ]; then
+    while read -r p; do
+      [ -n "$p" ] || continue
+      [ "$p" = "$expected_gone" ] && continue
+      if ! printf '%s\n' "$now" | grep -qx "$p"; then
+        err "原本在监听的 sshd 端口 ${p} 不见了"
+        bad=1
+      fi
+    done < "$SNAPDIR/real.before"
+  fi
+
+  # 2) ★ 预期新出现的端口必须【真的】在监听。
+  #    这一步专门抓"socket 激活导致 Port 指令静默失效"这一类失败 ——
+  #    以前的校验永远发现不了它，因为配置和 sshd -T 都是"对的"。
+  if [ -n "$expected_new" ]; then
+    if printf '%s\n' "$now" | grep -qx "$expected_new"; then
+      :
+    else
+      err "隧道端口 ${expected_new} 没有真的在监听（配置写了，但不生效）"
+      if ssh_socket_activated; then
+        err "  原因：你的 sshd 由 systemd 的 ssh.socket 拉起。这种模式下"
+        err "  sshd_config 里的 Port 指令【不生效】，端口必须写进 ssh.socket。"
+        err "  排查用的三条命令："
+        err "    systemctl cat ssh.socket | grep -i listenstream"
+        err "    ls -l ${SOCKET_DROPIN_DIR}/"
+        err "    sudo ss -tlnp | grep ':${expected_new}'"
+      fi
       bad=1
     fi
-  done < "$SNAPDIR/sshd_ports.before"
+  fi
 
-  # 2) 不属于 sshd 的监听端口不应该因为我们而消失（例如 Xray 的 443）
+  # 3) 不属于 sshd 的监听端口不应该因为我们而消失（例如 Xray 的 443）
   local before_now sshd_before now_all
   before_now="$(cat "$SNAPDIR/listen.before" 2>/dev/null || true)"
-  sshd_before="$(cat "$SNAPDIR/sshd_ports.before" 2>/dev/null || true)"
+  sshd_before="$(cat "$SNAPDIR/real.before" 2>/dev/null || true)"
   now_all="$(listen_ports_all || true)"
   while read -r p; do
     [ -n "$p" ] || continue
@@ -809,8 +1039,19 @@ rollback_dropin() {
   if [ -f "$DROPIN" ]; then
     mv -f "$DROPIN" "${DROPIN}.failed.$(date +%Y%m%d%H%M%S)" 2>/dev/null
   fi
+  # ★ socket 激活时，隧道端口是写在 ssh.socket 里的 —— 不摘掉的话，
+  #   回滚之后那个端口还在监听（虽然 CA 已经不可用，但没必要留着）。
+  if [ -f "$SOCKET_DROPIN" ]; then
+    mv -f "$SOCKET_DROPIN" "${SOCKET_DROPIN}.failed.$(date +%Y%m%d%H%M%S)" 2>/dev/null
+  fi
   sed -i "/^${MARK_BEGIN}$/,/^${MARK_END}$/d" "$SSHD_CONF" 2>/dev/null
-  systemctl restart "$svc" 2>/dev/null
+  if ssh_socket_activated; then
+    systemctl daemon-reload 2>/dev/null
+    systemctl restart ssh.socket 2>/dev/null
+    systemctl start "$svc" >/dev/null 2>&1 || true
+  else
+    systemctl restart "$svc" 2>/dev/null
+  fi
   sleep 1
   if systemctl is-active --quiet "$svc"; then
     warn "已回滚：SSH 恢复正常，但隧道配置没有生效。"
@@ -923,7 +1164,7 @@ precheck() {
 
   local cur_ports
   if cur_ports="$(sshd_ports)"; then
-    ok "sshd 当前生效端口：$(printf '%s ' $cur_ports)"
+    ok "sshd 配置里的端口：$(printf '%s ' $cur_ports)"
     if printf '%s\n' $cur_ports | grep -qx '22'; then
       info "其中含 22 → 本脚本不会改变你平时的登录端口"
     else
@@ -932,6 +1173,22 @@ precheck() {
   else
     err "sshd -T 解析失败，sshd 配置可能已有问题，先修好再来"
     fail=1
+  fi
+
+  # --- socket 激活：最容易漏、后果最严重的一种情况 ---
+  if ssh_socket_activated; then
+    local real_ports
+    real_ports="$(ssh_real_ports 2>/dev/null || true)"
+    warn "你的 sshd 是【systemd socket 激活】模式（Ubuntu 22.10+ 默认）"
+    info "  → 监听端口由 ssh.socket 决定，${SSHD_CONF} 里的 Port 指令【不生效】"
+    info "  → 真正在监听：$(printf '%s ' $real_ports)"
+    info "  脚本会同时写 ${SOCKET_DROPIN}，并重启 ssh.socket —— 这样才能真的加上隧道端口。"
+    if [ "$(printf '%s ' $cur_ports | tr -d ' ')" != "$(printf '%s ' $real_ports | tr -d ' ')" ]; then
+      warn "  ⚠ 配置里的端口和实际监听的不一致！"
+      info "     配置：$(printf '%s ' $cur_ports)"
+      info "     实际：$(printf '%s ' $real_ports)"
+      info "     这正是 socket 激活造成的 —— 写 sshd_config 不会改变实际监听端口。"
+    fi
   fi
 
   if grep -qE '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/\*\.conf' "$SSHD_CONF" 2>/dev/null; then
@@ -1079,6 +1336,23 @@ do_install() {
   fi
   ok "已写入 $DROPIN"
 
+  # ★★ 光写 sshd_config 不够 ★★
+  # Ubuntu 22.10+ 默认由 systemd 的 ssh.socket 拉起 sshd，此时 sshd_config 里的
+  # Port 指令【不生效】—— 监听端口只认 ssh.socket。只写上面那份，结果就是
+  # 「配置写着 2222、sshd -T 也说 2222，但内核那边一个端口都没多」，
+  # 家人的客户端收到 Connection refused。
+  #
+  # 所以这里必须把【当前真实在监听的端口 ∪ 隧道端口】写进 ssh.socket 的 drop-in。
+  # 注意要带上现有端口 —— 漏掉登录口就等于把自己关在门外。
+  if ssh_socket_activated; then
+    if sync_socket_ports "$TUNNEL_PORT" "$prev_port"; then
+      ok "已写入 $SOCKET_DROPIN"
+      info "  （你的 sshd 由 ssh.socket 拉起，端口必须写这里才生效）"
+    else
+      warn "写 ssh.socket 配置失败 —— 隧道端口很可能不会真的监听！"
+    fi
+  fi
+
   if ! grep -qE '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/\*\.conf' "$SSHD_CONF"; then
     warn "$SSHD_CONF 里没有 Include 指令，上面的配置不会生效！"
     warn "请手动在 $SSHD_CONF 顶部加一行： Include /etc/ssh/sshd_config.d/*.conf"
@@ -1100,7 +1374,8 @@ do_install() {
   fi
 
   say "  [4/6] 校验并重启 sshd（会先备份、后核对、异常自动回滚）"
-  restart_ssh "$prev_port" || return 1
+  # 第二个参数是"预期新出现的端口" —— 核对时如果它没真的监听，直接判失败并回滚。
+  restart_ssh "$prev_port" "$TUNNEL_PORT" || return 1
 
   say "  [5/6] 放行防火墙"
   local fwdid
@@ -1339,9 +1614,10 @@ EOF
     TUNNEL_PORT="$old_tunnel_port"; CLIENT_PORT="$old_tunnel_port"
     return 1
   fi
+  sync_socket_ports "$ssh_port" "$old_tunnel_port" || true
   save_conf
 
-  if restart_ssh "$old_tunnel_port"; then
+  if restart_ssh "$old_tunnel_port" "$ssh_port"; then
     ok "sshd 已挪到 ${ssh_port}（本机端口，由 sslh 从 443 转发进来）"
   else
     err "sshd 改端口失败，隧道配置已被自动摘掉"
@@ -2475,6 +2751,22 @@ do_show_config() {
   say "  客户端密钥目录: $CLIENT_DIR"
   say "  状态目录      : $STATE_DIR"
   say "  sshd 配置片段 : $DROPIN"
+  # ★ 必须把「实际监听」和「配置里写的」分开显示。
+  #   socket 激活时两者会不一致，而那个不一致就是故障本身 ——
+  #   只显示其中一个，用户会以为一切正常。
+  local _real _cfg
+  _real="$(ssh_real_ports 2>/dev/null | tr '\n' ' ' || true)"
+  _cfg="$(sshd_ports 2>/dev/null | tr '\n' ' ' || true)"
+  if ssh_socket_activated; then
+    say "  模式          : ${C_Y}systemd socket 激活${C_0}（ssh.socket 决定端口）"
+    say "  ssh.socket 配置: $SOCKET_DROPIN"
+    say "  实际在监听    : ${C_G}${_real:-（读不到）}${C_0}"
+    if [ -n "$_cfg" ] && [ "${_real% }" != "${_cfg% }" ]; then
+      say "  sshd_config 里 : ${C_R}${_cfg}${C_0}  ${C_D}← 不生效！${C_0}"
+    fi
+  else
+    say "  实际在监听    : ${C_G}${_real:-（读不到）}${C_0}"
+  fi
   say "  每日口令      : $(otp_enabled && echo 已开启 || echo 未开启)"
   local a; a="$(allowlist_get)"
   say "  来源 IP 白名单: ${a:-未设置}"
@@ -2591,6 +2883,10 @@ do_uninstall() {
   say  "      · 隧道 CA 与所有客户端密钥    ${C_D}${CA_DIR}${C_0}"
   say  "      · 状态目录 / 端口快照 / 口令密钥 ${C_D}${STATE_DIR}${C_0}"
   say  "      · sshd 配置片段               ${C_D}${DROPIN}${C_0}"
+  if ssh_socket_activated; then
+    say  "      · ssh.socket 端口配置          ${C_D}${SOCKET_DROPIN}${C_0}"
+    say  "        ${C_D}（你的 sshd 由 socket 激活，隧道端口写在这里）${C_0}"
+  fi
   say  "      · sshd_config 末尾的 Match 块"
   say  "      · 口令刷新定时器"
   say  "      · 隧道账号 ${C_B}${TUNNEL_USER}${C_0}（连同它的家目录）"
@@ -2611,6 +2907,9 @@ do_uninstall() {
 
   sed -i "/^${MARK_BEGIN}$/,/^${MARK_END}$/d" "$SSHD_CONF" 2>/dev/null
   rm -f "$DROPIN" 2>/dev/null && removed=$((removed + 1))
+  # socket 激活时隧道端口写在 ssh.socket 的 drop-in 里，也要摘掉，
+  # 否则卸载后那个端口还继续监听（没必要留着）。
+  rm -f "$SOCKET_DROPIN" 2>/dev/null && removed=$((removed + 1))
 
   systemctl disable --now igtunnel-otp.timer >/dev/null 2>&1
   rm -f "$SYSTEMD_DIR/igtunnel-otp.service" "$SYSTEMD_DIR/igtunnel-otp.timer"
@@ -2779,14 +3078,15 @@ change_port_interactive() {
     TUNNEL_PORT="$old"; CLIENT_PORT="$old"
     return 1
   fi
+  sync_socket_ports "$np" "$old" || true    # socket 激活时才做事
   save_conf
-  if restart_ssh "$old"; then
+  if restart_ssh "$old" "$np"; then
     ok "隧道端口已改为 ${np}"
     info "重新打包：菜单 2，输入同名客户端即可（复用旧密钥，只更新配置）"
   else
     TUNNEL_PORT="$old"; CLIENT_PORT="$old"; save_conf
     warn "换端口失败，正在尝试恢复原来的隧道配置..."
-    if build_dropin "$old" && restart_ssh; then
+    if build_dropin "$old" && sync_socket_ports "$old" "$np" && restart_ssh "" "$old"; then
       ok "已恢复到换端口之前的状态，家人那边不用重新打包。"
     else
       err "恢复失败，隧道暂时不可用。"
