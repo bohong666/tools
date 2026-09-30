@@ -47,6 +47,8 @@ OTP_FLAG="$STATE_DIR/otp_enabled"
 ALLOWLIST_FILE="$STATE_DIR/allowlist"
 INSTALLED_CTL="/usr/local/sbin/igtunnel-ctl"
 SNAPDIR="$STATE_DIR/snapshots"
+DIST_DIR="${DIST_DIR:-/root/igtunnel-dist}"   # 授权包输出目录（可用环境变量覆盖，便于测试）
+TEMPLATE_DIR="${TEMPLATE_DIR:-/opt/igtunnel/client}"  # 内嵌模板还原位置（同样可覆盖）
 
 MARK_BEGIN="# ==== igtunnel managed BEGIN ===="
 MARK_END="# ==== igtunnel managed END ===="
@@ -168,10 +170,303 @@ save_conf() {
   chmod 600 "$CONF_FILE"
 }
 
+# base64 解码（stdin -> stdout）。GNU 用 -d，BSD/老系统退回 openssl。
+b64_decode() {
+  if printf '' | base64 -d >/dev/null 2>&1; then base64 -d; return $?; fi
+  if have openssl; then openssl base64 -d; return $?; fi
+  return 1
+}
+
+# 内嵌的客户端模板（client/ 目录的 tar.gz + base64）。
+#
+# 为什么要内嵌：这是一个"单文件"服务端脚本。如果只把 tunnelctl.sh 传上 VPS，
+# 脚本就找不到同级的 client/ 目录，打包出来的 zip 里只有密钥、没有 .bat 和
+# tunnel.ps1，家人拿到手根本没法用。内嵌之后，单文件也能自给自足。
+client_payload_b64() {
+  cat <<'__IGTUNNEL_CLIENT_TEMPLATE_B64__'
+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
++f909qmfADoBAA==
+__IGTUNNEL_CLIENT_TEMPLATE_B64__
+}
+
+# 把内嵌模板解到 dest（tar 里顶层是 client/）
+materialize_client_template() {
+  local dest="$1" tmp
+  tmp="$(mktemp -d 2>/dev/null)" || return 1
+  if client_payload_b64 | b64_decode > "$tmp/p.tgz" 2>/dev/null && [ -s "$tmp/p.tgz" ] \
+     && tar -xzf "$tmp/p.tgz" -C "$tmp" 2>/dev/null && [ -d "$tmp/client" ]; then
+    mkdir -p "$dest" 2>/dev/null
+    if cp -a "$tmp/client/." "$dest/" 2>/dev/null; then
+      rm -rf "$tmp"
+      # 注意：本函数的调用方是 tpl="$(client_template_dir)"，stdout 会被捕获。
+      # 所以这条提示必须走 stderr，否则会混进路径变量里把 cp 搞崩。
+      ok "已从脚本内嵌模板还原客户端文件 → $dest" >&2
+      return 0
+    fi
+  fi
+  rm -rf "$tmp"
+  return 1
+}
+
 client_template_dir() {
-  for d in "$SCRIPT_DIR/client" "$SCRIPT_DIR/../client" "/opt/igtunnel/client"; do
+  local d
+  for d in "$SCRIPT_DIR/client" "$SCRIPT_DIR/../client" "$TEMPLATE_DIR"; do
     if [ -d "$d" ]; then printf '%s' "$d"; return 0; fi
   done
+  # 全都找不到 → 从脚本自身内嵌的模板还原一份（保证单文件脚本也能打包）
+  if materialize_client_template "$TEMPLATE_DIR"; then printf '%s' "$TEMPLATE_DIR"; return 0; fi
   return 1
 }
 
@@ -469,7 +764,7 @@ precheck() {
     ok "$SSHD_CONF 里有 Include sshd_config.d/*.conf"
   else
     warn "$SSHD_CONF 里没有 Include 指令"
-    info "隧道配置要写到 $DROPIN，没有 Include 就不会生效。"
+    info "隧道配置要写到 ${DROPIN}，没有 Include 就不会生效。"
     info "脚本只会提醒你手工加一行，不会替你改主配置。"
   fi
 
@@ -479,7 +774,7 @@ precheck() {
     local o443 s443
     o443="$(port_owner 443)"
     s443="$(service_owning_port 443 || true)"
-    warn "443 已被占用：${o443:-未知进程}${s443:+  （服务：$s443）}"
+    warn "443 已被占用：${o443:-未知进程}${s443:+  （服务：${s443}）}"
     info "本脚本【不会】动这个服务，隧道会改走别的端口（菜单 12 里挑）。"
     case "$s443" in
       xray|v2ray|sing-box|trojan|hysteria)
@@ -549,7 +844,7 @@ do_install() {
     warn "预检有告警项。安装【不会】碰你的 Xray / Nginx / V2Ray 配置，"
     warn "也【不会】改动 $SSHD_CONF 里除末尾 Match 块之外的任何内容。"
   fi
-  info "安装只做三件事：建一个受限账号、写 $DROPIN、重启一次 sshd。"
+  info "安装只做三件事：建一个受限账号、写 ${DROPIN}、重启一次 sshd。"
   info "重启前备份 ${SSHD_CONF}；重启后核对端口；异常自动回滚。"
   say ""
   confirm "开始安装？" || { info "已取消，没有改动任何东西"; return 0; }
@@ -578,7 +873,7 @@ do_install() {
     warn "账号已存在，跳过"
   else
     useradd -m -s "$nologin" "$TUNNEL_USER"
-    ok "已创建（shell=$nologin，无法登录）"
+    ok "已创建（shell=${nologin}，无法登录）"
   fi
   rm -f "/home/${TUNNEL_USER}/.ssh/authorized_keys"
 
@@ -756,7 +1051,7 @@ do_sslh_share() {
   local owner svc443now
   owner="$(port_owner 443)"
   svc443now="$(service_owning_port 443 || true)"
-  say "  当前 443 的占用者：${C_Y}${owner:-未知}${C_0}${svc443now:+  （服务：$svc443now）}"
+  say "  当前 443 的占用者：${C_Y}${owner:-未知}${C_0}${svc443now:+  （服务：${svc443now}）}"
   say ""
   say "  原理：sslh 接管 443，按第一个数据包的特征分流"
   info "  TLS 握手（0x16 0x03 ...）  ->  原来的服务（Xray / 网站）"
@@ -1045,6 +1340,28 @@ do_issue() {
   build_package "$name"
 }
 
+# 检查 zip 里的非 ASCII 文件名是否带了 UTF-8 标志（general purpose bit 11）。
+#
+# 不带标志时，Windows 会按本地代码页（简中是 GBK）去解释那串 UTF-8 字节，
+# 于是 "更新授权.bat" 显示成 "µ¢┤µû░µÄêµ¥â.bat" —— 家人完全认不出。
+# 返回 0 = 正常；返回非 0 时 stdout 给一个坏文件名的例子。
+check_zip_utf8() {
+  have python3 || return 0
+  python3 - "$1" <<'IGT_PY_EOF'
+import sys, zipfile
+try:
+    zf = zipfile.ZipFile(sys.argv[1])
+except Exception:
+    sys.exit(0)
+for info in zf.infolist():
+    name = info.orig_filename
+    if any(ord(ch) > 127 for ch in name) and not (info.flag_bits & 0x800):
+        print(name)
+        sys.exit(1)
+sys.exit(0)
+IGT_PY_EOF
+}
+
 build_package() {
   local name="$1"
   local host outroot pkg
@@ -1055,7 +1372,7 @@ build_package() {
     host="$(ask '客户端要连的地址' "$host")"
   fi
 
-  outroot="/root/igtunnel-dist"
+  outroot="$DIST_DIR"
   mkdir -p "$outroot"
   pkg="$outroot/$name"
   rm -rf "$pkg"; mkdir -p "$pkg/key"
@@ -1087,7 +1404,7 @@ MaxSessionMinutes=480
 StartUrl=https://www.instagram.com/
 EOF
 
-  info "客户端连接目标：${host}:${CLIENT_PORT:-$TUNNEL_PORT}（账号 $TUNNEL_USER）"
+  info "客户端连接目标：${host}:${CLIENT_PORT:-$TUNNEL_PORT}（账号 ${TUNNEL_USER}）"
 
   local archive=""
   local zippw
@@ -1095,18 +1412,55 @@ EOF
   info "打包时可以加个密码，防止传输途中被翻看（留空则不加密）"
   zippw="$(ask '压缩包密码（留空 = 不加密）' '')"
 
-  if have zip; then
-    archive="$outroot/$name.zip"
-    rm -f "$archive"
-    if [ -n "$zippw" ]; then
-      ( cd "$outroot" && zip -qr -P "$zippw" "$name.zip" "$name" ) && ok "已生成加密压缩包"
+  # 打包。
+  #
+  # ★ 为什么优先用 python3 而不是 zip：
+  #   包里的文件名是中文（打开Instagram.bat 等）。zip 命令（尤其是 macOS 自带
+  #   的那版 Info-ZIP 3.0）不会给非 ASCII 文件名设置 UTF-8 标志位，
+  #   Windows 解压时就会按本地代码页解释 → 变成 "µ¢┤µû░µÄêµ¥â.bat" 这种乱码，
+  #   家人根本认不出该双击哪个。python3 的 zipfile 会正确设置该标志。
+  #   代价：python3 的 zipfile 不支持写加密包，所以"要密码"时只能用 zip。
+  archive="$outroot/$name.zip"
+  rm -f "$archive"
+  local packer="" badname=""
+
+  # 第 1 步：想要密码 → 只能用 zip（python3 的 zipfile 写不了加密包）
+  if [ -n "$zippw" ]; then
+    if have zip; then
+      ( cd "$outroot" && zip -qr -P "$zippw" "$name.zip" "$name" ) && packer="zip（含密码）"
     else
-      ( cd "$outroot" && zip -qr "$name.zip" "$name" ) && ok "已生成压缩包"
+      warn "你设了密码，但系统没有 zip 命令（python3 无法加密）→ 改为不加密打包"
+      zippw=""
     fi
-  elif have python3; then
-    archive="$outroot/$name.zip"
-    rm -f "$archive"
-    ( cd "$outroot" && python3 -m zipfile -c "$name.zip" "$name" ) && ok "已生成压缩包（python3）"
+  fi
+
+  # 第 2 步：zip 打的包要自检中文文件名；不合格就丢弃，走第 3 步重打
+  if [ -n "$packer" ]; then
+    if ! badname="$(check_zip_utf8 "$archive")"; then
+      warn "压缩包里的中文文件名没带 UTF-8 标志，Windows 上会显示成乱码："
+      warn "  例如：${badname}"
+      warn "家人会认不出该双击哪个文件 → 自动改为【不加密】重打一次"
+      rm -f "$archive"; packer=""; badname=""; zippw=""
+    fi
+  fi
+
+  # 第 3 步：打一个不加密的包（优先 python3，文件名一定正确）
+  if [ -z "$packer" ]; then
+    if have python3; then
+      ( cd "$outroot" && python3 -m zipfile -c "$name.zip" "$name" ) && packer="python3"
+    elif have zip; then
+      ( cd "$outroot" && zip -qr "$name.zip" "$name" ) && packer="zip"
+    fi
+  fi
+
+  if [ -z "$packer" ]; then
+    err "打包失败：系统里既没有 zip 也没有 python3"
+  elif [ "$packer" = "zip" ]; then
+    ok "已生成压缩包（zip）"
+    warn "系统里没有 python3，无法自检中文文件名是否正常。"
+    warn "若家人在 Windows 上看到一堆乱码文件名，装个 python3 重打即可：apt install -y python3"
+  else
+    ok "已生成压缩包（${packer}）"
   fi
 
   say ""
@@ -1123,6 +1477,197 @@ EOF
   [ -n "$zippw" ] && say "    压缩包密码：${C_Y}$zippw${C_0}（请用另一个渠道告诉她）"
   say ""
   say "    ${C_Y}注意：包里有私钥，别用明文邮件或公开链接发。${C_0}"
+  say "    ${C_D}（想让自己点一下就下载，回菜单选 16）${C_0}"
+}
+
+# ============================================================
+#  16) 临时下载链接
+# ============================================================
+# 起一个一次性、带随机令牌、限时的 HTTP 服务，把授权包暴露出去。
+#
+# ⚠ 安全边界（必须如实告诉用户，不能粉饰）：
+#   这是【明文 HTTP】。令牌只防"被扫到/被猜到"，不防"被中途嗅探"。
+#   因为包里含私钥，这套机制只适合"自己下载给自己"的短窗口场景，
+#   不适合发给家人。给家人请用私钥加密后的 zip + 另一个渠道传密码。
+
+# 挑一个空闲的高位端口
+find_free_high_port() {
+  local i p
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    p=$(( 30000 + (RANDOM % 15000) ))
+    port_in_use "$p" || { printf '%s' "$p"; return 0; }
+  done
+  return 1
+}
+
+# 生成一个猜不出来的令牌
+rand_token() {
+  if have openssl; then openssl rand -hex 24 2>/dev/null && return 0; fi
+  if [ -r /dev/urandom ]; then
+    head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n'; return 0
+  fi
+  printf '%s%s%s' "$RANDOM$RANDOM" "$RANDOM$RANDOM" "$(date +%s)"
+}
+
+# 一次性下载服务：只认 /<token>，下载成功一次就退出，到点也退出。
+# 用法：serve_one_shot <文件> <端口> <令牌> <有效秒数> <完成标记文件>
+serve_one_shot() {
+  python3 - "$1" "$2" "$3" "$4" "$5" <<'IGT_PY_EOF'
+import http.server, os, sys, time
+
+FILE, PORT, TOKEN, TTL, FLAG = sys.argv[1], int(sys.argv[2]), sys.argv[3], int(sys.argv[4]), sys.argv[5]
+NAME = os.path.basename(FILE)
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    protocol_version = 'HTTP/1.0'
+
+    def log_message(self, *args):
+        pass
+
+    def _notfound(self):
+        self.send_response(404)
+        self.send_header('Content-Length', '0')
+        self.end_headers()
+
+    def do_HEAD(self):
+        if self.path != '/' + TOKEN:
+            self._notfound()
+            return
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/zip')
+        self.send_header('Content-Length', str(os.path.getsize(FILE)))
+        self.end_headers()
+
+    def do_GET(self):
+        if self.path != '/' + TOKEN:
+            self._notfound()
+            return
+        try:
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/zip')
+            self.send_header('Content-Length', str(os.path.getsize(FILE)))
+            self.send_header('Content-Disposition', 'attachment; filename="%s"' % NAME)
+            self.end_headers()
+            with open(FILE, 'rb') as fh:
+                while True:
+                    chunk = fh.read(65536)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            return
+        except OSError:
+            return
+        try:
+            with open(FLAG, 'w') as fh:
+                fh.write('ok')
+        except OSError:
+            pass
+
+server = http.server.HTTPServer(('0.0.0.0', PORT), Handler)
+server.timeout = 1
+deadline = time.time() + TTL
+try:
+    while time.time() < deadline:
+        server.handle_request()
+        if os.path.exists(FLAG):
+            break
+finally:
+    server.server_close()
+IGT_PY_EOF
+}
+
+do_serve_package() {
+  say ""
+  say "${C_B}临时下载链接${C_0}"
+  hr
+
+  local outroot="$DIST_DIR"
+  local list
+  list="$(ls -1t "$outroot"/*.zip 2>/dev/null | head -20)"
+  if [ -z "$list" ]; then
+    err "在 $outroot 里没找到 .zip 授权包。请先回菜单 2 签发并打包。"
+    pause_key; return 1
+  fi
+
+  say "  可下载的包（按时间从新到旧）："
+  local i=1 f
+  for f in $list; do
+    say "    $i) $(basename "$f")"
+    i=$((i+1))
+  done
+  say ""
+
+  local sel
+  sel="$(ask '选择要下载的（序号，直接回车 = 最新那个）' '1')"
+  case "$sel" in ''|*[!0-9]*) sel=1 ;; esac
+  local target
+  target="$(printf '%s\n' $list | sed -n "${sel}p")"
+  if [ -z "$target" ] || [ ! -f "$target" ]; then
+    err "序号无效"; pause_key; return 1
+  fi
+
+  local ttl
+  ttl="$(ask '链接有效期（分钟）' '15')"
+  case "$ttl" in ''|*[!0-9]*) ttl=15 ;; esac
+  [ "$ttl" -lt 1 ] && ttl=1
+  [ "$ttl" -gt 120 ] && ttl=120
+
+  local port
+  port="$(find_free_high_port)" || { err "找不到空闲端口"; pause_key; return 1; }
+
+  local token; token="$(rand_token)"
+  local flag; flag="$(mktemp)"
+  rm -f "$flag"
+
+  # 临时放行防火墙（结束后会收回）
+  local opened_ufw=0 opened_fw=0
+  if have ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
+    ufw allow "${port}/tcp" >/dev/null 2>&1 && opened_ufw=1
+  fi
+  if have firewall-cmd && firewall-cmd --state >/dev/null 2>&1; then
+    firewall-cmd --add-port="${port}/tcp" >/dev/null 2>&1 && opened_fw=1
+  fi
+
+  cleanup_serve() {
+    [ "$opened_ufw" = 1 ] && ufw delete allow "${port}/tcp" >/dev/null 2>&1
+    [ "$opened_fw" = 1 ] && firewall-cmd --remove-port="${port}/tcp" >/dev/null 2>&1
+    rm -f "$flag" 2>/dev/null
+    return 0
+  }
+  trap 'cleanup_serve; trap - INT TERM; exit 130' INT TERM
+
+  local ip
+  ip="$(public_host)"
+  [ -n "$ip" ] || ip="$(ask '探测公网 IP 失败，请手动输入本机公网地址' '')"
+
+  say ""
+  hr
+  say "  ${C_G}下载链接（${ttl} 分钟内有效，下载一次后自动关闭）${C_0}"
+  say ""
+  say "    ${C_B}http://${ip}:${port}/${token}${C_0}"
+  say ""
+  say "  ${C_Y}⚠ 这是明文 HTTP，而且包里含私钥，务必注意：${C_0}"
+  say "     · 这个链接本身就是密码，${C_Y}不要转发给任何人${C_0}（包括家人）"
+  say "     · 别在公共 Wi-Fi / 公司网络里下载"
+  say "     · 下载完（或超时）服务会自动关闭，端口也会收回"
+  say "     · 如果只是自己拿包，${C_G}scp 更安全${C_0}："
+  say "         scp root@${ip}:${target} ."
+  say ""
+  say "  正在等待下载...（按 Ctrl-C 可提前结束）"
+  say ""
+
+  serve_one_shot "$target" "$port" "$token" "$((ttl * 60))" "$flag"
+
+  say ""
+  if [ -f "$flag" ]; then
+    ok "已完成下载，服务已关闭、端口已收回"
+  else
+    info "未检测到下载（超时或已中断），服务已关闭、端口已收回"
+  fi
+  cleanup_serve
+  trap - INT TERM
+  pause_key
 }
 
 do_renew() {
@@ -1167,7 +1712,7 @@ do_renew() {
 
   if [ -z "$targets" ]; then err "选择无效"; return 1; fi
 
-  local outroot="/root/igtunnel-dist"
+  local outroot="$DIST_DIR"
   mkdir -p "$outroot"
   say ""
   for c in $targets; do
@@ -1918,6 +2463,7 @@ show_header() {
   say "   ${C_B}13${C_0}) 健康检查 / 被封诊断"
   say "   ${C_B}14${C_0}) 只读环境预检"
   say "   ${C_B}15${C_0}) 完全卸载"
+  say "   ${C_B}16${C_0}) 临时下载链接     ${C_D}（把压缩包用一次性链接发给自己）${C_0}"
   say "   ${C_B}0${C_0}) 退出"
   hr
 }
@@ -1943,6 +2489,7 @@ menu() {
       13) do_diagnose; continue ;;
       14) precheck; pause_key ;;
       15) do_uninstall; pause_key ;;
+      16) do_serve_package; continue ;;
       0)  say ""; say "  再见"; say ""; exit 0 ;;
       *)  warn "无效选项" ; sleep 1; continue ;;
     esac
@@ -1988,6 +2535,10 @@ Instagram 隧道 · 服务端控制台
   本脚本从不读写你的 Xray / V2Ray / Nginx 配置。
   它只往 sshd_config.d/10-tunnel.conf 和 sshd_config 末尾的 Match 块写东西，
   每次重启 sshd 前会备份并拍端口快照，重启后逐项核对，异常自动回滚。
+
+单文件说明：
+  client/ 模板已内嵌在本脚本里。只传这一个 tunnelctl.sh 也能正常打包，
+  脚本会把它还原到 /opt/igtunnel/client。
 EOF
     exit 0
     ;;
