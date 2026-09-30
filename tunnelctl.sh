@@ -157,6 +157,7 @@ load_conf() {
   TUNNEL_USER="${TUNNEL_USER:-tun}"
   TUNNEL_PORT="${TUNNEL_PORT:-443}"
   CLIENT_PORT="${CLIENT_PORT:-$TUNNEL_PORT}"
+  DOWNLOAD_PORT="${DOWNLOAD_PORT:-}"
 }
 
 save_conf() {
@@ -166,6 +167,7 @@ save_conf() {
     echo "TUNNEL_USER=\"$TUNNEL_USER\""
     echo "TUNNEL_PORT=\"$TUNNEL_PORT\""
     echo "CLIENT_PORT=\"${CLIENT_PORT:-$TUNNEL_PORT}\""
+    echo "DOWNLOAD_PORT=\"${DOWNLOAD_PORT:-}\""
   } > "$CONF_FILE"
   chmod 600 "$CONF_FILE"
 }
@@ -572,6 +574,118 @@ find_free_port() {
   return 1
 }
 
+# ============================================================
+#  防火墙：放行 / 收回端口
+# ============================================================
+# ★ 必须同时处理 ufw / firewalld / iptables 三套。
+#
+# 为什么 iptables 不能漏：Oracle Cloud、以及不少云厂商的镜像
+# （Oracle Linux、OCI 上的 Ubuntu）默认用 iptables，并且 INPUT 链里
+# 有一条 "除 22 外全 REJECT" 的规则。只调 ufw / firewalld 的话，
+# 在这些机器上端口根本没放开 —— 你会以为脚本没生效。
+
+# 放行一个 TCP 端口。stdout 输出"放行了哪些"，返回 0 表示至少放行了一处。
+fw_open_port() {
+  local port="$1" did=0
+
+  if have ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
+    ufw allow "${port}/tcp" >/dev/null 2>&1 && { printf 'ufw '; did=1; }
+  fi
+
+  if have firewall-cmd && firewall-cmd --state >/dev/null 2>&1; then
+    # 不加 --permanent：只改运行时，reload/重启后自动消失，正好用于临时端口
+    firewall-cmd --add-port="${port}/tcp" >/dev/null 2>&1 && { printf 'firewalld '; did=1; }
+  fi
+
+  if have iptables; then
+    if iptables -C INPUT -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1; then
+      printf 'iptables(已存在) '; did=1
+    elif iptables -I INPUT 1 -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1; then
+      printf 'iptables '; did=1
+    fi
+  fi
+
+  if have ip6tables; then
+    ip6tables -C INPUT -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1 \
+      || ip6tables -I INPUT 1 -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1 || true
+  fi
+
+  [ "$did" = 1 ]
+}
+
+# 收回之前放行的端口（三套都清一遍，清干净为止）
+fw_close_port() {
+  local port="$1"
+  if have ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
+    ufw delete allow "${port}/tcp" >/dev/null 2>&1 || true
+  fi
+  if have firewall-cmd && firewall-cmd --state >/dev/null 2>&1; then
+    firewall-cmd --remove-port="${port}/tcp" >/dev/null 2>&1 || true
+  fi
+  if have iptables; then
+    local n=0
+    while [ "$n" -lt 10 ] && iptables -C INPUT -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1; do
+      iptables -D INPUT -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1 || break
+      n=$((n + 1))
+    done
+  fi
+  if have ip6tables; then
+    local m=0
+    while [ "$m" -lt 10 ] && ip6tables -C INPUT -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1; do
+      ip6tables -D INPUT -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1 || break
+      m=$((m + 1))
+    done
+  fi
+  return 0
+}
+
+# 让 iptables 的运行时规则落盘，重启后仍生效（隧道端口需要，临时端口不需要）
+fw_persist() {
+  if have netfilter-persistent; then
+    netfilter-persistent save >/dev/null 2>&1 && { printf 'netfilter-persistent'; return 0; }
+  fi
+  if have service && service iptables save >/dev/null 2>&1; then
+    printf 'service iptables save'; return 0
+  fi
+  if have iptables-save && [ -f /etc/sysconfig/iptables ]; then
+    iptables-save > /etc/sysconfig/iptables 2>/dev/null && { printf '/etc/sysconfig/iptables'; return 0; }
+  fi
+  if have iptables-save && [ -d /etc/iptables ]; then
+    iptables-save > /etc/iptables/rules.v4 2>/dev/null && { printf '/etc/iptables/rules.v4'; return 0; }
+  fi
+  return 1
+}
+
+# 是不是 Oracle Cloud（OCI）。OCI 的"安全列表/NSG"在云侧，
+# 机器内部改不了，只能去控制台加规则。
+is_oracle_cloud() {
+  local tag=""
+  if [ -r /sys/class/dmi/id/chassis_asset_tag ]; then
+    tag="$(cat /sys/class/dmi/id/chassis_asset_tag 2>/dev/null)"
+    [ "$tag" = "OracleCloud" ] && return 0
+  fi
+  if have curl; then
+    curl -fsS --max-time 3 -H 'Authorization: Bearer Oracle' \
+      http://169.254.169.254/opc/v2/instance/ >/dev/null 2>&1 && return 0
+  fi
+  return 1
+}
+
+# 打印"云侧安全组还得手动开"的提示（只在真的检测到时才提）
+fw_cloud_hint() {
+  local port="$1"
+  is_oracle_cloud || return 0
+  say ""
+  warn "${C_Y}检测到这是 Oracle Cloud${C_0} —— 还有一层防火墙我改不了："
+  say "     OCI 控制台的 ${C_B}安全列表 / NSG${C_0} 是云侧的，机器内部无法修改。"
+  say "     如果下面这个端口连不上，去控制台加一条入站规则："
+  say ""
+  say "       实例 → 主 VNIC → 子网 → 安全列表 → 添加入站规则"
+  say "       源 CIDR: ${C_B}0.0.0.0/0${C_0}   协议: ${C_B}TCP${C_0}   目标端口: ${C_B}${port}${C_0}"
+  say ""
+  say "     ${C_D}（或者回菜单 16 选第 2 种方式：SSH 命令。走已经放行的端口，一个新端口都不用开）${C_0}"
+}
+
 # ---------- sshd 改动安全网 ----------
 # 动 sshd 之前拍快照，动完之后逐项核对；任何一项不对就回滚。
 
@@ -915,13 +1029,26 @@ do_install() {
   restart_ssh "$prev_port" || return 1
 
   say "  [5/6] 放行防火墙"
-  if have ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
-    ufw allow "${TUNNEL_PORT}/tcp" >/dev/null 2>&1 && ok "ufw 已放行 ${TUNNEL_PORT}/tcp"
+  local fwdid
+  if fwdid="$(fw_open_port "$TUNNEL_PORT")"; then
+    ok "已放行 ${TUNNEL_PORT}/tcp（${fwdid}）"
+    # firewalld 是运行时的，要永久生效得单独加；iptables 要落盘
+    if have firewall-cmd && firewall-cmd --state >/dev/null 2>&1; then
+      firewall-cmd --permanent --add-port="${TUNNEL_PORT}/tcp" >/dev/null 2>&1 \
+        && firewall-cmd --reload >/dev/null 2>&1 && ok "firewalld 已设为永久放行"
+    fi
+    if have iptables; then
+      local pdid
+      if pdid="$(fw_persist)"; then
+        ok "iptables 规则已落盘（${pdid}），重启后仍生效"
+      else
+        warn "iptables 规则只是运行时的，重启后会丢。建议装 netfilter-persistent 后执行 save"
+      fi
+    fi
+  else
+    warn "没检测到活动的本机防火墙（ufw/firewalld/iptables 都没有）—— 如果连不上，多半是云侧安全组没放行"
   fi
-  if have firewall-cmd && firewall-cmd --state >/dev/null 2>&1; then
-    firewall-cmd --permanent --add-port="${TUNNEL_PORT}/tcp" >/dev/null && firewall-cmd --reload >/dev/null
-    ok "firewalld 已放行 ${TUNNEL_PORT}/tcp"
-  fi
+  fw_cloud_hint "$TUNNEL_PORT"
 
   say "  [6/6] 安装每日口令的定时刷新服务"
   install_otp_timer
@@ -1477,18 +1604,22 @@ EOF
   [ -n "$zippw" ] && say "    压缩包密码：${C_Y}$zippw${C_0}（请用另一个渠道告诉她）"
   say ""
   say "    ${C_Y}注意：包里有私钥，别用明文邮件或公开链接发。${C_0}"
-  say "    ${C_D}（想让自己点一下就下载，回菜单选 16）${C_0}"
+  say "    ${C_D}（想把包拿到自己电脑上：菜单 16 —— 可选 HTTP 链接或一条 SSH 命令）${C_0}"
 }
 
 # ============================================================
-#  16) 临时下载链接
+#  16) 把授权包传给自己
 # ============================================================
-# 起一个一次性、带随机令牌、限时的 HTTP 服务，把授权包暴露出去。
+# 两种方式：
+#   1) 一次性 HTTP 链接 —— 随机令牌 + 限时 + 下载一次即关。
+#      需要额外放行一个端口；云服务器（如 Oracle Cloud）还得去控制台
+#      的安全列表加规则，机器内部改不了。
+#   2) 一条 SSH 命令 —— 走已经放行的 SSH 端口，一个新端口都不用开。
+#      端口不能随便开的机器（Oracle Cloud 免费机是典型）推荐这个。
 #
-# ⚠ 安全边界（必须如实告诉用户，不能粉饰）：
-#   这是【明文 HTTP】。令牌只防"被扫到/被猜到"，不防"被中途嗅探"。
-#   因为包里含私钥，这套机制只适合"自己下载给自己"的短窗口场景，
-#   不适合发给家人。给家人请用私钥加密后的 zip + 另一个渠道传密码。
+# ⚠ 方式 1 是【明文 HTTP】。令牌只防"被扫到/被猜到"，不防"被中途嗅探"。
+#   因为包里含私钥，只适合"自己下载给自己"的短窗口场景，不适合发给家人。
+#   给家人请用私钥加密后的 zip + 另一个渠道传密码。
 
 # 挑一个空闲的高位端口
 find_free_high_port() {
@@ -1577,9 +1708,43 @@ finally:
 IGT_PY_EOF
 }
 
+# 打印"在你自己的电脑上执行"的取包命令。
+# 这是 Oracle Cloud 这类"端口不能随便开"的机器上最省事的办法：
+# 完全走已经放行的 SSH 端口，一个新端口都不用开。
+#
+# ★ 为什么主推 scp，而不是更短的 ssh + 重定向：
+#   `ssh host "cat 文件" > 本地文件` 看着更短，但**在 Windows 自带的
+#   PowerShell 5.1 里会把文件写坏**。PS 5.1 的 `>` 等价于
+#   `Out-File -Encoding Unicode`，它把 8 位字节流当成「文本」重新编码：
+#     · 写成 UTF-16LE，文件头多出 ff fe，长度大约翻倍
+#     · 顺手做换行归一化，把 CR(0x0d) 删掉
+#   实测：256 字节的二进制 → 516 字节，内容面目全非，zip 根本打不开。
+#   （PowerShell 7+ 的 `>` 是字节透传的，实测 256 → 256 字节完全一致。）
+#   所以：要么用 scp（不经 shell 重定向，二进制安全，cmd / PowerShell 都能跑），
+#   要么在 cmd.exe 里跑 ssh + 重定向（cmd 的 `>` 是真正的字节重定向）。
+show_ssh_pull_cmd() {
+  local ip="$1" sshport="$2" file="$3"
+  local base; base="$(basename "$file")"
+  say ""
+  hr
+  say "  ${C_G}在你自己的电脑上执行这一行就行${C_0}"
+  say "  ${C_D}（走 SSH，一个新端口都不用开；Windows 10/11 自带的 cmd 或 PowerShell 都能跑）${C_0}"
+  say ""
+  say "    ${C_B}scp -P ${sshport} root@${ip}:${file} .${C_0}"
+  say ""
+  say "  ${C_D}想只把内容打出来也可以，但${C_Y}这一条必须在 cmd.exe 里跑${C_D}：${C_0}"
+  say "    ${C_B}ssh -p ${sshport} root@${ip} \"cat ${file}\" > ${base}${C_0}"
+  say ""
+  say "  ${C_Y}⚠ 两个容易踩的坑：${C_0}"
+  say "     · 端口参数大小写不同 —— ssh 是小写 ${C_B}-p${C_0}，scp 是大写 ${C_B}-P${C_0}"
+  say "     · ${C_Y}别在 Windows 自带的 PowerShell 5.1 里用 > 重定向${C_0}"
+  say "       ${C_D}它会把字节流当文本重编码成 UTF-16（长度翻倍、CR 被删），zip 直接打不开。${C_0}"
+  say "       ${C_D}要么用上面的 scp，要么在 cmd.exe 里跑，要么装 PowerShell 7+。${C_0}"
+}
+
 do_serve_package() {
   say ""
-  say "${C_B}临时下载链接${C_0}"
+  say "${C_B}把授权包传给自己${C_0}"
   hr
 
   local outroot="$DIST_DIR"
@@ -1590,7 +1755,7 @@ do_serve_package() {
     pause_key; return 1
   fi
 
-  say "  可下载的包（按时间从新到旧）："
+  say "  可传的包（按时间从新到旧）："
   local i=1 f
   for f in $list; do
     say "    $i) $(basename "$f")"
@@ -1599,12 +1764,32 @@ do_serve_package() {
   say ""
 
   local sel
-  sel="$(ask '选择要下载的（序号，直接回车 = 最新那个）' '1')"
+  sel="$(ask '选择要传的（序号，直接回车 = 最新那个）' '1')"
   case "$sel" in ''|*[!0-9]*) sel=1 ;; esac
   local target
   target="$(printf '%s\n' $list | sed -n "${sel}p")"
   if [ -z "$target" ] || [ ! -f "$target" ]; then
     err "序号无效"; pause_key; return 1
+  fi
+
+  local ip
+  ip="$(public_host)"
+  [ -n "$ip" ] || ip="$(ask '探测公网 IP 失败，请手动输入本机公网地址' '')"
+  local sshport="${TUNNEL_PORT:-22}"
+
+  say ""
+  say "  ${C_B}怎么传？${C_0}"
+  say "    ${C_B}1${C_0}) 临时 HTTP 链接      ${C_D}（要额外放行一个端口；云服务器还得去控制台加规则）${C_0}"
+  say "    ${C_B}2${C_0}) 只给我一条 SSH 命令  ${C_G}（走已开放的端口，一个新端口都不用开）${C_0}"
+  say ""
+  local how
+  how="$(ask '选择 [1/2]' '1')"
+  case "$how" in 2) how=2 ;; *) how=1 ;; esac
+
+  if [ "$how" = 2 ]; then
+    show_ssh_pull_cmd "$ip" "$sshport" "$target"
+    pause_key
+    return 0
   fi
 
   local ttl
@@ -1613,33 +1798,41 @@ do_serve_package() {
   [ "$ttl" -lt 1 ] && ttl=1
   [ "$ttl" -gt 120 ] && ttl=120
 
+  # 端口：记住上次用的，方便你在云控制台预先放行一个固定端口
+  local defport="${DOWNLOAD_PORT:-}"
+  [ -n "$defport" ] || defport="$(find_free_high_port || printf '38135')"
   local port
-  port="$(find_free_high_port)" || { err "找不到空闲端口"; pause_key; return 1; }
+  port="$(ask '用哪个端口提供下载（回车用默认）' "$defport")"
+  case "$port" in ''|*[!0-9]*) port="$defport" ;; esac
+  if port_in_use "$port"; then
+    warn "端口 ${port} 已被占用，换一个空闲的"
+    port="$(find_free_high_port)" || { err "找不到空闲端口"; pause_key; return 1; }
+    info "改用 ${port}"
+  fi
+  if [ "${DOWNLOAD_PORT:-}" != "$port" ]; then
+    DOWNLOAD_PORT="$port"
+    save_conf
+    info "已记住端口 ${port}，下次默认用它"
+  fi
 
   local token; token="$(rand_token)"
   local flag; flag="$(mktemp)"
   rm -f "$flag"
 
-  # 临时放行防火墙（结束后会收回）
-  local opened_ufw=0 opened_fw=0
-  if have ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
-    ufw allow "${port}/tcp" >/dev/null 2>&1 && opened_ufw=1
-  fi
-  if have firewall-cmd && firewall-cmd --state >/dev/null 2>&1; then
-    firewall-cmd --add-port="${port}/tcp" >/dev/null 2>&1 && opened_fw=1
+  # 临时放行本机防火墙（ufw / firewalld / iptables 三套都处理），结束后收回
+  local fwdid
+  if fwdid="$(fw_open_port "$port")"; then
+    ok "本机防火墙已放行 ${port}/tcp（${fwdid}）"
+  else
+    warn "没检测到活动的本机防火墙（ufw / firewalld / iptables）"
   fi
 
   cleanup_serve() {
-    [ "$opened_ufw" = 1 ] && ufw delete allow "${port}/tcp" >/dev/null 2>&1
-    [ "$opened_fw" = 1 ] && firewall-cmd --remove-port="${port}/tcp" >/dev/null 2>&1
+    fw_close_port "$port"
     rm -f "$flag" 2>/dev/null
     return 0
   }
   trap 'cleanup_serve; trap - INT TERM; exit 130' INT TERM
-
-  local ip
-  ip="$(public_host)"
-  [ -n "$ip" ] || ip="$(ask '探测公网 IP 失败，请手动输入本机公网地址' '')"
 
   say ""
   hr
@@ -1647,12 +1840,15 @@ do_serve_package() {
   say ""
   say "    ${C_B}http://${ip}:${port}/${token}${C_0}"
   say ""
-  say "  ${C_Y}⚠ 这是明文 HTTP，而且包里含私钥，务必注意：${C_0}"
+  say "  ${C_Y}⚠ 这是明文 HTTP，而且包里含私钥：${C_0}"
   say "     · 这个链接本身就是密码，${C_Y}不要转发给任何人${C_0}（包括家人）"
   say "     · 别在公共 Wi-Fi / 公司网络里下载"
-  say "     · 下载完（或超时）服务会自动关闭，端口也会收回"
-  say "     · 如果只是自己拿包，${C_G}scp 更安全${C_0}："
-  say "         scp root@${ip}:${target} ."
+  say "     · 下载完（或超时）服务自动关闭，本机防火墙规则也会收回"
+
+  fw_cloud_hint "$port"
+
+  say ""
+  say "  ${C_D}一直连不上就别耗着了 —— 回上一级选 2，用 SSH 命令取，不用开端口。${C_0}"
   say ""
   say "  正在等待下载...（按 Ctrl-C 可提前结束）"
   say ""
@@ -1661,9 +1857,9 @@ do_serve_package() {
 
   say ""
   if [ -f "$flag" ]; then
-    ok "已完成下载，服务已关闭、端口已收回"
+    ok "已完成下载，服务已关闭、本机防火墙规则已收回"
   else
-    info "未检测到下载（超时或已中断），服务已关闭、端口已收回"
+    info "未检测到下载（超时或已中断），服务已关闭、本机防火墙规则已收回"
   fi
   cleanup_serve
   trap - INT TERM
@@ -1862,7 +2058,7 @@ do_monitor() {
 
   # 失败尝试
   local fails
-  fails="$(ssh_unit_logs --since "24 hours ago" | grep -c "Failed\|Invalid user" || true)"
+  fails="$(ssh_unit_logs --since "24 hours ago" | grep -cE 'Failed|Invalid user' || true)"
   say ""
   say "  近 24 小时认证失败次数：${fails:-0}"
 
@@ -2377,7 +2573,7 @@ do_diagnose() {
   say "  ${C_B}[3] 日志判读${C_0}"
   local recent_ok recent_fail
   recent_ok="$(ssh_unit_logs --since '24 hours ago' 2>/dev/null | grep -c "Accepted .* for ${TUNNEL_USER} " || true)"
-  recent_fail="$(ssh_unit_logs --since '24 hours ago' 2>/dev/null | grep -c "Failed\|Invalid user" || true)"
+  recent_fail="$(ssh_unit_logs --since '24 hours ago' 2>/dev/null | grep -cE 'Failed|Invalid user' || true)"
   say "      近 24 小时：成功连接 ${recent_ok:-0} 次，认证失败 ${recent_fail:-0} 次"
 
   local last
@@ -2463,7 +2659,7 @@ show_header() {
   say "   ${C_B}13${C_0}) 健康检查 / 被封诊断"
   say "   ${C_B}14${C_0}) 只读环境预检"
   say "   ${C_B}15${C_0}) 完全卸载"
-  say "   ${C_B}16${C_0}) 临时下载链接     ${C_D}（把压缩包用一次性链接发给自己）${C_0}"
+  say "   ${C_B}16${C_0}) 把授权包传给自己 ${C_D}（HTTP 链接 / SSH 命令）${C_0}"
   say "   ${C_B}0${C_0}) 退出"
   hr
 }
