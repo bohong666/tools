@@ -66,7 +66,7 @@ DIST_DIR="${DIST_DIR:-/root/igtunnel-dist}"   # 授权包输出目录（可用�
 # 为什么值得占一行：你经常要把新脚本传到一台【已经有旧脚本】的机器上覆盖，
 # 而覆盖成功与否、跑的是哪一版，以前完全没有办法确认 —— 只能靠"我记得传过了"。
 # 现在：菜单最下面一行会显示它，`--version` 也能直接问。
-SCRIPT_VER="2026.09.30-4"
+SCRIPT_VER="2026.10.01-1"
 
 # 本脚本自己的目录（客户端模板还原在这里）。卸载时整体删除。
 # 单独定义成一个变量、而不是从 TEMPLATE_DIR 反推父目录，是为了让测试能安全覆盖：
@@ -134,11 +134,54 @@ confirm_typed() {
 pause_key() { read -r -p "  按回车返回菜单..." _ </dev/tty; }
 
 ssh_service() {
-  if systemctl list-unit-files 2>/dev/null | grep -q '^ssh\.service'; then
+  # ★ 为什么不用 `systemctl list-unit-files | grep -q`：
+  #   本脚本第 37 行是 `set -uo pipefail`。grep -q 一命中就退出，此时 systemctl
+  #   还在往管道里写 → 收到 SIGPIPE → 退出码 141 → pipefail 让整条管道返回 141
+  #   → if 判为「失败」。实测在 Oracle 的 Ubuntu 上就是这里返回了 sshd（真实是 ssh），
+  #   进而让 ssh_socket_activated 的守卫短路，整条 socket 激活处理链路被关掉，
+  #   隧道端口写进了不生效的文件 —— 客户端拿到 Connection refused。
+  #
+  # 改用【退出码探测】，全程不解析任何文本：
+  #   · 单元不存在 → 1；被 mask → 0（退化配置，后续判据会失败，不会误判）
+  #   · Debian 上 ssh.service 带 Alias=sshd.service，反过来问 sshd 也返回 0
+  #     → 所以【必须先问 ssh】。这个顺序是有意的，别调换。
+  if systemctl cat ssh.service >/dev/null 2>&1; then
     printf 'ssh'
   else
     printf 'sshd'
   fi
+}
+
+# 内核证据：是否存在某个 TCP LISTEN 端口【同时】被 sshd 和 systemd(pid=1) 持有。
+#
+# 返回 0 = 有证据；1 = 无证据；2 = 无法判断（ss 读不到 / 看不到进程名）
+#
+# ★ 这是【完全不依赖 systemd 任何文本输出】的兜底判据。socket 激活时监听 fd
+#   归 systemd(pid=1) 所有，sshd 被拉起后继承同一个 fd，于是 `ss -p` 的同一行
+#   会同时列出 sshd 和 systemd(pid=1) —— 这是内核事实，改不了也骗不了。
+#
+# ★ 全程不许有"提前退出"的消费者：grep -q / head / awk 中途 exit 都会让上游
+#   吃 SIGPIPE，在 pipefail 下污染退出码（本脚本刚因为这个栽过一次）。
+#   所以 awk 只在 END 里给退出码。
+#
+# ★ 端口号做全等比较（取最后一个 : 之后的整段），22 不会匹配到 2222；
+#   也【不允许跨端口拼凑】—— 22 上只有 systemd、2222 上只有 sshd 不算证据。
+ssh_socket_kernel_evidence() {
+  local out
+  out="$(ss -tlnpH 2>/dev/null)" || return 2
+  [ -n "$out" ] || return 2
+  case "$out" in
+    *'users:('*) : ;;
+    *) return 2 ;;   # 非 root 看不到进程名 —— 证据不足，不许武断下结论
+  esac
+  printf '%s\n' "$out" | awk '
+    {
+      n = split($4, a, /:/); port = a[n]
+      if (port !~ /^[0-9]+$/) next
+      if ($0 ~ /users:\(\(.*"systemd",pid=1[,)]/)   sysd[port]  = 1
+      if ($0 ~ /users:\(\(.*"sshd",pid=[0-9]+[,)]/) sshdp[port] = 1
+    }
+    END { for (p in sysd) if (p in sshdp) exit 0; exit 1 }'
 }
 
 # ============================================================
@@ -160,10 +203,16 @@ ssh_service() {
 # 教训：`sshd -T` 说的是"sshd 以为的"，`ss` 说的才是"内核在做的"。
 #       两者不一致时，看谁持有 fd。
 ssh_socket_activated() {
-  # 只有 Debian/Ubuntu 的 ssh 用这套；RHEL 系的 sshd 没有 socket 激活
-  [ "$(ssh_service)" = "ssh" ] || return 1
+  # ★ 这里【故意】没有 `[ "$(ssh_service)" = "ssh" ] || return 1` 那个守卫。
+  #   它依赖 ssh_service 的返回值，而 ssh_service 一旦判错（曾经因为 SIGPIPE
+  #   返回过 sshd），守卫就把整条 socket 激活链路静默关掉 —— 实测故障就是
+  #   这两层叠加的结果。守卫本身也是多余的：RHEL 系根本不装 ssh.socket 单元，
+  #   下面两条 is-active / is-enabled 天然返回非 0。
   systemctl is-active  --quiet ssh.socket 2>/dev/null && return 0
   systemctl is-enabled --quiet ssh.socket 2>/dev/null && return 0
+  # 兜底：内核证据。就算 systemd 那边完全问不出来，只要内核里能看到
+  # 「sshd 和 systemd(pid=1) 同时持有一个端口」，那就是 socket 激活。
+  ssh_socket_kernel_evidence && return 0
   return 1
 }
 
@@ -736,7 +785,14 @@ have() { command -v "$1" >/dev/null 2>&1; }
 port_in_use() {
   local p="$1"
   if have ss; then
-    ss -tlnH 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${p}\$"
+    # ★ 不用 `| grep -q`：消费者提前退出 → 上游 awk/ss 吃 SIGPIPE →
+    #   pipefail 让管道返回 141 → 这里 `return $?` 会把「占用」误判成「空闲」，
+    #   脚本就会去绑一个已被占用的端口，白白触发一次回滚。
+    #   awk 也【不能】在匹配时提前 exit，必须读完所有输入、只在 END 里给退出码。
+    # ★ 端口做全等比较（取最后一个 : 之后的整段），22 不会匹配到 2222。
+    ss -tlnH 2>/dev/null | awk -v p="$p" '
+      { n = split($4, a, /:/); if (a[n] == p) f = 1 }
+      END { exit(f ? 0 : 1) }'
     return $?
   fi
   if have lsof; then
@@ -835,11 +891,35 @@ find_free_port() {
 # 有一条 "除 22 外全 REJECT" 的规则。只调 ufw / firewalld 的话，
 # 在这些机器上端口根本没放开 —— 你会以为脚本没生效。
 
+# ufw 当前是否处于活动状态。
+#
+# ★ 为什么不能写 `ufw status | grep -q "Status: active"`：
+#   1) ufw 是 Python + gettext 写的，输出跟着 locale 走。中文系统上它打印的
+#      是「状态：活动」，英文串必然匹配不上 —— 整个 ufw 分支被静默跳过，
+#      用户会以为「脚本没生效」，实际是这一行判断没进来。
+#      所以必须 LC_ALL=C 强制英文输出。
+#   2) 仍然是「消费者提前退出」那类问题：grep -q 一命中就退出，上游 ufw
+#      吃 SIGPIPE，在 pipefail 下污染退出码。这里改用 case 做前缀匹配，
+#      全程不引入管道。
+#
+# 返回 0 = 活动；1 = 未活动 / 没装 / 读不到。
+# 读不到时按「未活动」处理：宁可漏调一次 ufw（后面还有 firewalld / iptables
+# 兜底），也不要误判成活动去执行一条注定失败的 ufw 命令。
+ufw_active() {
+  have ufw || return 1
+  local out
+  out="$(LC_ALL=C ufw status 2>/dev/null)" || return 1
+  case "$out" in
+    "Status: active"*) return 0 ;;
+  esac
+  return 1
+}
+
 # 放行一个 TCP 端口。stdout 输出"放行了哪些"，返回 0 表示至少放行了一处。
 fw_open_port() {
   local port="$1" did=0
 
-  if have ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
+  if ufw_active; then
     ufw allow "${port}/tcp" >/dev/null 2>&1 && { printf 'ufw '; did=1; }
   fi
 
@@ -867,7 +947,7 @@ fw_open_port() {
 # 收回之前放行的端口（三套都清一遍，清干净为止）
 fw_close_port() {
   local port="$1"
-  if have ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
+  if ufw_active; then
     ufw delete allow "${port}/tcp" >/dev/null 2>&1 || true
   fi
   if have firewall-cmd && firewall-cmd --state >/dev/null 2>&1; then
@@ -1595,7 +1675,11 @@ DAEMON_OPTS="--user sslh --listen 0.0.0.0:443 --ssh 127.0.0.1:${ssh_port} --tls 
 EOF
   ok "已写入 $def"
 
-  if systemctl list-unit-files 2>/dev/null | grep -q '^sslh\.socket'; then
+  # ★ 用退出码探测，不用 `systemctl list-unit-files | grep -q`（SIGPIPE 陷阱，
+  #   见 ssh_service 上面的说明）。这里判错的后果比 SSH 那处更重：会漏掉停用
+  #   sslh.socket，导致 sslh 与 socket 争抢 443 起不来，而脚本已经把用户
+  #   原有的 443 服务停掉了 —— 等于把代理打挂。
+  if systemctl cat sslh.socket >/dev/null 2>&1; then
     systemctl disable --now sslh.socket >/dev/null 2>&1
     info "已停用 sslh.socket（改用 sslh.service 直接监听 443）"
   fi
@@ -3359,7 +3443,10 @@ Instagram 隧道 · 服务端控制台
 
 安全说明：
   本脚本从不读写你的 Xray / V2Ray / Nginx 配置。
-  它只往 sshd_config.d/10-tunnel.conf 和 sshd_config 末尾的 Match 块写东西，
+  它只往三处写 sshd 相关文件：sshd_config.d/10-tunnel.conf、
+  sshd_config 末尾的 Match 块、以及 socket 激活模式下的 ssh.socket.d/10-tunnel.conf
+  （Ubuntu 22.10+ 默认是 socket 激活，那种模式下 sshd_config 的 Port 指令不生效，
+   端口必须写在 ssh.socket 里）。
   每次重启 sshd 前会备份并拍端口快照，重启后逐项核对，异常自动回滚。
 
 单文件说明：
