@@ -35,7 +35,12 @@
 
 set -euo pipefail
 
-VERSION="1.0.0"
+VERSION="1.0.1"
+# v1.0.1 修正: ① 临时文件必须带 .json 后缀 (xray 按扩展名判断格式,
+#   无后缀的 mktemp 文件会导致 xray -test 报 Failed to get format);
+#   ② domainStrategy 改写到 streamSettings.sockopt (freedom settings
+#   里的写法在新版 xray 已废弃); ③ 校验失败时保留失败配置并打印
+#   xray 的原始报错, 不再静默丢弃。
 
 STATE_DIR="${XRAY_EGRESS_STATE_DIR:-/root/.xray-egress}"
 BACKUP_FILE="$STATE_DIR/config.json.orig"
@@ -153,7 +158,9 @@ has_v6 = "direct-v6" in obs
 rule_v4 = any(r.get("outboundTag") == "direct-v4" for r in rules)
 rule_v6 = any(r.get("outboundTag") == "direct-v6" for r in rules)
 direct = obs.get("direct", {})
-ds = (direct.get("settings") or {}).get("domainStrategy", "")
+ss = direct.get("streamSettings") or {}
+so = ss.get("sockopt") or {}
+ds = so.get("domainStrategy", "") or (direct.get("settings") or {}).get("domainStrategy", "")
 st = direct.get("sendThrough", "")
 if has_v4 and has_v6 and rule_v4 and rule_v6:
     mode = "mode1"
@@ -302,13 +309,13 @@ if mode == "mode1":
     # guard 规则与 bittorrent 拦截在前面, 保持优先。
     cfg.setdefault("outbounds", []).append({
         "protocol": "freedom",
-        "settings": {"domainStrategy": "UseIPv4"},
+        "streamSettings": {"sockopt": {"domainStrategy": "UseIPv4"}},
         "sendThrough": ipv4,
         "tag": "direct-v4",
     })
     cfg.setdefault("outbounds", []).append({
         "protocol": "freedom",
-        "settings": {"domainStrategy": "UseIPv6"},
+        "streamSettings": {"sockopt": {"domainStrategy": "UseIPv6"}},
         "sendThrough": ipv6,
         "tag": "direct-v6",
     })
@@ -332,10 +339,18 @@ elif mode in ("mode2", "mode3"):
         sys.stderr.write("错误: 配置里找不到 tag 为 direct 的 freedom 出站\n")
         sys.exit(2)
     settings = direct.get("settings")
-    if not isinstance(settings, dict):
-        settings = {}
-        direct["settings"] = settings
-    settings["domainStrategy"] = strategy
+    if isinstance(settings, dict):
+        # 清掉旧版写法的 domainStrategy, 避免新版 xray 报废弃警告
+        settings.pop("domainStrategy", None)
+    ss = direct.get("streamSettings")
+    if not isinstance(ss, dict):
+        ss = {}
+        direct["streamSettings"] = ss
+    so = ss.get("sockopt")
+    if not isinstance(so, dict):
+        so = {}
+        ss["sockopt"] = so
+    so["domainStrategy"] = strategy
     direct["sendThrough"] = addr
     dns = cfg.get("dns")
     if isinstance(dns, dict):
@@ -375,18 +390,23 @@ apply_mode() {
     echo "正在切换到: $(mode_name "$mode")"
     backup_pristine
 
-    tmp="$(mktemp)"
+    tmp="$(mktemp -d)/config.json"
     cp "$BACKUP_FILE" "$tmp"
     if ! transform_config "$tmp" "$mode" "$ipv4" "$ipv6"; then
-        rm -f "$tmp"
+        rm -rf "$(dirname "$tmp")"
         die "配置生成失败, 未做任何修改"
     fi
-    if ! "$XRAY_BIN" -test -config "$tmp" >/dev/null 2>&1; then
-        rm -f "$tmp"
-        die "新配置校验失败 (xray -test 未通过), 未做任何修改"
+    local test_output=""
+    if ! test_output="$("$XRAY_BIN" -test -config "$tmp" 2>&1)"; then
+        mkdir -p "$STATE_DIR"
+        cp "$tmp" "$STATE_DIR/config.failed.json"
+        rm -rf "$(dirname "$tmp")"
+        echo "错误: 新配置校验失败, xray 报错如下:" >&2
+        printf '%s\n' "$test_output" >&2
+        die "失败的配置已保存到 $STATE_DIR/config.failed.json, 未做任何修改"
     fi
     cp "$tmp" "$CONFIG"
-    rm -f "$tmp"
+    rm -rf "$(dirname "$tmp")"
 
     echo "配置已写入, 正在重启 xray (约 1 秒, 现有连接会断开重连)..."
     restart_xray
