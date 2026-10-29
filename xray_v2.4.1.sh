@@ -1,9 +1,18 @@
 #!/usr/bin/env bash
 # ==============================================================
-# VPS 一键管理脚本  v2.4.0 (终极大师版 - 版本感知版)
+# VPS 一键管理脚本  v2.4.1 (终极大师版 - 版本感知版)
 # 功能: Xray VLESS+Reality+Vision  本地直连 + 链式中转
 #       + Hysteria2 (HY2) 节点管理 + 端口跳跃 + 带宽限制 + 伪装
 # 架构: XTLS 官方内部 dokodemo-door 终极防偷流量 + 极客级健壮性
+#
+# 更新日志 v2.4.1:
+#   1. 修复: 端口段冲突检查假死。旧 hy2_range_conflict 对段内每个端口
+#           都单独跑一次 ss, 30000-40000 这种万级段要查 10001 次,
+#           在小机器上等于卡死。新版一次遍历 DB 做区间重叠判断,
+#           再只跑一次 ss 取监听表比对, 段多大都瞬间完成。
+#           顺带修正: 原 ss 取表用的是第 5 列 (Peer 列), 实际监听地址
+#           在第 4 列, 不改则新版会漏检已监听端口。
+#           (v2.4.0 其他内容一个没动, 仅此一处修复)
 #
 # 更新日志 v2.4.0:
 #   1. 新增: Hysteria2 节点管理 (增删改查 + 状态检测)，与 Xray 节点
@@ -34,7 +43,7 @@
 #   4. 继承: v2.3.4 全部功能，一个没删
 # ==============================================================
 
-SCRIPT_VERSION="v2.4.0"
+SCRIPT_VERSION="v2.4.1"
 
 # ── 颜色与日志 ────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -1592,16 +1601,39 @@ hy2_port_conflict() {
 # 段冲突检查: [start,end] 与其他 HY2 节点端口/段重叠, 或段内已有 UDP 监听。
 hy2_range_conflict() {
     local start="$1" end="$2" exclude_svc="${3:-}"
-    local p
-    for p in $(seq "$start" "$end" 2>/dev/null | head -n 65536); do
-        hy2_port_conflict "$p" "$exclude_svc" && return 0
-    done
-    # 段内已有 UDP 监听 (逐个 ss 查太慢, 一次性取表比对)
+    # 注意: 绝不能逐个端口循环查 (旧写法对 30000-40000 这种万级端口段
+    # 会跑 10001 次 ss, 在小机器上等于假死)。这里一次遍历 DB 做区间
+    # 重叠算术判断, 再只跑一次 ss 取监听表比对, 段多大都一样快。
+    local line svc2 _n port2 hop2 start2 end2 ints2
+    while IFS='|' read -r svc2 _n port2 hop2 start2 end2 ints2 _rest; do
+        [ -z "$svc2" ] && continue
+        case "$svc2" in '#'*) continue ;; esac
+        [ -n "$exclude_svc" ] && [ "$svc2" = "$exclude_svc" ] && continue
+        if [ "$hop2" = "range" ]; then
+            # 区间重叠: start <= end2 && start2 <= end (空字段先跳过, 防脏数据)
+            case "$start2" in ''|*[!0-9]*) continue ;; esac
+            case "$end2" in ''|*[!0-9]*) continue ;; esac
+            if [ "$start" -le "$end2" ] && [ "$start2" -le "$end" ]; then return 0; fi
+        else
+            case "$port2" in ''|*[!0-9]*) ;; *) [ "$port2" -ge "$start" ] && [ "$port2" -le "$end" ] && return 0 ;; esac
+            if [ -n "$ints2" ]; then
+                local old_ifs="$IFS" p
+                IFS=','
+                for p in $ints2; do
+                    IFS="$old_ifs"
+                    case "$p" in ''|*[!0-9]*) ;; *) [ "$p" -ge "$start" ] && [ "$p" -le "$end" ] && return 0 ;; esac
+                    IFS=','
+                done
+                IFS="$old_ifs"
+            fi
+        fi
+    done < <(cat "$HY2_DB" 2>/dev/null | tr -d '\r')
+    # 段内已有 UDP 监听: 一次性取表比对
     local lp
     while read -r lp; do
         case "$lp" in ''|*[!0-9]*) continue ;; esac
         if [ "$lp" -ge "$start" ] && [ "$lp" -le "$end" ]; then return 0; fi
-    done < <(ss -uln 2>/dev/null | awk '{print $5}' | sed 's/.*://' | sort -un)
+    done < <(ss -uln 2>/dev/null | awk '{print $4}' | sed 's/.*://' | sort -un)
     return 1
 }
 
