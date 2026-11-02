@@ -347,24 +347,37 @@ ensure_python() {
 # 链接都实时探测, 同一条节点会每次输出不同 IP, 其中只有一个能用。
 # 所以: 首次探测结果落盘复用; 检测到变化时只警告不改值;
 # 用户可用 echo '真实入站IP' > $DATA_DIR/server_ip 强制覆盖。
+# 注意: 本函数只允许把 IP 写到 stdout。所有诊断信息必须走 stderr,
+# 因为它被 ipv4=$(public_ip4) 捕获 —— 任何一行多余的 stdout 都会被
+# 拼进 vless:// 链接和 mihomo 的 server: 字段, 把节点彻底写坏。
 public_ip4() {
     local cached fresh
     if [ -s "$DATA_DIR/server_ip" ]; then
         cached=$(tr -d ' \r\n' < "$DATA_DIR/server_ip" 2>/dev/null)
-        if echo "$cached" | grep -Eq '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'; then
+        if printf '%s' "$cached" | grep -Eq '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'; then
             fresh=$(get_ipv4 2>/dev/null)
             if [ -n "$fresh" ] && [ "$fresh" != "$cached" ]; then
-                log_warn "出口 IP 与缓存不一致: 缓存 $cached / 本次探测 $fresh"
-                log_warn "NAT 机器出口 IP 可能轮换, 链接统一用缓存值以保证稳定。"
-                log_warn "若缓存值不是你的入站 IP, 用真实值覆盖:"
-                log_warn "  echo '你的入站IP' > $DATA_DIR/server_ip"
+                {
+                    log_warn "出口 IP 与缓存不一致: 缓存 $cached / 本次探测 $fresh"
+                    log_warn "NAT 机器出口 IP 可能轮换, 链接统一用缓存值以保证稳定。"
+                    log_warn "若缓存值不是你的入站 IP, 用真实值覆盖:"
+                    log_warn "  echo '你的入站IP' > $DATA_DIR/server_ip"
+                    log_warn "提示: 出口 IP 轮换通常意味着这是 NAT 机器, IPv4 入站未必可用。"
+                    log_warn "      若你本来就用 IPv6 访问, 直接用 -v6 那条链接, 忽略 IPv4 那条。"
+                } >&2
             fi
-            echo "$cached"; return 0
+            printf '%s\n' "$cached"; return 0
         fi
     fi
     fresh=$(get_ipv4) || return 1
-    echo "$fresh" > "$DATA_DIR/server_ip" 2>/dev/null
-    echo "$fresh"
+    printf '%s\n' "$fresh" > "$DATA_DIR/server_ip" 2>/dev/null
+    printf '%s\n' "$fresh"
+}
+
+# 兜底清洗: 即便上游有杂讯, 也只取最后一行合法 IPv4。
+# 双保险, 因为这条值直接进链接, 出错的代价是节点不可用。
+safe_ipv4() {
+    public_ip4 2>/dev/null | tr -d ' \r' | grep -E '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' | tail -1
 }
 
 get_ipv4() {
@@ -1547,7 +1560,7 @@ view_all_nodes() {
 show_node_info() {
     local uuid="$1" port="$2" sni="$3" sid="$4" priv="$5" pub="$6" name="$7" fp="${8:-chrome}"
     local ipv4 ipv6
-    ipv4=$(public_ip4); ipv6=$(get_ipv6)
+    ipv4=$(safe_ipv4); ipv6=$(get_ipv6)
 
     # 检测成功就缓存 IP，检测失败则用缓存兜底
     [ -n "$ipv4" ] && echo "$ipv4" > "$DATA_DIR/server_ip" 2>/dev/null
@@ -2499,7 +2512,7 @@ show_hy2_info() {
     cports=$(hy2_client_ports "$hop_type" "$port" "$hop_start" "$hop_end" "$ext_ports")
 
     local ipv4 ipv6
-    ipv4=$(public_ip4); ipv6=$(get_ipv6)
+    ipv4=$(safe_ipv4); ipv6=$(get_ipv6)
     [ -n "$ipv4" ] && echo "$ipv4" > "$DATA_DIR/server_ip" 2>/dev/null
     if [ -z "$ipv4" ] && [ -f "$DATA_DIR/server_ip" ]; then
         ipv4=$(tr -d ' \r\n' < "$DATA_DIR/server_ip" 2>/dev/null)
