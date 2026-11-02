@@ -341,6 +341,32 @@ ensure_python() {
     if cmd_exists python3; then PYTHON=python3; else log_error "Python 安装失败"; PYTHON=""; fi
 }
 
+# 取"入站 IP"。与 get_ipv4 的区别: 优先用缓存, 不每次重新探测。
+# 背景: NAT VPS 的出口 IP 常常是一个池 (本次实测同一台机器两次探测
+# 分别得到 .219 和 .220), 而客户端要连的是"入站 IP"。如果每次生成
+# 链接都实时探测, 同一条节点会每次输出不同 IP, 其中只有一个能用。
+# 所以: 首次探测结果落盘复用; 检测到变化时只警告不改值;
+# 用户可用 echo '真实入站IP' > $DATA_DIR/server_ip 强制覆盖。
+public_ip4() {
+    local cached fresh
+    if [ -s "$DATA_DIR/server_ip" ]; then
+        cached=$(tr -d ' \r\n' < "$DATA_DIR/server_ip" 2>/dev/null)
+        if echo "$cached" | grep -Eq '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'; then
+            fresh=$(get_ipv4 2>/dev/null)
+            if [ -n "$fresh" ] && [ "$fresh" != "$cached" ]; then
+                log_warn "出口 IP 与缓存不一致: 缓存 $cached / 本次探测 $fresh"
+                log_warn "NAT 机器出口 IP 可能轮换, 链接统一用缓存值以保证稳定。"
+                log_warn "若缓存值不是你的入站 IP, 用真实值覆盖:"
+                log_warn "  echo '你的入站IP' > $DATA_DIR/server_ip"
+            fi
+            echo "$cached"; return 0
+        fi
+    fi
+    fresh=$(get_ipv4) || return 1
+    echo "$fresh" > "$DATA_DIR/server_ip" 2>/dev/null
+    echo "$fresh"
+}
+
 get_ipv4() {
     local ip url
     for url in https://api4.ipify.org https://ipv4.icanhazip.com https://ifconfig.me https://api.ip.sb https://icanhazip.com; do
@@ -675,8 +701,16 @@ sni_scan() {
         if sni_is_risky "$d"; then continue; fi
         ip4=$(_sni_resolve "$d" 4)
         ip6=$(_sni_resolve "$d" 6)
-        r4=$(_sni_probe_best "$ip4" "$d"); v4="${r4%%|*}"; ms4="${r4##*|}"
-        r6=$(_sni_probe_ip "$ip6" "$d"); v6="${r6%%|*}"; ms6="${r6##*|}"
+        if [ -z "$ip4" ]; then
+            v4="NONE"; ms4=0
+        else
+            r4=$(_sni_probe_best "$ip4" "$d"); v4="${r4%%|*}"; ms4="${r4##*|}"
+        fi
+        if [ -z "$ip6" ]; then
+            v6="NONE"; ms6=0
+        else
+            r6=$(_sni_probe_ip "$ip6" "$d"); v6="${r6%%|*}"; ms6="${r6##*|}"
+        fi
         if [ "$v4" = "OK" ]; then
             key="$ms4"
         elif [ "$v6" = "OK" ]; then
@@ -711,35 +745,43 @@ sni_pick_menu() {
     echo ""
     printf "  %-4s %-24s %-17s %-10s %-10s %s\n" "排名" "域名" "IPv4" "v4握手" "v6握手" "结论"
     echo "  -------------------------------------------------------------------------------"
-    local i=0 key d v4 ms4 v6 ms6 ip best="" v4d v6d note
+    local i=0 key d v4 ms4 v6 ms6 ip best="" v4p v6p c4 c6 note
     while IFS='|' read -r key d v4 ms4 v6 ms6 ip; do
         [ -z "$d" ] && continue
         i=$((i + 1))
         [ -z "$best" ] && best="$d"
+        # 先把纯文本补齐到固定宽度, 再整体套色。
+        # 不能写成 %-10b + 内嵌颜色: printf 会把 ANSI 转义字节算进宽度,
+        # 导致列错位 (实际表现是 "OK 56ms 失败" 挤在一起)。
         case "$v4" in
-            OK)   v4d="${GREEN}OK ${ms4}ms${NC}" ;;
-            NOH2) v4d="${YELLOW}无h2${NC}" ;;
-            *)    v4d="${RED}失败${NC}" ;;
+            OK)    v4p="OK ${ms4}ms"; c4="$GREEN" ;;
+            NOH2)  v4p="无h2";        c4="$YELLOW" ;;
+            NONE)  v4p="无A记录";      c4="$YELLOW" ;;
+            *)     v4p="失败";         c4="$RED" ;;
         esac
         case "$v6" in
-            OK)   v6d="${GREEN}OK ${ms6}ms${NC}" ;;
-            NOH2) v6d="${YELLOW}无h2${NC}" ;;
-            *)    v6d="${RED}失败${NC}" ;;
+            OK)    v6p="OK ${ms6}ms"; c6="$GREEN" ;;
+            NOH2)  v6p="无h2";        c6="$YELLOW" ;;
+            NONE)  v6p="—";           c6="$YELLOW" ;;
+            *)     v6p="失败";         c6="$RED" ;;
         esac
+        v4p=$(printf '%-9s' "$v4p")
+        v6p=$(printf '%-9s' "$v6p")
         note=""
         [ "$i" -eq 1 ] && note="${CYAN}← 最优${NC}"
-        printf "  %-4s %-24s %-17s %-10b %-10b %b\n" "$i" "$d" "${ip:0:16}" "$v4d" "$v6d" "$note"
+        printf "  %-4s %-24s %-17s %b%s%b %b%s%b %b\n" \
+            "$i" "$d" "${ip:0:16}" "$c4" "$v4p" "$NC" "$c6" "$v6p" "$NC" "$note"
     done <<< "$SNI_SCAN"
 
     echo ""
     log_success "最优: $best  (TLS1.3 + h2 全绿, 握手最快)"
-    echo "  ${YELLOW}注${NC}: 相邻名次差 50ms 以内基本是测量噪声, 不必较真;"
+    echo -e "  ${YELLOW}注${NC}: 相邻名次差 50ms 以内基本是测量噪声, 不必较真;"
     echo "      断崖式差距 (比如 3 倍以上) 才是真实差异, 那种要优先。"
     echo ""
-    echo "  ${YELLOW}注意${NC}: 同一个 SNI 不要用在多台服务器上。选定后请记入你的分配表,"
+    echo -e "  ${YELLOW}注意${NC}: 同一个 SNI 不要用在多台服务器上。选定后请记入你的分配表,"
     echo "        其他机器从这份榜单里挑别的名次, 不要都用第 1 名。"
     echo ""
-    echo "  ${YELLOW}必做${NC}: 本预检只能证明「这台服务器能回落」, 证明不了「大陆能连」。"
+    echo -e "  ${YELLOW}必做${NC}: 本预检只能证明「这台服务器能回落」, 证明不了「大陆能连」。"
     echo "        SNI 若在大陆被墙, 发出去就被 RST, 服务器侧再合格也没用。"
     echo "        选定后在本地(不走代理)验一次, 返回 2 才算真过:"
     echo "          curl -sS -o /dev/null -w '%{http_version}\\n' --noproxy '*' https://${best}"
@@ -1417,7 +1459,21 @@ edit_node() {
         return 1
     fi
 
-    read -rp "新 SNI [$sni] (auto=重新预检): " ns; [ -z "$ns" ] && ns="$sni"
+    # 若 [14] 预检已经选定过域名, 这里把"回车"的含义改成"采用预检结果",
+    # 而不是"保持旧值" —— 否则用户刚在 [14] 选完, 到这一步回车却被静默
+    # 保留旧 SNI, 看起来就像预检没生效。想保留旧值就显式输入 -。
+    local sni_memo=""
+    [ -s "$SNI_CHOSEN_FILE" ] && sni_memo=$(tr -d ' \r\n' < "$SNI_CHOSEN_FILE")
+    if [ -n "$sni_memo" ] && [ "$sni_memo" != "$sni" ]; then
+        echo -e "  ${CYAN}预检已选定: ${sni_memo}${NC}"
+        read -rp "新 SNI [回车=采用 ${sni_memo} / 输入 - 保持 ${sni} / auto=重新预检]: " ns
+        case "$ns" in
+            "")  ns="$sni_memo" ;;
+            "-") ns="$sni" ;;
+        esac
+    else
+        read -rp "新 SNI [$sni] (auto=重新预检): " ns; [ -z "$ns" ] && ns="$sni"
+    fi
     ns=$(sanitize_field "$ns"); [ -z "$ns" ] && ns="$sni"
     case "$ns" in
         auto|AUTO|Auto)
@@ -1491,7 +1547,7 @@ view_all_nodes() {
 show_node_info() {
     local uuid="$1" port="$2" sni="$3" sid="$4" priv="$5" pub="$6" name="$7" fp="${8:-chrome}"
     local ipv4 ipv6
-    ipv4=$(get_ipv4); ipv6=$(get_ipv6)
+    ipv4=$(public_ip4); ipv6=$(get_ipv6)
 
     # 检测成功就缓存 IP，检测失败则用缓存兜底
     [ -n "$ipv4" ] && echo "$ipv4" > "$DATA_DIR/server_ip" 2>/dev/null
@@ -2443,7 +2499,7 @@ show_hy2_info() {
     cports=$(hy2_client_ports "$hop_type" "$port" "$hop_start" "$hop_end" "$ext_ports")
 
     local ipv4 ipv6
-    ipv4=$(get_ipv4); ipv6=$(get_ipv6)
+    ipv4=$(public_ip4); ipv6=$(get_ipv6)
     [ -n "$ipv4" ] && echo "$ipv4" > "$DATA_DIR/server_ip" 2>/dev/null
     if [ -z "$ipv4" ] && [ -f "$DATA_DIR/server_ip" ]; then
         ipv4=$(tr -d ' \r\n' < "$DATA_DIR/server_ip" 2>/dev/null)
