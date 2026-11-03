@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# ================= 核心配置区 =================
+# ================= 核心配置区 ==================
 PID_FILE="/tmp/.sys_helper.pid"
 MEM_FILE="/dev/shm/.sys_cache_buffer"
 
