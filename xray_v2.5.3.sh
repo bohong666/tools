@@ -5,6 +5,17 @@
 #       + Hysteria2 (HY2) 节点管理 + 端口跳跃 + 带宽限制 + 伪装
 # 架构: XTLS 官方内部 dokodemo-door 终极防偷流量 + 极客级健壮性
 #
+# 补充修复 v2.5.3-r2 (v2.5.3 首版自身引入的误判, 真实事故):
+#   1. 修复(严重): 判「openssl 不认参数」的正则里含宽泛的 "not supported",
+#           -i 会命中正常握手输出 "Secure Renegotiation IS NOT supported",
+#           于是把一次完全成功的 TLS1.3 + h2 握手误报成「openssl 过老」。
+#           现只认 unknown/illegal option、Usage: s_client 等真实参数报错。
+#   2. 修复: TLS1.3 判定原来只认 "Protocol : TLSv1.3" 一行。OpenSSL 3.0.22
+#           在 stdin 立即 EOF 时可能不打印 SSL-Session 段, 只剩
+#           "New, TLSv1.3, Cipher is ..." —— 握手成功却仍判不合格。
+#           现两个标志任一命中即算 TLS1.3; TLS1.2 判定同样兼容 New 行;
+#           重试条件同步放宽, 避免每次都白跑两遍握手。
+#
 # 更新日志 v2.5.3 (SNI 实测误报修复, 真实事故):
 #   1. 修复(严重): 手打 SNI 时, 任何「没拿到 TLS1.3 结果」的失败都会被
 #           统一报成「SNI xxx 不合格: 不支持 TLS 1.3」。实际原因可能是
@@ -710,17 +721,22 @@ sni_probe() {
     fi
 
     out=$(_sni_handshake "$s" "$target")
-    # 只在「根本没拿到 Protocol 行」时重试一次, 挡掉 CDN 首包抖动 / 偶发 RST。
-    if ! printf '%s' "$out" | grep -q 'Protocol *:'; then
+    # 只在「连握手摘要都没有」时重试一次, 挡掉 CDN 首包抖动 / 偶发 RST。
+    # 不能只认 Protocol 行: OpenSSL 3.0 的 s_client 在 stdin 立即 EOF 时
+    # 可能只打印 "New, TLSv1.3, Cipher is ..." 而不打印 SSL-Session 段。
+    if ! printf '%s' "$out" | grep -qiE 'New, TLSv1\.[23], Cipher is|Protocol *: *TLSv1\.[23]'; then
         out=$(_sni_handshake "$s" "$target")
     fi
 
     SNI_PROBE_DIAG=$(printf '%s\n' "$out" | grep -iE \
-        'unknown option|illegal option|not supported|alert |errno|no peer certificate|timed out|CONNECTED|Protocol *:|New,|ALPN|SSL handshake|verify error|refused|unreachable' \
+        'unknown option|illegal option|alert |errno|no peer certificate|timed out|CONNECTED|Protocol *:|New, TLSv|ALPN|SSL handshake|verify error|refused|unreachable' \
         | head -8 | sed 's/^/         /')
 
     # ---- 按真实原因分类, 不再把所有失败都叫「不支持 TLS 1.3」 ----
-    if printf '%s' "$out" | grep -qiE 'unknown option|illegal option|not supported|usage:'; then
+    # 教训 (v2.5.3 首版真实事故): 不能用宽泛的 "not supported" 判 openssl
+    # 参数错误 —— 正常握手里的 "Secure Renegotiation IS NOT supported"
+    # 会被 -i 命中, 把一次完全成功的 TLS1.3+h2 握手误报成「openssl 过老」。
+    if printf '%s' "$out" | grep -qiE 'unknown option|illegal option|not an option|Usage: s_client|s_client: Error|option.*not recognized'; then
         SNI_PROBE_MSG="本机 openssl 不认 -tls1_3 参数 (版本过老或非 OpenSSL 实现)"
         SNI_PROBE_DIAG="${SNI_PROBE_DIAG}
          本机 openssl: $(openssl version 2>&1 | head -1)"
@@ -735,7 +751,7 @@ sni_probe() {
         SNI_PROBE_MSG="目标站明确拒绝了 TLS1.3 握手"
         return 1
     fi
-    if printf '%s' "$out" | grep -q 'Protocol *: *TLSv1\.2'; then
+    if printf '%s' "$out" | grep -qiE 'New, TLSv1\.2|Protocol *: *TLSv1\.2'; then
         SNI_PROBE_MSG="目标站只协商到 TLS 1.2 (确实不支持 TLS1.3)"
         return 1
     fi
@@ -744,8 +760,10 @@ sni_probe() {
         return 1
     fi
 
-    printf '%s' "$out" | grep -q 'Protocol *: *TLSv1\.3' && SNI_TLS="是"
-    printf '%s' "$out" | grep -q 'ALPN protocol: h2'      && SNI_H2="是"
+    # TLS1.3 判定: "New, TLSv1.3, Cipher is" 跨 OpenSSL 版本都存在,
+    # Protocol 行作为兜底 (3.0 某些构建/EOF 提前退出时可能不打印)。
+    printf '%s' "$out" | grep -qiE 'New, TLSv1\.3, Cipher is|Protocol *: *TLSv1\.3' && SNI_TLS="是"
+    printf '%s' "$out" | grep -q  'ALPN protocol: h2'                              && SNI_H2="是"
 
     if [ "$SNI_TLS" != "是" ]; then
         SNI_PROBE_MSG="TLS 握手未产出 TLS1.3 结果 (原因见下方 openssl 原文)"
