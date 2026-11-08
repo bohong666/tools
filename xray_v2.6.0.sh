@@ -1,0 +1,4453 @@
+#!/usr/bin/env bash
+# ==============================================================
+# VPS 一键管理脚本  v2.5.3 (抗风控加固版)
+# 功能: Xray VLESS+Reality+Vision  本地直连 + 链式中转
+#       + Hysteria2 (HY2) 节点管理 + 端口跳跃 + 带宽限制 + 伪装
+# 架构: XTLS 官方内部 dokodemo-door 终极防偷流量 + 极客级健壮性
+#
+# 补充修复 v2.5.3-r2 (v2.5.3 首版自身引入的误判, 真实事故):
+#   1. 修复(严重): 判「openssl 不认参数」的正则里含宽泛的 "not supported",
+#           -i 会命中正常握手输出 "Secure Renegotiation IS NOT supported",
+#           于是把一次完全成功的 TLS1.3 + h2 握手误报成「openssl 过老」。
+#           现只认 unknown/illegal option、Usage: s_client 等真实参数报错。
+#   2. 修复: TLS1.3 判定原来只认 "Protocol : TLSv1.3" 一行。OpenSSL 3.0.22
+#           在 stdin 立即 EOF 时可能不打印 SSL-Session 段, 只剩
+#           "New, TLSv1.3, Cipher is ..." —— 握手成功却仍判不合格。
+#           现两个标志任一命中即算 TLS1.3; TLS1.2 判定同样兼容 New 行;
+#           重试条件同步放宽, 避免每次都白跑两遍握手。
+#
+# 更新日志 v2.5.3 (SNI 实测误报修复, 真实事故):
+#   1. 修复(严重): 手打 SNI 时, 任何「没拿到 TLS1.3 结果」的失败都会被
+#           统一报成「SNI xxx 不合格: 不支持 TLS 1.3」。实际原因可能是
+#           连不上 443 / 8 秒超时 / 被 RST / 本机 openssl 不认 -tls1_3 /
+#           DNS 二次解析用了 IPv6。用户拿 ping 通去质疑判定, 却被这句
+#           错误文案带偏 —— ping 只证明 ICMP 到 CDN 边缘可达, 与 TCP 443
+#           是否完成 TLS 握手无关。现区分失败类型并打印 openssl 原文。
+#   2. 修复: sni_probe 原来用 -connect "域名:443" 让 openssl 自己再解析
+#           一次域名, 与 [14] 自动预检「先解析出 IPv4 再显式连 IP」不是
+#           同一条路径。NAT/双栈机器上 DNS 行为不同, 就会出现「手打全挂、
+#           自动预检却能过」。现统一改用 _sni_resolve 的结果显式连 IP,
+#           回落出站本来就锁 UseIPv4, 语义上也更正确。
+#   3. 修复: openssl 的 stderr 被 2>/dev/null 丢掉, 握手失败的关键线索
+#           (alert protocol version / errno / unknown option / no peer
+#           certificate) 全部不可见。现保留 stderr 并抽取诊断行。
+#   4. 改进: 超时 8s -> 12s; 仅当「握手未完成」类失败时自动重试一次,
+#           避免 CDN 首包抖动造成假不合格。
+#   5. 改进: 手打 SNI 连续失败时主动提示可输 auto 走 [14] 预检, 并给出
+#           一条可直接复制的 openssl 诊断命令, 不再让用户盲试域名。
+#
+# 更新日志 v2.5.2 (缓存一致性 + 升级数据安全, 均为真实事故):
+#   1. 修复(严重): 首次安装内核后链接漏掉 support-x25519mlkem768 参数。
+#           根因是缓存时序: 主菜单渲染时先调 xray_kernel_version(),
+#           此时二进制还不存在, 结果被缓存为"空版本 + 已检查"; install_xray
+#           装完后没复位该缓存, 于是 make_uri 读到的永远是空版本,
+#           xray_needs_mlkem 判假, 链接不带 MLKEM 参数。而服务端内核是
+#           26.10.21 (>=26.9.8), 强制要求 ClientHello 带 X25519MLKEM768,
+#           客户端不带就被判定认证失败、静默回落 —— 表现为"端口通、
+#           TCP 能连、但一点数据都收不到", 极易误判成节点被封或端口写错。
+#           修法: install_xray 装完复位版本缓存; 并在版本读不出来时
+#           用锁定版 XRAY_VERSION_PIN 兜底 (XRAY_VER_FALLBACK=1 标记)。
+#   2. 修复(严重): 入站 IP 缓存永不过期。VPS 重装/换 IP 后, 缓存里还是
+#           旧地址, 生成出来的链接全部指向一台已经不存在的机器。
+#           修法: 缓存加 TTL (IP_CACHE_TTL_DAYS, 默认 7 天, 按文件 mtime
+#           计算, 兼容历史纯 IP 格式), 过期自动重探; install_xray 安装前
+#           主动调 reset_ip_cache 清一次, 重装后第一次跑脚本就能拿新 IP。
+#           另修: show_node_info 原本每次查看节点都回写 server_ip,
+#           mtime 被刷新导致 TTL 永不生效, 现改为仅在缓存缺失时补写。
+#   3. 改进: 内核版本探测兼容性。原实现只试 `xray version` 且把 stderr
+#           丢掉, 某些构建读不到版本。现依次尝试 version / -version /
+#           --version, 且合并 stderr。
+#   4. 改进: [6] 检测节点状态不再因缓存显示"未能探测内核版本";
+#           版本来自兜底时明确标注, 避免误导。
+#   5. 改进: 修正原提示"本脚本生成的链接已自动带提示参数"的自相矛盾
+#           表述 (v2.5.1 实际不带), 改为明确指引: 旧链接需重新取。
+#   6. 改进: [1] 添加节点时提示"链接用的是内网监听端口", NAT 机型在面板
+#           做了端口映射 (如 54324->443) 时需自行替换成外部端口。
+#   7. 修复(严重): [13] 升级内核失败可能丢数据。原实现只备份二进制和
+#           .dat, config.json 与 nodes.db / relay.db / hy2.db 完全没保护;
+#           而升级过程会先 regen_config 覆盖 config.json。一旦新内核起不来,
+#           回滚后是"旧二进制 + 已被覆盖的坏配置", 服务照样起不来, 节点
+#           私钥与 UUID 也可能已经丢了。现改为:
+#             - backup_xray_state 备份整套状态, 关键库备份失败直接中止升级;
+#             - restore_xray_state 回滚时整套还原, 回滚后不再重复 regen;
+#             - regen_config 写前备份旧配置, 验证失败自动还原。
+#   8. 改进: 内核升级备份保留最近 3 份, 自动清理更早的, 避免
+#           /root/vps_manager_backups 被几十 MB 的旧内核堆满。
+#
+# 更新日志 v2.5.1 (SNI 预检 + 链接可靠性):
+#   1. 新增: [14] 改为"SNI 自动预检排名"。10 个实测通过的候选域名,
+#           双栈探测后按 IPv4 握手耗时升序排名, 直接给出最优, 输序号
+#           即可采用并记住 (存 /etc/vps_manager/sni_chosen)。
+#           候选池替换掉原内置的 samsung/nvidia/amd/intel 那批 ——
+#           它们实测大面积不支持 TLS1.3。
+#   2. 新增: [1] 添加节点时 SNI 回车 = 自动预检; 输入 auto = 重新预检。
+#           原默认值 www.samsung.com 已移除 (它本身就是不合格站)。
+#   3. 新增: [2] 修改节点时, 若 [14] 已选定过域名, 回车 = 采用该域名
+#           (输入 - 才保持旧值)。原来回车是"保持旧值", 用户刚选完再来
+#           这一步按回车会看起来像预检没生效。
+#   4. 修复: 链接里的 IPv4 每次生成可能不同。原 get_ipv4 每次实时探测
+#           出口 IP, 而 NAT 机器出口 IP 常是池 (实测同一台机器连续两次
+#           得到 .219 / .220 / .221), 但客户端要连的是入站 IP。现改为
+#           首次探测落盘复用, 变化时只警告不改值, 并支持手工覆盖。
+#   5. 修复: public_ip4 的告警原本走 stdout, 被 $(...) 捕获后整段文本
+#           被拼进 vless:// 链接和 mihomo 的 server: 字段, 节点报废。
+#           现全部改走 stderr, 另加 safe_ipv4() 只取最后一行合法 IPv4。
+#   6. 修复: 预检表格列错位 (printf %-10b 把 ANSI 转义字节算进宽度);
+#           颜色未生效 (echo 缺 -e)。无 AAAA 记录的站改显示 "—"。
+#
+# 更新日志 v2.5.0 (抗风控加固版):
+#   1. 新增: SNI 风险库。Xray 内核自己会警告的目标站 (apple.com /
+#           microsoft.com / bing.com 等被墙内用户用烂的域名) 一律
+#           拒绝入库; 添加/修改节点时自动实测目标站的 TLS1.3 + ALPN h2
+#           + 443 可达性, 三项不过关不给过。原来的默认 www.yahoo.com
+#           也在风险库里, 默认值改成自检通过的候选。
+#   2. 新增: 回落链路强制 IPv4。原配置回落直接走 direct 出站, 当 SNI
+#           只解析出 AAAA 而本机没有 IPv6 出口时, 回落会连不上,
+#           探测方看到"无响应"——这比 RST 更像墙。现改为独立的
+#           fallback 出站并锁 UseIPv4。
+#   3. 新增: 去掉防偷的 block 规则。原配置在 SNI 不匹配时直接 RST,
+#           而真实站点会回 handshake_failure alert, RST 是更硬的
+#           封锁特征。内层 dokodemo-door 的 address 固定为 SNI,
+#           放开后也只能到达那一个站点, 偷流量风险可控。
+#   4. 新增: 内置内核加固 (harden_sysctl)。conntrack 上限 65536、
+#           出站端口范围 10240-65535、握手队列 8192、syncookies。
+#           默认 conntrack 8192 被扫一轮就打满, 表现和被墙一模一样。
+#   5. 新增: 节点信息输出改为"直接可用"。同时给出 v4 / v6 两个节点,
+#           并附带一个 fallback 类型的策略组, 导入 Clash Party 后
+#           IPv4 被阻断会自动切到 IPv6, 不需要手工改。
+#   6. 新增: 主菜单 [14] SNI 评测、[15] 探测统计与日志级别。
+#   7. 改进: 非 443 端口明确提示风险 (NAT 机无法避免, 但要知情)。
+#   8. 继承: v2.4.2 全部功能, 一个没删
+#
+# 更新日志 v2.4.2:
+#   1. 新增: Xray 内核版本感知。xray >= 26.9.8 的 REALITY 服务端按
+#           ClientHello 判定: 必须带 X25519MLKEM768 key share 且排在
+#           X25519 之前, 否则静默回落 dest (表现与被风控无异)。
+#           生成的 vless 链接现按本机内核版本决定是否携带
+#           support-x25519mlkem768=true 提示参数 (mihomo 导入时
+#           自动启用); 内核更低或探测不到时链接与旧版逐字一致。
+#           查看节点信息时另附 Mihomo (Clash Meta) 配置片段。
+#   2. 新增: 指纹兼容警告。内核 >= 26.9.8 且节点指纹不是 chrome
+#           时, 添加/修改节点会明确警告 (只有 chrome 指纹能发出
+#           X25519MLKEM768, mihomo 握手将失败; sing-box 与
+#           Shadowrocket 未更新的版本也连不上), 只警告不拦截;
+#           节点检测新增“内核版本与客户端要求”一项。
+#   3. 新增: 主菜单 [13] 升级 Xray 内核。可选锁定版或官方最新版;
+#           旧内核自动备份到备份目录, 新内核验收失败自动回滚;
+#           跨过 26.9.8 边界时打印客户端兼容提醒。
+#   4. 改进: 安装版本锁。新装 Xray 全部发行版统一走官方 zip 安装
+#           锁定版本 v26.10.21 (Debian 系不再用官方 install 脚本);
+#           删掉下载失败回落 v1.8.4 的兜底, 失败明确报错。
+#   5. 新增: 多发行版支持。在 Debian/Ubuntu (apt) 与 Alpine (apk)
+#           之外新增 RHEL 系 (dnf, 缺失时 yum)、Arch 系 (pacman)、
+#           openSUSE 系 (zypper), 按 /etc/os-release 的 ID 与
+#           ID_LIKE 判定家族; systemd 判定加容器纠正 (systemd
+#           不在位且有 OpenRC 时改判 openrc); 防火墙在 iptables
+#           与 ufw 之外补 firewalld 等价放行/回收。
+#   6. 继承: v2.4.1 全部功能，一个没删
+#
+# 更新日志 v2.4.1:
+#   1. 修复: 端口段冲突检查假死。旧 hy2_range_conflict 对段内每个端口
+#           都单独跑一次 ss, 30000-40000 这种万级段要查 10001 次,
+#           在小机器上等于卡死。新版一次遍历 DB 做区间重叠判断,
+#           再只跑一次 ss 取监听表比对, 段多大都瞬间完成。
+#           顺带修正: 原 ss 取表用的是第 5 列 (Peer 列), 实际监听地址
+#           在第 4 列, 不改则新版会漏检已监听端口。
+#           (v2.4.0 其他内容一个没动, 仅此一处修复)
+#
+# 更新日志 v2.4.0:
+#   1. 新增: Hysteria2 节点管理 (增删改查 + 状态检测)，与 Xray 节点
+#           共存，互不干扰；每个 HY2 节点独立进程、独立配置、
+#           独立证书、独立服务
+#   2. 新增: 端口跳跃。非 NAT 机用服务端内置 listen 段 (:起-止)，
+#           由 hysteria2 自动建/清防火墙重定向规则；NAT 机
+#           (面板映射端口有限) 只用 1-3 个外网端口，内网端口
+#           由脚本做 REDIRECT 落到 HY2 主端口，客户端用外网
+#           端口段/列表跳跃
+#   3. 新增: HY2 节点可设上/下行带宽 (Mbps)，写入服务端
+#           bandwidth，封顶 Brutal 拥塞控制的抢占
+#   4. 新增: 强密码 (自动生成 32 位) 与服务端伪装 Masquerade
+#           (反代/本地文件/固定字符串三选一)；混淆 Obfs
+#           (salamander) 默认关闭，可选开启并独立设密码
+#   5. 修复: VPS 重启后 Xray/HY2 不自启。原因：旧脚本 OpenRC
+#           分支从未执行 rc-update add，systemd 分支的
+#           enable 失败被静默吞掉且无人校验。现每次启动与
+#           每次服务重启都会校验并补齐自启，失败会明说
+#   6. 继承: v2.3.5 全部功能，一个没删
+#
+# 更新日志 v2.3.5:
+#   1. 修复: 查看节点时若公网 IP 自动检测失败，vless 链接不再消失
+#           (之前检测不到 IP 就整段不打印，这是本次报障的根因)
+#   2. 改进: IP 检测增加多个备用源 + 严格格式校验，防止错误页面污染
+#   3. 改进: 检测成功的 IP 自动缓存，检测失败时用缓存兜底；
+#           实在拿不到则用「你的服务器IP」占位符照常输出链接并提示替换
+#   4. 继承: v2.3.4 全部功能，一个没删
+# ==============================================================
+
+# ==============================================================
+# v2.6.0 — 网络自检 + 差异化 TCP 调优 (主菜单 16)
+#   1. 新增: 单文件自包含的网络体检 / 调优模块，不增加依赖、不改 Xray/HY2
+#      配置、不改防火墙、不改 DNS。
+#   2. 新增: 自动识别虚拟化 (KVM/Xen/OpenVZ/LXC/Docker)、内存档位、
+#      内核可写性，NAT 小资源机自动降档；不可写的键逐键跳过，绝不硬套。
+#   3. 新增: 实测 VPS 外网上下行 + 到「本地」的 RTT (自动取 SSH 来源 IP)，
+#      按 BDP = 带宽 × RTT 推导每台机器专属参数，近距/区域/跨洋/远洋分档。
+#   4. 新增: 只写「未被 /etc/sysctl.conf 或其它 sysctl.d 占用」的键，
+#      不与 v2.5.x 的 BBR / 99-proxy-harden.conf 抢配置。
+#   5. 新增: 每次应用前自动备份 (运行时原值 + 配置文件副本 + manifest)；
+#      支持「临时试跑」(重启自动还原)、「正式应用」(带验证)、「一键回滚」。
+#   6. 兼容: 非 systemd / 精简系统自动回落到 /etc/sysctl.conf 标记块。
+#   注: 本版只新增功能，未改配置格式。旧机首次运行若提示升级，选 0 直接
+#       进菜单即可，不需要 regen_config。
+# ==============================================================
+
+SCRIPT_VERSION="v2.6.0"
+
+# ── 颜色与日志 ────────────────────────────────────────────────
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
+NC='\033[0m'
+
+log_info()    { echo -e "${GREEN}[INFO]${NC}  $*"; }
+log_warn()    { echo -e "${YELLOW}[WARN]${NC}  $*"; }
+log_error()   { echo -e "${RED}[ERROR]${NC} $*"; }
+log_success() { echo -e "${CYAN}[OK]${NC}    $*"; }
+log_step()    { echo -e "${BLUE}[STEP]${NC}  $*"; }
+log_title()   {
+    echo -e "\n${MAGENTA}══════════════════════════════════════════════${NC}"
+    echo -e "${MAGENTA}  $*${NC}"
+    echo -e "${MAGENTA}══════════════════════════════════════════════${NC}\n"
+}
+
+# ── 全局变量 ──────────────────────────────────────────────────
+XRAY_BIN="/usr/local/bin/xray"
+XRAY_ETC="/usr/local/etc/xray"
+XRAY_CONFIG="$XRAY_ETC/config.json"
+XRAY_LOG_DIR="/var/log/xray"
+
+# Xray 内核锁定版本 (v2.4.2): 新装统一走官方 zip 安装此版本, 不跟随
+# 上游 latest, 避免 breaking change 在新装时无声引入 (26.9.8 的
+# REALITY MLKEM 强制要求即为前车之鉴)。升级走主菜单 [13] 专门流程。
+XRAY_VERSION_PIN="v26.10.21"
+
+# 内核版本探测缓存 (v2.4.2): xray_kernel_version 首次探测后填充,
+# XRAY_VER_STR 为纯数字版本串 (如 26.10.21), 探测失败为空串。
+# v2.5.2: 新增 XRAY_VER_FALLBACK, 标记版本串来自锁定版兜底而非实测。
+XRAY_VER_STR=""
+XRAY_VER_CHECKED=0
+XRAY_VER_FALLBACK=0
+
+# 入站 IP 缓存有效期 (天), v2.5.2: 防止重装/换 IP 后链接长期指向旧地址。
+IP_CACHE_TTL_DAYS=7
+
+DATA_DIR="/etc/vps_manager"
+NODE_DB="$DATA_DIR/nodes.db"
+RELAY_DB="$DATA_DIR/relay.db"
+VERSION_FILE="$DATA_DIR/version"
+BACKUP_DIR="/root/vps_manager_backups"
+
+# 内层防偷端口基数 (改用冷僻高位段)
+GUARD_BASE_PORT=54321
+
+OS_TYPE=""
+PKG_MGR=""
+SVC_MGR=""
+TOTAL_MEM=0
+TOTAL_DISK=0
+PYTHON=""
+PICKED_LINE=""
+PICKED_RELAY_NUM=""
+PICKED_RELAY_LINE=""
+PARSED_PRIV=""
+PARSED_PUB=""
+
+UPGRADE_CHECKED=0
+
+# ── Hysteria2 全局变量 (v2.4.0 新增) ───────────────────────────
+HY2_BIN="/usr/local/bin/hysteria"
+HY2_ETC="/usr/local/etc/hysteria2"
+HY2_CERT_DIR="$HY2_ETC/certs"
+HY2_DB="$DATA_DIR/hy2.db"
+HY2_LOG_DIR="/var/log/hysteria2"
+HY2_VERSION_PIN="app/v2.13.0"
+PICKED_HY2_NUM=""
+PICKED_HY2_LINE=""
+
+# ==============================================================
+# 工具与基础函数
+# ==============================================================
+cmd_exists() { command -v "$1" >/dev/null 2>&1; }
+
+sanitize_db() {
+    [ -f "$NODE_DB" ] && sed -i 's/\r//g' "$NODE_DB" 2>/dev/null || true
+    [ -f "$RELAY_DB" ] && sed -i 's/\r//g' "$RELAY_DB" 2>/dev/null || true
+    [ -f "$HY2_DB" ] && sed -i 's/\r//g' "$HY2_DB" 2>/dev/null || true
+    # DB 里是密钥与密码，权限收紧到仅 root 可读写
+    chmod 600 "$NODE_DB" "$RELAY_DB" "$HY2_DB" 2>/dev/null || true
+}
+
+# 过滤 DB 分隔符 |，防止字段错乱
+sanitize_field() {
+    echo "$1" | tr -d '|' | tr -d '\r' | tr -d '\n'
+}
+
+# 比较两个版本号 (格式 vX.Y.Z，可处理 v2.3.10 > v2.3.9)
+# 返回值: 0 相等 | 1 第一个更大 | 2 第一个更小
+ver_cmp() {
+    local v1 v2
+    v1=$(echo "${1#v}" | tr -cd '0-9.')
+    v2=$(echo "${2#v}" | tr -cd '0-9.')
+    [ -z "$v1" ] && v1="0.0.0"
+    [ -z "$v2" ] && v2="0.0.0"
+    local IFS='.'
+    local -a a b
+    read -ra a <<< "$v1"
+    read -ra b <<< "$v2"
+    local i x y
+    for i in 0 1 2; do
+        x="${a[$i]:-0}"; y="${b[$i]:-0}"
+        x=$((10#$x)); y=$((10#$y))   # 10# 防止 08 被当成八进制
+        (( x > y )) && return 1
+        (( x < y )) && return 2
+    done
+    return 0
+}
+
+# 版本感知：低版本提示升级，无版本/版本相同直接进菜单
+check_version() {
+    if [ "$UPGRADE_CHECKED" = "1" ]; then return 0; fi
+    UPGRADE_CHECKED=1
+
+    local installed=""
+    [ -f "$VERSION_FILE" ] && installed=$(tr -d ' \r\n' < "$VERSION_FILE" 2>/dev/null || true)
+
+    # 无版本记录
+    if [ -z "$installed" ]; then
+        if [ -s "$NODE_DB" ] || [ -s "$RELAY_DB" ]; then
+            installed="v0.0.0"   # 有老数据但无版本文件 → 视为远古版本，走升级流程
+        else
+            echo "$SCRIPT_VERSION" > "$VERSION_FILE" 2>/dev/null || true
+            return 0             # 全新安装，直接进菜单
+        fi
+    fi
+
+    ver_cmp "$installed" "$SCRIPT_VERSION"
+    local cmp=$?
+
+    if [ "$cmp" -eq 2 ]; then
+        # ── 低版本 → 提示升级 ──
+        log_title "检测到旧版本"
+        echo -e " VPS 已安装版本: ${YELLOW}$installed${NC}"
+        echo -e " 当前脚本版本: ${GREEN}$SCRIPT_VERSION${NC}"
+        echo ""
+        echo "  1) 平滑升级 (保留节点与落地，推荐)"
+        echo "  2) 清空重装 (删除所有数据，危险)"
+        echo "  0) 暂不升级，直接进入菜单"
+        read -rp "请选择 [1/2/0]: " ch
+        case "$ch" in
+            1)
+                log_info "正在平滑升级 $installed → $SCRIPT_VERSION ..."
+                sanitize_db
+                ensure_python
+                if regen_config; then
+                    start_xray
+                    echo "$SCRIPT_VERSION" > "$VERSION_FILE" 2>/dev/null || true
+                    ensure_autostart_all
+                    log_success "升级完成！新版本已生效。"
+                else
+                    log_error "配置重新生成失败，版本未更新，下次启动会再次提示升级。"
+                    log_warn "可尝试主菜单 [9) 强制修复配置]。"
+                fi
+                sleep 2
+                ;;
+            2)
+                read -rp "警告: 将删除所有节点、落地和配置！确定吗？[y/N]: " confirm
+                if [ "${confirm:-N}" = "y" ] || [ "${confirm:-N}" = "Y" ]; then
+                    hy2_wipe_all
+                    rm -rf "${DATA_DIR:?}" "${XRAY_ETC:?}"
+                    mkdir -p "$DATA_DIR" "$BACKUP_DIR" "$XRAY_LOG_DIR" "$XRAY_ETC"
+                    touch "$NODE_DB" "$RELAY_DB"
+                    echo "$SCRIPT_VERSION" > "$VERSION_FILE" 2>/dev/null || true
+                    log_success "已清空重装，当前版本 $SCRIPT_VERSION。"
+                    sleep 1
+                else
+                    log_info "已取消清空，版本保持 $installed。"
+                fi
+                ;;
+            *)
+                log_info "已跳过升级，下次启动将再次提示。"
+                return 0
+                ;;
+        esac
+    elif [ "$cmp" -eq 1 ]; then
+        # 版本记录比脚本还新 (极端情况) → 同步记录，直接进菜单
+        log_warn "版本记录($installed)高于脚本($SCRIPT_VERSION)，已同步记录"
+        echo "$SCRIPT_VERSION" > "$VERSION_FILE" 2>/dev/null || true
+    fi
+    # cmp == 0 → 版本相同，直接进菜单，什么都不做
+    return 0
+}
+
+detect_os() {
+    # v2.4.2: 多发行版家族判定。读 ID 与 ID_LIKE 两项: 先按 ID 精确
+    # 命中, 未命中再按 ID_LIKE 归家族 (衍生发行版)。os-release 路径
+    # 可用环境变量 OS_RELEASE_FILE 覆盖 (测试用), 默认 /etc/os-release。
+    local osrel="${OS_RELEASE_FILE:-/etc/os-release}"
+    if [ ! -f "$osrel" ]; then log_error "无法识别操作系统"; exit 1; fi
+    local os_id os_like
+    os_id=$(grep -E "^ID=" "$osrel" | head -1 | cut -d= -f2 | tr -d '"' | tr -d "'" | tr '[:upper:]' '[:lower:]')
+    os_like=$(grep -E "^ID_LIKE=" "$osrel" | head -1 | cut -d= -f2 | tr -d '"' | tr -d "'" | tr '[:upper:]' '[:lower:]')
+    OS_TYPE=""; PKG_MGR=""; SVC_MGR=""
+    case "$os_id" in
+        ubuntu|debian) OS_TYPE="debian"; PKG_MGR="apt"; SVC_MGR="systemd" ;;
+        alpine)        OS_TYPE="alpine"; PKG_MGR="apk"; SVC_MGR="openrc" ;;
+        centos|rhel|rocky|almalinux|fedora|oraclelinux|ol)
+                       OS_TYPE="rhel"; PKG_MGR="dnf"; SVC_MGR="systemd" ;;
+        arch|manjaro|endeavouros|garuda|artix)
+                       OS_TYPE="arch"; PKG_MGR="pacman"; SVC_MGR="systemd" ;;
+        opensuse-leap|opensuse-tumbleweed|opensuse|sles|sled)
+                       OS_TYPE="suse"; PKG_MGR="zypper"; SVC_MGR="systemd" ;;
+    esac
+    if [ -z "$OS_TYPE" ]; then
+        case " $os_like " in
+            *" debian "*|*" ubuntu "*) OS_TYPE="debian"; PKG_MGR="apt"; SVC_MGR="systemd" ;;
+            *" rhel "*|*" fedora "*|*" centos "*) OS_TYPE="rhel"; PKG_MGR="dnf"; SVC_MGR="systemd" ;;
+            *" arch "*)   OS_TYPE="arch"; PKG_MGR="pacman"; SVC_MGR="systemd" ;;
+            *" suse "*)   OS_TYPE="suse"; PKG_MGR="zypper"; SVC_MGR="systemd" ;;
+        esac
+    fi
+    if [ -z "$OS_TYPE" ]; then log_error "不支持的发行版: '${os_id}' (ID_LIKE='${os_like}')"; exit 1; fi
+    # RHEL 系老版本 (如 CentOS 7) 没有 dnf, 回落 yum (其余不变)
+    if [ "$PKG_MGR" = "dnf" ] && ! cmd_exists dnf && cmd_exists yum; then PKG_MGR="yum"; fi
+    # 容器纠正: 家族默认 systemd, 但 systemd 实际不在位
+    # (/run/systemd/system 不存在) 且机器上有 OpenRC 时改判 openrc,
+    # 避免把容器里的伪 systemd 当真 (沿用 realm 脚本的教训);
+    # 其余情况一律不改判。
+    if [ "$SVC_MGR" = "systemd" ] && [ ! -d /run/systemd/system ] && cmd_exists rc-update; then
+        SVC_MGR="openrc"
+    fi
+}
+
+need_root() {
+    local uid
+    uid=$(id -u 2>/dev/null || echo "1")
+    if [ "$uid" -ne 0 ]; then log_error "请以 root 权限运行：sudo bash $0"; exit 1; fi
+}
+
+ensure_python() {
+    if cmd_exists python3; then PYTHON=python3; return 0; fi
+    if cmd_exists python; then PYTHON=python; return 0; fi
+    log_warn "未检测到 Python，正在安装..."
+    case "$PKG_MGR" in
+        apt)     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3 2>/dev/null || true ;;
+        apk)     apk add --no-cache -q python3 2>/dev/null || true ;;
+        dnf|yum) "$PKG_MGR" install -y -q python3 2>/dev/null || true ;;
+        pacman)  pacman -Sy --noconfirm -q python 2>/dev/null || true ;;
+        zypper)  zypper --non-interactive --quiet install python3 2>/dev/null || true ;;
+        *)       apk add --no-cache -q python3 2>/dev/null || true ;;
+    esac
+    if cmd_exists python3; then PYTHON=python3; else log_error "Python 安装失败"; PYTHON=""; fi
+}
+
+# 取"入站 IP"。与 get_ipv4 的区别: 优先用缓存, 不每次重新探测。
+# 背景: NAT VPS 的出口 IP 常常是一个池 (本次实测同一台机器两次探测
+# 分别得到 .219 和 .220), 而客户端要连的是"入站 IP"。如果每次生成
+# 链接都实时探测, 同一条节点会每次输出不同 IP, 其中只有一个能用。
+# 所以: 首次探测结果落盘复用; 检测到变化时只警告不改值;
+# 用户可用 echo '真实入站IP' > $DATA_DIR/server_ip 强制覆盖。
+#
+# v2.5.2 补充: 缓存永不过期是个陷阱 —— VPS 重装/换 IP 后, 缓存里还是
+# 旧地址, 生成出来的链接全部指向一台已经不存在的机器, 表现和"节点被封"
+# 一模一样。现在给缓存加 TTL (默认 7 天), 过期自动重探; 并且 install_xray
+# 在安装前会主动清一次缓存 (重装场景下第一次跑脚本就能拿到新 IP)。
+#
+# 注意: 本函数只允许把 IP 写到 stdout。所有诊断信息必须走 stderr,
+# 因为它被 ipv4=$(public_ip4) 捕获 —— 任何一行多余的 stdout 都会被
+# 拼进 vless:// 链接和 mihomo 的 server: 字段, 把节点彻底写坏。
+public_ip4() {
+    local cached fresh age=0 mtime now
+    if [ -s "$DATA_DIR/server_ip" ]; then
+        cached=$(tr -d ' \r\n' < "$DATA_DIR/server_ip" 2>/dev/null)
+        if printf '%s' "$cached" | grep -Eq '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'; then
+            # 缓存年龄 (天): 用文件 mtime, 兼容历史纯 IP 格式
+            mtime=$(stat -c %Y "$DATA_DIR/server_ip" 2>/dev/null \
+                 || stat -f %m "$DATA_DIR/server_ip" 2>/dev/null || echo 0)
+            now=$(date +%s)
+            [ "$mtime" -gt 0 ] 2>/dev/null && age=$(( (now - mtime) / 86400 ))
+
+            if [ "$age" -ge "$IP_CACHE_TTL_DAYS" ]; then
+                {
+                    log_warn "IP 缓存已 ${age} 天 (TTL ${IP_CACHE_TTL_DAYS} 天), 强制重新探测入站 IP。"
+                    log_warn "若这是重装过/换过 IP 的机器, 旧链接请一并作废。"
+                } >&2
+                rm -f "$DATA_DIR/server_ip" 2>/dev/null || true
+            else
+                fresh=$(get_ipv4 2>/dev/null)
+                if [ -n "$fresh" ] && [ "$fresh" != "$cached" ]; then
+                    {
+                        log_warn "出口 IP 与缓存不一致: 缓存 $cached / 本次探测 $fresh"
+                        log_warn "NAT 机器出口 IP 可能轮换, 链接统一用缓存值以保证稳定。"
+                        log_warn "若缓存值不是你的入站 IP, 用真实值覆盖:"
+                        log_warn "  echo '你的入站IP' > $DATA_DIR/server_ip"
+                        log_warn "提示: 出口 IP 轮换通常意味着这是 NAT 机器, IPv4 入站未必可用。"
+                        log_warn "      若你本来就用 IPv6 访问, 直接用 -v6 那条链接, 忽略 IPv4 那条。"
+                    } >&2
+                fi
+                printf '%s\n' "$cached"; return 0
+            fi
+        fi
+    fi
+    fresh=$(get_ipv4) || return 1
+    printf '%s\n' "$fresh" > "$DATA_DIR/server_ip" 2>/dev/null
+    printf '%s\n' "$fresh"
+}
+
+# v2.5.2: 清除 IP 缓存 (安装/重装/换 IP 后调用)
+reset_ip_cache() {
+    if [ -f "$DATA_DIR/server_ip" ]; then
+        local old
+        old=$(tr -d ' \r\n' < "$DATA_DIR/server_ip" 2>/dev/null)
+        rm -f "$DATA_DIR/server_ip" 2>/dev/null || true
+        log_info "已清除旧 IP 缓存${old:+ (原值 $old)}, 下次生成链接时重新探测。"
+    fi
+}
+
+# 兜底清洗: 即便上游有杂讯, 也只取最后一行合法 IPv4。
+# 双保险, 因为这条值直接进链接, 出错的代价是节点不可用。
+safe_ipv4() {
+    public_ip4 2>/dev/null | tr -d ' \r' | grep -E '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' | tail -1
+}
+
+get_ipv4() {
+    local ip url
+    for url in https://api4.ipify.org https://ipv4.icanhazip.com https://ifconfig.me https://api.ip.sb https://icanhazip.com; do
+        ip=$(curl -s -4 --max-time 5 "$url" 2>/dev/null | tr -d '[:space:]')
+        # 严格校验确为 IPv4，防止错误页面污染
+        if echo "$ip" | grep -Eq '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'; then
+            echo "$ip"; return 0
+        fi
+    done
+    return 1
+}
+
+get_ipv6() {
+    local ip url
+    for url in https://api6.ipify.org https://ipv6.icanhazip.com https://ifconfig.me https://icanhazip.com; do
+        ip=$(curl -s -6 --max-time 5 "$url" 2>/dev/null | tr -d '[:space:]')
+        if echo "$ip" | grep -q ':' && echo "$ip" | grep -Eq '^[0-9a-fA-F:]{2,}$'; then
+            echo "$ip"; return 0
+        fi
+    done
+    return 1
+}
+
+check_github() { curl -sI --max-time 6 https://api.github.com >/dev/null 2>&1; return $?; }
+
+gh_download() {
+    if check_github; then curl -fL --retry 3 --progress-bar -o "$2" "$1"
+    else curl -fL --retry 3 --progress-bar -o "$2" "https://ghp.ci/$1"; fi
+}
+
+parse_xray_keys() {
+    PARSED_PRIV=$(echo "$1" | grep -i "^private" | awk '{print $NF}' | tr -d ' \r\n')
+    PARSED_PUB=$(echo "$1"  | grep -iE "(^public|publickey)" | awk '{print $NF}' | tr -d ' \r\n')
+    if [ -z "$PARSED_PRIV" ] || [ -z "$PARSED_PUB" ]; then return 1; fi
+    return 0
+}
+
+derive_pub() { "$XRAY_BIN" x25519 -i "$1" 2>&1 | grep -iE "(^public|publickey)" | awk '{print $NF}' | tr -d ' \r\n'; }
+
+gen_uuid() {
+    if cmd_exists uuidgen; then uuidgen | tr '[:upper:]' '[:lower:]'
+    else od -x /dev/urandom | head -1 | awk '{OFS="-"; print $2$3,$4,$5,$6,$7$8$9}' | tr '[:upper:]' '[:lower:]'; fi
+}
+
+enable_bbr() {
+    # 先尝试加载 tcp_bbr 内核模块 (精简版系统默认可能未挂载)
+    if cmd_exists modprobe; then
+        modprobe tcp_bbr 2>/dev/null || true
+    fi
+    # 检测内核是否真正支持 BBR，避免 sysctl -p 静默失败
+    if ! sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
+        log_warn "当前内核不支持 BBR，跳过开启 (可用: $(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || echo '未知'))"
+        return 0
+    fi
+    touch /etc/sysctl.conf 2>/dev/null || true
+    grep -q "net.core.default_qdisc=fq" /etc/sysctl.conf || echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
+    grep -q "net.ipv4.tcp_congestion_control=bbr" /etc/sysctl.conf || echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
+    sysctl -p >/dev/null 2>&1 || sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1 || true
+    # 真实验收
+    if sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -qw bbr; then
+        log_success "BBR 已成功开启"
+    else
+        log_warn "BBR 开启失败，当前算法: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo '未知')"
+    fi
+}
+
+# 检查外层端口是否已被其他节点占用 (排除指定 UUID)
+port_in_use() {
+    local check_port="$1" exclude_uuid="${2:-}"
+    if [ -z "$exclude_uuid" ]; then
+        awk -F'|' -v p="$check_port" '!/^#/ && NF>=7 && $2==p {exit 0} END{exit 1}' "$NODE_DB" 2>/dev/null
+    else
+        awk -F'|' -v p="$check_port" -v u="$exclude_uuid" '!/^#/ && NF>=7 && $2==p && $1!=u {exit 0} END{exit 1}' "$NODE_DB" 2>/dev/null
+    fi
+}
+
+# 按物理行号替换文件中的某一行 (避免 awk -v 转义问题)
+replace_line_by_num() {
+    local file="$1" num="$2" newline="$3"
+    local tmp
+    tmp=$(mktemp)
+    {
+        head -n $((num - 1)) "$file" 2>/dev/null
+        printf '%s\n' "$newline"
+        tail -n +"$((num + 1))" "$file" 2>/dev/null
+    } > "$tmp" && mv "$tmp" "$file"
+}
+
+# 按物理行号删除文件中的某一行
+delete_line_by_num() {
+    local file="$1" num="$2"
+    local tmp
+    tmp=$(mktemp)
+    awk -v nr="$num" 'NR!=nr' "$file" > "$tmp" && mv "$tmp" "$file"
+}
+
+# ==============================================================
+# Xray 内核版本感知 (v2.4.2 新增)
+# 背景: xray >= 26.9.8 的 REALITY 服务端按 ClientHello 判定,
+# 必须含 X25519MLKEM768 key share 且排在 X25519 之前, 否则静默
+# 回落 dest; minClientVer 对此无效, 服务端也没有放宽开关。
+# 链接里的 MLKEM 提示参数因此必须按本机内核版本决定, 不能无条件加
+# (< 26.9.8 两者都收, 2025-05 之前的远古服务端会拒绝 MLKEM)。
+# ==============================================================
+# 探测本机内核版本, 结果写入全局 XRAY_VER_STR (如 "26.10.21"),
+# 探测失败为空串。首次探测后缓存, 后续调用不重复执行二进制;
+# 更换二进制后须把 XRAY_VER_CHECKED 复位为 0 再重新探测。
+xray_kernel_version() {
+    if [ "$XRAY_VER_CHECKED" = "1" ]; then return 0; fi
+    XRAY_VER_CHECKED=1
+    XRAY_VER_STR=""
+    XRAY_VER_FALLBACK=0
+    if [ -x "$XRAY_BIN" ]; then
+        local out flag
+        # v2.5.2: Xray 各版本对 version 子命令/标志的支持不一致, 逐个试,
+        # 并且不能把 stderr 丢掉 (某些构建把版本行写 stderr)。
+        for flag in version -version --version; do
+            out=$("$XRAY_BIN" "$flag" 2>&1 | head -5)
+            # 输出形如: Xray 26.10.21 (Xray, Penetrates Everything.) ...
+            XRAY_VER_STR=$(echo "$out" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+            [ -n "$XRAY_VER_STR" ] && break
+        done
+        # v2.5.2: 二进制在但版本读不出来时, 用锁定版本兜底。
+        # 否则 xray_needs_mlkem 会误判成"老内核"而不给链接加 MLKEM 参数,
+        # 客户端连新内核服务端必然 REALITY 认证失败 (v2.5.1 的真实事故)。
+        if [ -z "$XRAY_VER_STR" ]; then
+            XRAY_VER_STR="${XRAY_VERSION_PIN#v}"
+            XRAY_VER_FALLBACK=1
+        fi
+    fi
+    return 0
+}
+
+# 内核版本是否 >= 目标版本 ($1 为 x.y.z); 探测不到版本返回 1
+xray_kernel_ge() {
+    xray_kernel_version
+    [ -z "$XRAY_VER_STR" ] && return 1
+    ver_cmp "v$XRAY_VER_STR" "v$1"
+    local c=$?
+    [ "$c" -eq 0 ] || [ "$c" -eq 1 ]
+}
+
+# 内核是否强制要求客户端发送 X25519MLKEM768 (>= 26.9.8)
+xray_needs_mlkem() {
+    xray_kernel_ge "26.9.8"
+}
+
+# 指纹兼容警告: 内核 >= 26.9.8 且指纹不是 chrome 时调用。
+# 只警告不拦截 (老服务端场景下非 chrome 指纹仍然合法)。
+warn_fp_mlkem() {
+    local fp="$1"
+    [ "$fp" = "chrome" ] && return 0
+    xray_needs_mlkem || return 0
+    log_warn "注意: 本机 Xray 内核为 ${XRAY_VER_STR}, >= 26.9.8 的 REALITY 要求客户端在 ClientHello 里发送 X25519MLKEM768, 而只有 chrome 指纹能发出该 key share。"
+    log_warn "当前指纹 '${fp}': 用 mihomo/Clash 连此节点将握手失败 (静默回落, 极像被风控); sing-box / Shadowrocket 未更新到支持 MLKEM 的版本也连不上。"
+    log_warn "强烈建议把指纹改回 chrome。服务端本身不受影响, 只是这类客户端连不上。"
+}
+
+# ==============================================================
+# SNI 风险库与实测校验 (v2.5.0 新增)
+# 背景: Xray 26.x 在 -test 时会警告某些目标站"会提高 IP 被 GFW
+# 封锁的概率"——这些是墙内用户用烂的域名, 已被重点观察。光靠
+# 内核警告不够, 还要实测目标站是否真满足 REALITY 的回落前提:
+# TLS 1.3 + ALPN h2 + 从本机 443 可达。任一项不过, 回落就会露馅,
+# 探测方看到的是"无响应"或"无 ALPN", 等于主动暴露。
+# ==============================================================
+SNI_RISK_LIST="apple.com www.apple.com icloud.com www.icloud.com
+microsoft.com www.microsoft.com bing.com www.bing.com
+adobe.com www.adobe.com amazon.com www.amazon.com aws.amazon.com
+cloudflare.com www.cloudflare.com google.com www.google.com
+www.youtube.com www.yahoo.com yahoo.com www.baidu.com
+qq.com www.qq.com taobao.com www.taobao.com weixin.qq.com"
+
+sni_is_risky() {
+    local s="$1" d
+    for d in $SNI_RISK_LIST; do
+        [ "$s" = "$d" ] && return 0
+    done
+    return 1
+}
+
+# 实测一个 SNI 是否满足 REALITY 回落前提。
+# 结果同时回填 SNI_PROBE_IP / SNI_PROBE_V6 / SNI_TLS / SNI_H2 /
+# SNI_REACH / SNI_PROBE_MSG, 便于调用方展示细项。
+SNI_PROBE_IP=""; SNI_PROBE_V6=""; SNI_PROBE_MSG=""; SNI_PROBE_DIAG=""
+SNI_TLS="否"; SNI_H2="否"; SNI_REACH="否"
+
+# v2.5.3: 跑一次握手, 保留 stderr。原来 2>/dev/null 把 alert / errno /
+# unknown option 全丢了, 失败时只剩一句误导性的"不支持 TLS 1.3"。
+_sni_handshake() {
+    echo | timeout 12 openssl s_client -connect "$2" -servername "$1" \
+        -tls1_3 -alpn h2 2>&1 | tr -d '\000'
+}
+
+sni_probe() {
+    local s="$1"
+    SNI_PROBE_IP=""; SNI_PROBE_V6=""; SNI_PROBE_MSG=""; SNI_PROBE_DIAG=""
+    SNI_TLS="否"; SNI_H2="否"; SNI_REACH="否"
+
+    # 与 [14] 自动预检共用同一个解析器, 不再让 openssl 自己二次解析域名。
+    # 回落出站本来就是 UseIPv4, 显式连 IP 才是真正要验的那条链路。
+    SNI_PROBE_IP=$(_sni_resolve "$s" 4)
+    SNI_PROBE_V6=$(_sni_resolve "$s" 6)
+    if [ -z "$SNI_PROBE_IP" ] && [ -z "$SNI_PROBE_V6" ]; then
+        SNI_PROBE_MSG="域名解析失败 (本机 DNS 解析不出 A/AAAA)"
+        return 1
+    fi
+
+    local target out
+    if [ -n "$SNI_PROBE_IP" ]; then
+        target="${SNI_PROBE_IP}:443"
+    else
+        target="[${SNI_PROBE_V6}]:443"
+    fi
+
+    out=$(_sni_handshake "$s" "$target")
+    # 只在「连握手摘要都没有」时重试一次, 挡掉 CDN 首包抖动 / 偶发 RST。
+    # 不能只认 Protocol 行: OpenSSL 3.0 的 s_client 在 stdin 立即 EOF 时
+    # 可能只打印 "New, TLSv1.3, Cipher is ..." 而不打印 SSL-Session 段。
+    if ! printf '%s' "$out" | grep -qiE 'New, TLSv1\.[23], Cipher is|Protocol *: *TLSv1\.[23]'; then
+        out=$(_sni_handshake "$s" "$target")
+    fi
+
+    SNI_PROBE_DIAG=$(printf '%s\n' "$out" | grep -iE \
+        'unknown option|illegal option|alert |errno|no peer certificate|timed out|CONNECTED|Protocol *:|New, TLSv|ALPN|SSL handshake|verify error|refused|unreachable' \
+        | head -8 | sed 's/^/         /')
+
+    # ---- 按真实原因分类, 不再把所有失败都叫「不支持 TLS 1.3」 ----
+    # 教训 (v2.5.3 首版真实事故): 不能用宽泛的 "not supported" 判 openssl
+    # 参数错误 —— 正常握手里的 "Secure Renegotiation IS NOT supported"
+    # 会被 -i 命中, 把一次完全成功的 TLS1.3+h2 握手误报成「openssl 过老」。
+    if printf '%s' "$out" | grep -qiE 'unknown option|illegal option|not an option|Usage: s_client|s_client: Error|option.*not recognized'; then
+        SNI_PROBE_MSG="本机 openssl 不认 -tls1_3 参数 (版本过老或非 OpenSSL 实现)"
+        SNI_PROBE_DIAG="${SNI_PROBE_DIAG}
+         本机 openssl: $(openssl version 2>&1 | head -1)"
+        return 1
+    fi
+    if [ -z "$out" ]; then
+        SNI_PROBE_MSG="从本机连不上 443 / openssl 无输出 (回落会超时, 探测方看到无响应)"
+        return 1
+    fi
+    SNI_REACH="是"
+    if printf '%s' "$out" | grep -qiE 'alert protocol version|no protocols available|unsupported protocol'; then
+        SNI_PROBE_MSG="目标站明确拒绝了 TLS1.3 握手"
+        return 1
+    fi
+    if printf '%s' "$out" | grep -qiE 'New, TLSv1\.2|Protocol *: *TLSv1\.2'; then
+        SNI_PROBE_MSG="目标站只协商到 TLS 1.2 (确实不支持 TLS1.3)"
+        return 1
+    fi
+    if printf '%s' "$out" | grep -qiE 'errno=|no peer certificate|timed out|Connection refused|Network is unreachable|socket:'; then
+        SNI_PROBE_MSG="TCP/443 握手未完成 (超时/被拒/被 RST) —— 不是不支持 TLS1.3"
+        return 1
+    fi
+
+    # TLS1.3 判定: "New, TLSv1.3, Cipher is" 跨 OpenSSL 版本都存在,
+    # Protocol 行作为兜底 (3.0 某些构建/EOF 提前退出时可能不打印)。
+    printf '%s' "$out" | grep -qiE 'New, TLSv1\.3, Cipher is|Protocol *: *TLSv1\.3' && SNI_TLS="是"
+    printf '%s' "$out" | grep -q  'ALPN protocol: h2'                              && SNI_H2="是"
+
+    if [ "$SNI_TLS" != "是" ]; then
+        SNI_PROBE_MSG="TLS 握手未产出 TLS1.3 结果 (原因见下方 openssl 原文)"
+        return 1
+    fi
+    if [ "$SNI_H2" != "是" ]; then
+        SNI_PROBE_MSG="不支持 ALPN h2 (REALITY 要求目标站必须支持 h2)"
+        return 1
+    fi
+    SNI_PROBE_MSG="TLS1.3 + h2 + 可达"
+    return 0
+}
+
+# 添加/修改节点时的 SNI 校验入口。返回 0 放行, 1 拒绝。
+sni_validate() {
+    local s="$1"
+    if sni_is_risky "$s"; then
+        log_error "SNI '$s' 在风险库中。"
+        log_warn  "风险库收录的是墙内用户过度使用的目标站 (apple.com 等已被 Xray 内核"
+        log_warn  "点名警告会提高 IP 被封锁概率)。被大量用户共用的 SNI 等于共用一份"
+        log_warn  "观察名单, 建议换一个。"
+        log_warn  "批量挑域名: 主菜单 [14] SNI 评测。"
+        return 1
+    fi
+
+    log_step "实测 SNI '$s' 是否满足 REALITY 回落前提..."
+    if sni_probe "$s"; then
+        log_success "SNI 合格: $SNI_PROBE_MSG"
+        echo "    A记录: ${SNI_PROBE_IP:-无}    AAAA: ${SNI_PROBE_V6:-无}"
+        if [ -z "$SNI_PROBE_IP" ]; then
+            log_warn "该域名没有 A 记录, 回落只能走 IPv6。已为回落单独配置 UseIPv4 出站,"
+            log_warn "但仍需本机 IPv6 出口可用, 否则回落依旧会失败。"
+        fi
+        return 0
+    fi
+
+    log_error "SNI '$s' 不合格: $SNI_PROBE_MSG"
+    if [ -n "$SNI_PROBE_DIAG" ]; then
+        echo -e "  ${YELLOW}openssl 原文（判定依据）:${NC}"
+        printf '%s\n' "$SNI_PROBE_DIAG"
+    fi
+    echo "   实测目标: ${SNI_PROBE_IP:-${SNI_PROBE_V6:-未解析}}:443   SNI=$s"
+    echo "   自查命令: echo | openssl s_client -connect '${SNI_PROBE_IP:-IP}:443' -servername '$s' -tls1_3 -alpn h2 2>&1 | grep -E 'Protocol|ALPN|alert|errno|unknown'"
+    log_warn  "回落站不合格时, 防火墙探测会看到异常响应, 等于主动暴露这台机器。"
+    log_warn  "若报的是「连不上 / 握手未完成」, 那是本机出站 443 或 DNS 的问题, 换域名没用。"
+    log_warn  "可输入 auto 走 [14] 自动预检 (同样显式连 IPv4), 或先跑上面那条自查命令。"
+    local force
+    read -rp "仍要强制使用这个域名吗? [y/N]: " force
+    case "${force:-N}" in
+        y|Y) log_warn "已强制使用风险 SNI, 后果自负"; return 0 ;;
+        *)   return 1 ;;
+    esac
+}
+
+# ==============================================================
+# SNI 候选池 + 自动预检排名 (v2.5.1)
+# 设计目标: 不再需要人工一个个试。跑一次给出排名 + 推荐, 选定后
+# 记住, 之后添加节点直接回车就用。
+#
+# 判定只认 IPv4 —— 回落出站固定 UseIPv4, IPv6 通不通不影响回落能否
+# 成功, v6 仅作参考列展示 (很多站只有 A 记录, 强求双栈没有意义)。
+# ==============================================================
+SNI_CANDIDATES="www.gentoo.org www.perl.org www.apache.org www.elastic.co www.ruby-lang.org www.rust-lang.org www.kernel.org www.mozilla.org www.python.org www.spotify.com"
+SNI_PICKED=""
+SNI_CHOSEN_FILE="$DATA_DIR/sni_chosen"
+
+# 当前毫秒时间戳 (兼容没有 %N 的 busybox date)
+_now_ms() {
+    local n
+    n=$(date +%s%N 2>/dev/null)
+    case "$n" in
+        *N|"") date +%s | awk '{printf "%d", $1*1000}' ;;
+        *)     printf '%d' $(( n / 1000000 )) ;;
+    esac
+}
+
+# 解析域名到指定地址族。优先 getent(glibc), 退回 dig(精简系统/非 glibc)
+# IPv6 必须过滤 ::ffff: —— glibc 在无 AAAA 时会返回 IPv4-mapped,
+# 不过滤会把一次 IPv4 探测误判成 IPv6 可用。
+_sni_resolve() {
+    local d="$1" fam="$2" v=""
+    if [ "$fam" = "4" ]; then
+        v=$(getent ahostsv4 "$d" 2>/dev/null | awk '$2=="STREAM"{print $1; exit}')
+        if [ -z "$v" ] && cmd_exists dig; then
+            v=$(dig +short A "$d" 2>/dev/null | grep -E '^[0-9]+\.' | head -1)
+        fi
+    else
+        v=$(getent ahostsv6 "$d" 2>/dev/null | awk '$2=="STREAM"{print $1; exit}' | grep -v '^::ffff:')
+        if [ -z "$v" ] && cmd_exists dig; then
+            v=$(dig +short AAAA "$d" 2>/dev/null | grep -E ':' | head -1)
+        fi
+    fi
+    printf '%s' "$v"
+}
+
+# 对单个地址做 REALITY 回落前提探测。输出: OK|毫秒 / NOH2|毫秒 / FAIL|毫秒
+_sni_probe_ip() {
+    local ip="$1" s="$2" target out t0 t1 ms t=0 a=0
+    [ -z "$ip" ] && { printf 'FAIL|0'; return; }
+    case "$ip" in
+        *:*) target="[$ip]:443" ;;
+        *)   target="$ip:443" ;;
+    esac
+    t0=$(_now_ms)
+    out=$(echo | timeout 6 openssl s_client -connect "$target" -servername "$s" \
+            -tls1_3 -alpn h2 2>/dev/null | tr -d '\000')
+    t1=$(_now_ms)
+    ms=$(( t1 - t0 ))
+    printf '%s' "$out" | grep -q 'Protocol *: *TLSv1\.3' && t=1
+    printf '%s' "$out" | grep -q 'ALPN protocol: h2'     && a=1
+    if [ "$t" = 1 ] && [ "$a" = 1 ]; then printf 'OK|%s' "$ms"
+    elif [ "$t" = 1 ]; then printf 'NOH2|%s' "$ms"
+    else printf 'FAIL|%s' "$ms"; fi
+}
+
+# 单次测量噪声不小 (进程启动 + 路由抖动), IPv4 侧测两次取快的,
+# 避免排名被一次偶发慢握手带偏。v6 只作参考, 测一次即可。
+_sni_probe_best() {
+    local ip="$1" s="$2" r1 r2 s1 s2
+    r1=$(_sni_probe_ip "$ip" "$s")
+    r2=$(_sni_probe_ip "$ip" "$s")
+    s1="${r1%%|*}"; s2="${r2%%|*}"
+    if [ "$s1" = "OK" ] && [ "$s2" = "OK" ]; then
+        if [ "${r2##*|}" -lt "${r1##*|}" ]; then printf '%s' "$r2"; else printf '%s' "$r1"; fi
+        return
+    fi
+    [ "$s1" = "OK" ] && { printf '%s' "$r1"; return; }
+    [ "$s2" = "OK" ] && { printf '%s' "$r2"; return; }
+    [ "$s1" = "NOH2" ] && { printf '%s' "$r1"; return; }
+    [ "$s2" = "NOH2" ] && { printf '%s' "$r2"; return; }
+    printf '%s' "${r1:-FAIL|0}"
+}
+
+# 批量预检候选池, 结果按 IPv4 握手耗时升序存入 SNI_SCAN
+# 每行: 排序键|域名|v4状态|v4毫秒|v6状态|v6毫秒|地址
+SNI_SCAN=""
+sni_scan() {
+    local list="${1:-$SNI_CANDIDATES}" d ip4 ip6 r4 r6 v4 ms4 v6 ms6 key total n=0
+    SNI_SCAN=""
+    total=$(printf '%s\n' $list | wc -l | tr -d ' ')
+    for d in $list; do
+        n=$((n + 1))
+        printf '\r  [%s/%s] 探测 %-28s' "$n" "$total" "$d"
+        if sni_is_risky "$d"; then continue; fi
+        ip4=$(_sni_resolve "$d" 4)
+        ip6=$(_sni_resolve "$d" 6)
+        if [ -z "$ip4" ]; then
+            v4="NONE"; ms4=0
+        else
+            r4=$(_sni_probe_best "$ip4" "$d"); v4="${r4%%|*}"; ms4="${r4##*|}"
+        fi
+        if [ -z "$ip6" ]; then
+            v6="NONE"; ms6=0
+        else
+            r6=$(_sni_probe_ip "$ip6" "$d"); v6="${r6%%|*}"; ms6="${r6##*|}"
+        fi
+        if [ "$v4" = "OK" ]; then
+            key="$ms4"
+        elif [ "$v6" = "OK" ]; then
+            key=$(( ms6 + 5000 ))   # v4 不通的排在所有 v4 可用之后
+        else
+            continue
+        fi
+        SNI_SCAN="${SNI_SCAN}${key}|${d}|${v4}|${ms4}|${v6}|${ms6}|${ip4:-$ip6}"$'\n'
+    done
+    printf '\r%*s\r' 64 ''
+    SNI_SCAN=$(printf '%s' "$SNI_SCAN" | sort -t'|' -k1,1n)
+}
+
+# 批量预检 -> 排名 -> 推荐 -> 选定并记住
+sni_pick_menu() {
+    log_title "SNI 伪装域名预检 (自动排名)"
+    echo "  判定: REALITY 回落要求目标站同时支持 TLS1.3 与 ALPN h2。"
+    echo "        任一项不满足, 探测方拿到的响应与真实站点不一致, 等于自曝。"
+    echo "  排序: 按 IPv4 握手耗时升序。回落出站固定 UseIPv4, 故只认 v4 结果,"
+    echo "        v6 列仅供参考 (站点只有 A 记录时显示为空属正常)。"
+    echo ""
+
+    sni_scan "${1:-$SNI_CANDIDATES}"
+
+    if [ -z "$SNI_SCAN" ]; then
+        log_warn "候选全部不合格, 没有可用域名。"
+        log_warn "可能原因: 本机出网受限, 或该地区到候选站的路由异常。"
+        log_warn "可手工指定候选再测: 主菜单 [14] 之外直接跑 [1] 添加节点手打域名。"
+        return 1
+    fi
+
+    echo ""
+    printf "  %-4s %-24s %-17s %-10s %-10s %s\n" "排名" "域名" "IPv4" "v4握手" "v6握手" "结论"
+    echo "  -------------------------------------------------------------------------------"
+    local i=0 key d v4 ms4 v6 ms6 ip best="" v4p v6p c4 c6 note
+    while IFS='|' read -r key d v4 ms4 v6 ms6 ip; do
+        [ -z "$d" ] && continue
+        i=$((i + 1))
+        [ -z "$best" ] && best="$d"
+        # 先把纯文本补齐到固定宽度, 再整体套色。
+        # 不能写成 %-10b + 内嵌颜色: printf 会把 ANSI 转义字节算进宽度,
+        # 导致列错位 (实际表现是 "OK 56ms 失败" 挤在一起)。
+        case "$v4" in
+            OK)    v4p="OK ${ms4}ms"; c4="$GREEN" ;;
+            NOH2)  v4p="无h2";        c4="$YELLOW" ;;
+            NONE)  v4p="无A记录";      c4="$YELLOW" ;;
+            *)     v4p="失败";         c4="$RED" ;;
+        esac
+        case "$v6" in
+            OK)    v6p="OK ${ms6}ms"; c6="$GREEN" ;;
+            NOH2)  v6p="无h2";        c6="$YELLOW" ;;
+            NONE)  v6p="—";           c6="$YELLOW" ;;
+            *)     v6p="失败";         c6="$RED" ;;
+        esac
+        v4p=$(printf '%-9s' "$v4p")
+        v6p=$(printf '%-9s' "$v6p")
+        note=""
+        [ "$i" -eq 1 ] && note="${CYAN}← 最优${NC}"
+        printf "  %-4s %-24s %-17s %b%s%b %b%s%b %b\n" \
+            "$i" "$d" "${ip:0:16}" "$c4" "$v4p" "$NC" "$c6" "$v6p" "$NC" "$note"
+    done <<< "$SNI_SCAN"
+
+    echo ""
+    log_success "最优: $best  (TLS1.3 + h2 全绿, 握手最快)"
+    # 榜首榜尾差距过小时, 排名完全是噪声 —— 必须明确说出来,
+    # 否则用户会照着第 1 名去选, 以为占了便宜, 其实毫无区别。
+    local first_ms last_ms spread
+    first_ms=$(printf '%s' "$SNI_SCAN" | head -1 | cut -d'|' -f1)
+    last_ms=$(printf '%s' "$SNI_SCAN" | tail -1 | cut -d'|' -f1)
+    spread=$(( ${last_ms:-0} - ${first_ms:-0} ))
+    if [ "$spread" -lt 30 ]; then
+        echo -e "  ${YELLOW}但这次排名不可信${NC}: 榜首到榜尾只差 ${spread}ms, 全部落在测量噪声里。"
+        echo "        说明这些站从本机过去都走同一个 CDN 节点, 快慢没区别。"
+        echo "        这种情况请按「哪台机器还没用过这个域名」来选, 不要按名次。"
+    else
+        echo -e "  ${YELLOW}注${NC}: 相邻名次差 50ms 以内基本是测量噪声, 不必较真;"
+        echo "      断崖式差距 (比如 3 倍以上) 才是真实差异, 那种要优先。"
+    fi
+    echo ""
+    echo -e "  ${YELLOW}注意${NC}: 同一个 SNI 不要用在多台服务器上。选定后请记入你的分配表,"
+    echo "        其他机器从这份榜单里挑别的名次, 不要都用第 1 名。"
+    echo ""
+    echo -e "  ${YELLOW}必做${NC}: 本预检只能证明「这台服务器能回落」, 证明不了「大陆能连」。"
+    echo "        SNI 若在大陆被墙, 发出去就被 RST, 服务器侧再合格也没用。"
+    echo "        选定后在本地(不走代理)验一次, 返回 2 才算真过:"
+    echo "          curl -sS -o /dev/null -w '%{http_version}\\n' --noproxy '*' https://${best}"
+    echo ""
+
+    local sel
+    read -rp "采用第几个? [回车=1, 0=只看不选]: " sel
+    sel=$(echo "${sel:-1}" | tr -d ' ')
+    [ "$sel" = "0" ] && { log_warn "未选定。"; return 1; }
+    case "$sel" in ''|*[!0-9]*) log_error "序号必须是数字"; return 1 ;; esac
+    if [ "$sel" -lt 1 ] || [ "$sel" -gt "$i" ]; then log_error "序号超出范围 (1-$i)"; return 1; fi
+
+    SNI_PICKED=$(printf '%s' "$SNI_SCAN" | sed -n "${sel}p" | cut -d'|' -f2)
+    [ -z "$SNI_PICKED" ] && { log_error "取值失败"; return 1; }
+
+    printf '%s\n' "$SNI_PICKED" > "$SNI_CHOSEN_FILE" 2>/dev/null || true
+    log_success "已选用: $SNI_PICKED"
+    echo "  已记入 $SNI_CHOSEN_FILE"
+    echo "  之后 [1] 添加节点 / [2] 修改节点 直接回车或输入 auto 就用这个域名。"
+    return 0
+}
+
+# ==============================================================
+# 内核加固 (v2.5.0 新增)
+# conntrack 默认 8192, 被扫一轮或并发一高就打满丢包, 现象是
+# "突然全断几分钟又自己好了", 极容易被误判成被墙。
+# 不动拥塞控制算法, 用户自己装的 BBRv3 内核保持原样。
+# ==============================================================
+harden_sysctl() {
+    log_step "应用内核加固..."
+    modprobe nf_conntrack 2>/dev/null || true
+
+    local conf tmp
+    if [ -d /etc/sysctl.d ]; then conf=/etc/sysctl.d/99-proxy-harden.conf
+    else conf=/etc/sysctl.conf; fi
+
+    tmp=$(mktemp)
+    cat > "$tmp" <<'HARDEOF'
+# vps_manager v2.5.0 内核加固
+# 回滚: 删除本文件后执行 sysctl --system
+# conntrack 上限 (默认 8192 太小, 打满即丢包)
+net.netfilter.nf_conntrack_max = 65536
+# 出站临时端口 (默认 32768-60999 只有 28k 个)
+net.ipv4.ip_local_port_range = 10240 65535
+# 握手队列
+net.core.somaxconn = 8192
+net.ipv4.tcp_max_syn_backlog = 8192
+# SYN 洪水保护
+net.ipv4.tcp_syncookies = 1
+# 客户端与服务端同时启用 TFO
+net.ipv4.tcp_fastopen = 3
+HARDEOF
+
+    if [ "$conf" = "/etc/sysctl.conf" ]; then
+        # openrc 系没有 sysctl.d, 逐条追加, 已存在同 key 则跳过
+        local line k
+        while IFS= read -r line; do
+            case "$line" in ''|'#'*) continue ;; esac
+            k=$(echo "$line" | cut -d= -f1 | tr -d ' ')
+            [ -z "$k" ] && continue
+            grep -qE "^[[:space:]]*${k//./\\.}[[:space:]]*=" /etc/sysctl.conf 2>/dev/null || echo "$line" >> /etc/sysctl.conf
+        done < "$tmp"
+        rm -f "$tmp"
+        sysctl -p /etc/sysctl.conf >/dev/null 2>&1 || true
+    else
+        mv "$tmp" "$conf"
+        sysctl -p "$conf" >/dev/null 2>&1 || sysctl --system >/dev/null 2>&1 || true
+    fi
+
+    local cc pr
+    cc=$(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null || echo "n/a")
+    pr=$(sysctl -n net.ipv4.ip_local_port_range 2>/dev/null || echo "n/a")
+    if [ "$cc" = "n/a" ]; then
+        log_warn "conntrack 参数不可写 (内核未加载 nf_conntrack?), 其余项已应用"
+    else
+        log_success "内核加固已生效: conntrack_max=$cc  出站端口=$pr"
+    fi
+}
+
+# ==============================================================
+# 探测统计与日志级别 (v2.5.0 新增)
+# ==============================================================
+set_loglevel() {
+    local want="$1"
+    mkdir -p "$DATA_DIR" 2>/dev/null || true
+    echo "$want" > "$DATA_DIR/loglevel" 2>/dev/null || true
+    if regen_config; then
+        start_xray
+        log_success "loglevel 已设为 $want 并重启 Xray"
+    else
+        log_error "配置重新生成失败"
+    fi
+}
+
+probe_stats() {
+    log_title "探测统计与日志级别"
+    local lv="warning"
+    [ -f "$DATA_DIR/loglevel" ] && lv=$(tr -d ' \r\n' < "$DATA_DIR/loglevel")
+    echo "  当前 loglevel: ${lv}  (配置文件: $DATA_DIR/loglevel)"
+    echo ""
+
+    local logf="$XRAY_LOG_DIR/error.log"
+    if [ -f "$logf" ]; then
+        local total today
+        total=$(grep -c 'REALITY: processed invalid connection' "$logf" 2>/dev/null || true)
+        today=$(grep 'REALITY: processed invalid connection' "$logf" 2>/dev/null | grep -c "$(date +%Y/%m/%d)" 2>/dev/null || true)
+        echo "  REALITY 非法握手累计: ${total:-0}"
+        echo "  今日:                 ${today:-0}"
+        if [ "${total:-0}" = "0" ]; then
+            echo ""
+            log_warn "累计为 0 通常不是没人探测, 而是 loglevel=warning 把该条日志过滤了。"
+            log_warn "想真实观测 GFW 探测频率, 临时切到 info 观察 24h 再切回 warning。"
+        elif [ "${today:-0}" -gt 20 ]; then
+            echo ""
+            log_warn "今日非法握手 ${today} 次, 说明这台机器正在被主动探测。"
+            log_warn "此时应检查 SNI 是否在风险库、回落是否正常, 并考虑换 IP。"
+        fi
+        echo ""
+        echo "  最近 5 条相关日志:"
+        grep -iE "reality|invalid|rejected" "$logf" 2>/dev/null | tail -5 | cut -c1-150 | sed 's/^/    /'
+    else
+        log_warn "日志不存在: $logf"
+    fi
+
+    echo ""
+    echo "  1) 切到 info (临时观测, 日志量会涨)"
+    echo "  2) 切回 warning (推荐长期)"
+    echo "  0) 返回"
+    local c
+    read -rp "选择: " c
+    case "$c" in
+        1) set_loglevel info ;;
+        2) set_loglevel warning ;;
+        *) return ;;
+    esac
+}
+
+# xray 官方 zip 的架构映射, 不支持的架构返回 1
+xray_arch() {
+    local machine
+    machine=$(uname -m)
+    case "$machine" in
+        x86_64)        echo "64" ;;
+        aarch64|arm64) echo "arm64-v8a" ;;
+        armv7l)        echo "arm32-v7a" ;;
+        *)             return 1 ;;
+    esac
+}
+
+# 下载并解压指定版本 xray 官方 zip 到目标目录:
+# 成功后 $2/unzipped/ 内含 xray 二进制与 .dat 文件; 失败返回 1。
+xray_fetch_zip() {
+    local ver="$1" dest="$2"
+    local arch
+    arch=$(xray_arch) || { log_error "不支持的架构: $(uname -m)"; return 1; }
+    if ! gh_download "https://github.com/XTLS/Xray-core/releases/download/${ver}/Xray-linux-${arch}.zip" "$dest/xray.zip"; then
+        return 1
+    fi
+    if ! unzip -q -o "$dest/xray.zip" -d "$dest/unzipped" 2>/dev/null; then
+        return 1
+    fi
+    [ -f "$dest/unzipped/xray" ] || return 1
+    return 0
+}
+
+# ==============================================================
+# 核心组件安装
+# ==============================================================
+system_init() {
+    log_step "系统初始化..."
+    case "$PKG_MGR" in
+        apt)
+            DEBIAN_FRONTEND=noninteractive apt-get update -qq 2>/dev/null || true
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl wget unzip openssl coreutils iproute2 net-tools iptables nftables python3 2>/dev/null || true
+            ;;
+        apk)
+            apk update -q 2>/dev/null || true
+            apk add --no-cache -q bash curl wget unzip openssl coreutils iproute2 iptables ip6tables nftables python3 2>/dev/null || true
+            ;;
+        dnf|yum)
+            "$PKG_MGR" install -y -q curl wget unzip openssl coreutils iproute net-tools iptables nftables python3 2>/dev/null || true
+            ;;
+        pacman)
+            pacman -Sy --noconfirm -q curl wget unzip openssl coreutils iproute2 net-tools iptables nftables python 2>/dev/null || true
+            ;;
+        zypper)
+            zypper --non-interactive --quiet install curl wget unzip openssl coreutils iproute2 net-tools iptables nftables python3 2>/dev/null || true
+            ;;
+        *)
+            log_warn "未知包管理器 '${PKG_MGR}', 跳过依赖安装, 请手动确认 curl/wget/unzip/openssl/python3 已就位"
+            ;;
+    esac
+    enable_bbr
+    harden_sysctl
+    mkdir -p "$DATA_DIR" "$BACKUP_DIR" "$XRAY_LOG_DIR" "$XRAY_ETC" 2>/dev/null || true
+    touch "$NODE_DB" "$RELAY_DB" 2>/dev/null || true
+    ensure_python
+    log_success "系统初始化完成"
+}
+
+install_xray() {
+    # 语义不变: 二进制已存在则只补 service 文件并返回, 绝不在此偷偷
+    # 更换版本 (升级走主菜单 [13] upgrade_xray 专门流程)。
+    if [ -x "$XRAY_BIN" ]; then write_xray_service; return 0; fi
+    log_step "安装 Xray-core ${XRAY_VERSION_PIN} (版本锁定, 官方 zip)..."
+    # v2.5.2: 装内核意味着环境可能刚重装/换过 IP, 先清掉入站 IP 缓存,
+    # 避免生成的链接继续指向旧地址 (重装后不通的头号原因之一)。
+    reset_ip_cache
+    local tmp
+    tmp=$(mktemp -d)
+    if ! xray_fetch_zip "$XRAY_VERSION_PIN" "$tmp"; then
+        log_error "Xray ${XRAY_VERSION_PIN} 下载或解压失败 (版本已锁定, 不做降级兜底, 请检查网络后重试)"
+        rm -rf "$tmp"
+        return 1
+    fi
+    install -m 755 "$tmp/unzipped/xray" "$XRAY_BIN"
+    mkdir -p /usr/local/share/xray
+    cp "$tmp/unzipped/"*.dat /usr/local/share/xray/ 2>/dev/null || true
+    rm -rf "$tmp"
+    if [ ! -x "$XRAY_BIN" ]; then log_error "Xray 安装后未找到二进制文件"; return 1; fi
+    # v2.5.2 关键修复: 必须复位内核版本探测缓存。
+    # 主菜单在渲染时会先调用一次 xray_kernel_version(), 那时二进制还不存在,
+    # 结果被缓存成"空版本 + 已检查"。装完之后如果不复位, 后续 make_uri
+    # 读到的永远是空版本 -> xray_needs_mlkem 判定为假 -> 链接漏掉
+    # support-x25519mlkem768 参数 -> 客户端连新内核服务端必然 REALITY 认证失败。
+    XRAY_VER_CHECKED=0; XRAY_VER_STR=""; XRAY_VER_FALLBACK=0
+    write_xray_service
+    return 0
+}
+
+write_xray_service() {
+    if [ "$SVC_MGR" = "systemd" ]; then
+        rm -rf "/etc/systemd/system/xray.service.d" 2>/dev/null || true
+        cat > /etc/systemd/system/xray.service <<SVCEOF
+[Unit]
+Description=Xray Service
+Documentation=https://github.com/xtls
+After=network-online.target nss-lookup.target
+
+[Service]
+Type=simple
+User=root
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ExecStart=${XRAY_BIN} run -config ${XRAY_CONFIG}
+Restart=on-failure
+RestartPreventExitStatus=23
+LimitNPROC=10000
+LimitNOFILE=1000000
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+        systemctl daemon-reload 2>/dev/null || true
+    else
+        cat > /etc/init.d/xray <<ORCEOF
+#!/sbin/openrc-run
+name="xray"
+command="${XRAY_BIN}"
+command_args="run -config ${XRAY_CONFIG}"
+command_background="yes"
+pidfile="/run/xray.pid"
+output_log="${XRAY_LOG_DIR}/access.log"
+error_log="${XRAY_LOG_DIR}/error.log"
+ORCEOF
+        chmod +x /etc/init.d/xray
+    fi
+}
+
+fix_log_perms() {
+    mkdir -p "$XRAY_LOG_DIR"
+    chmod 755 "$XRAY_LOG_DIR"
+    touch "$XRAY_LOG_DIR/access.log" "$XRAY_LOG_DIR/error.log"
+}
+
+# ==============================================================
+# 配置生成引擎 (100% 对齐官方防偷架构 + 全局端口避让)
+# ==============================================================
+gen_config_python() {
+    "$PYTHON" - "$1" "$2" "$3" "$4" <<'PYEOF'
+import sys, json, os
+
+node_db = sys.argv[1]
+relay_db = sys.argv[2]
+log_dir = sys.argv[3]
+guard_base = int(sys.argv[4])
+
+# v2.5.0: loglevel 持久化。存在 $DATA_DIR/loglevel 里, 由主菜单 [15]
+# 切换。文件缺失或内容非法时回落 warning, 与旧版行为一致。
+loglevel = 'warning'
+try:
+    _lv = open(os.path.join(os.path.dirname(node_db), 'loglevel')).read().strip()
+    if _lv in ('debug', 'info', 'warning', 'error', 'none'):
+        loglevel = _lv
+except Exception:
+    pass
+
+def read_db(path):
+    rows = []
+    try:
+        with open(path, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#'):
+                    rows.append(line)
+    except: pass
+    return rows
+
+# ── 第一遍：解析并收集所有外层端口，用于内层避让 ──
+nodes = []          # (uuid, port_int, port_str, sni, sid, priv, name, fp)
+outer_ports = set()
+
+for line in read_db(node_db):
+    p = line.split('|')
+    if len(p) < 7:
+        continue
+    uuid, port, sni, sid, priv, name, fp = [x.strip() for x in p[:7]]
+
+    # 健壮性校验
+    if not uuid or not port.isdigit():
+        continue
+    port_int = int(port)
+    if not 1 <= port_int <= 65535:
+        continue
+    if not sni or not priv or not sid:
+        continue
+
+    outer_ports.add(port_int)
+    nodes.append((uuid, port_int, port, sni, sid, priv, name, fp))
+
+inbounds = []
+anti_steal_rules = []
+used_inner = set()
+
+def alloc_guard_port(preferred):
+    """分配一个不与任何外层端口、已用内层端口冲突的端口"""
+    candidate = preferred
+    tries = 0
+    while tries < 1000:
+        if candidate < 1 or candidate > 65535:
+            candidate = 40000
+        if candidate not in outer_ports and candidate not in used_inner:
+            return candidate
+        candidate += 1
+        tries += 1
+    # 极端兜底：顺序找空位
+    for c in range(40000, 65536):
+        if c not in outer_ports and c not in used_inner:
+            return c
+    return None
+
+for idx, (uuid, port_int, port_str, sni, sid, priv, name, fp) in enumerate(nodes):
+    inner_port = alloc_guard_port(guard_base + idx)
+    if inner_port is None:
+        # 端口耗尽时跳过该节点，避免生成无效配置
+        continue
+    used_inner.add(inner_port)
+
+    outer_tag = "in-{}-{}".format(port_str, uuid[:8])
+    inner_tag = "guard-{}-{}".format(port_str, uuid[:8])
+
+    # 外层：100% 对齐官方。非法握手 fallback 至本地内层看门狗
+    inbounds.append({
+        "tag": outer_tag,
+        "port": port_int,
+        "listen": "::",
+        "protocol": "vless",
+        "settings": {
+            "clients": [{"id": uuid, "flow": "xtls-rprx-vision"}],
+            "decryption": "none"
+        },
+        "streamSettings": {
+            "network": "tcp",
+            "security": "reality",
+            "realitySettings": {
+                "show": False,
+                "dest": "127.0.0.1:{}".format(inner_port),
+                "serverNames": [sni],
+                "privateKey": priv,
+                "shortIds": [sid]
+            }
+        },
+        "sniffing": {
+            "enabled": True,
+            "destOverride": ["http", "tls", "quic"],
+            "routeOnly": True
+        }
+    })
+
+    # 内层：严格只监听本地，嗅探真实目标 SNI
+    inbounds.append({
+        "tag": inner_tag,
+        "port": inner_port,
+        "listen": "127.0.0.1",
+        "protocol": "dokodemo-door",
+        "settings": {
+            "address": sni,
+            "port": 443,
+            "network": "tcp"
+        },
+        "sniffing": {
+            "enabled": True,
+            "destOverride": ["tls"],
+            "routeOnly": True
+        }
+    })
+
+    # v2.5.0: 回落统一走 fallback 出站 (freedom + UseIPv4)。
+    # 去掉原来的 block 规则, 原因:
+    #   1) 探测方用非白名单 SNI 时, 旧配置会立刻 RST; 而真实站点
+    #      会回 handshake_failure alert。RST 是更硬的封锁特征。
+    #   2) 内层 dokodemo-door 的 address 固定为 sni, 放开后也只能
+    #      到达那一个站点, 偷流量风险可控。
+    anti_steal_rules.append({
+        "type": "field",
+        "inboundTag": [inner_tag],
+        "outboundTag": "fallback"
+    })
+
+outbounds = [
+    {"protocol": "freedom",   "tag": "direct"},
+    # v2.5.0: 回落专用出站。SNI 常常只解析出 AAAA, 若本机没有
+    # IPv6 出口, 回落会连不上, 探测方看到的是"无响应"——这比 RST
+    # 更像被墙。这里强制 IPv4 解析, 保证回落永远能打到真实站点。
+    {"protocol": "freedom",   "tag": "fallback",
+     "settings": {"domainStrategy": "UseIPv4"}},
+    {"protocol": "blackhole", "tag": "block"}
+]
+
+rules = []
+rules.extend(anti_steal_rules)
+rules.append({"type": "field", "protocol": ["bittorrent"], "outboundTag": "block"})
+
+default_out = "direct"
+
+for line in read_db(relay_db):
+    p = line.split('|')
+    if len(p) < 9:
+        continue
+    label, ip, rport, ruuid, pubkey, shortid, rsni, fp, active = [x.strip() for x in p[:9]]
+    if active != '1':
+        continue
+    if not ip or not rport.isdigit() or not ruuid:
+        continue
+    rport_int = int(rport)
+    if not 1 <= rport_int <= 65535:
+        continue
+    if not pubkey or not rsni:
+        continue
+
+    relay_tag = "relay-out"
+    outbounds.insert(0, {
+        "tag": relay_tag,
+        "protocol": "vless",
+        "settings": {
+            "vnext": [{
+                "address": ip,
+                "port": rport_int,
+                "users": [{"id": ruuid, "flow": "xtls-rprx-vision", "encryption": "none"}]
+            }]
+        },
+        "streamSettings": {
+            "network": "tcp",
+            "security": "reality",
+            "realitySettings": {
+                "fingerprint": fp or 'chrome',
+                "serverName": rsni,
+                "publicKey": pubkey,
+                "shortId": shortid
+            }
+        }
+    })
+    # 中转规则：在防偷规则之后，确保合法用户才被路由
+    rules.append({"type": "field", "network": "tcp,udp", "outboundTag": relay_tag})
+    default_out = relay_tag
+    break
+
+config = {
+    "log": {"loglevel": loglevel, "access": "{}/access.log".format(log_dir), "error": "{}/error.log".format(log_dir)},
+    "inbounds": inbounds,
+    "outbounds": outbounds,
+    "routing": {"domainStrategy": "IPIfNonMatch", "defaultOutboundTag": default_out, "rules": rules}
+}
+print(json.dumps(config, indent=2, ensure_ascii=False))
+PYEOF
+}
+
+regen_config() {
+    log_step "生成 Xray 配置文件..."
+    fix_log_perms
+    sanitize_db
+    ensure_python || return 1
+
+    local cfg
+    cfg=$(gen_config_python "$NODE_DB" "$RELAY_DB" "$XRAY_LOG_DIR" "$GUARD_BASE_PORT")
+    if [ $? -ne 0 ] || [ -z "$cfg" ]; then
+        log_error "配置生成失败"
+        return 1
+    fi
+
+    # v2.5.2: 写前备份 + 验证失败自动还原。
+    # 原实现直接覆盖 config.json, 一旦新配置验证不过, 上一份可用配置就没了 ——
+    # 服务再也起不来, 且升级内核回滚时最致命: 二进制退回去了, 配置却是坏的,
+    # 回滚后照样起不来, 用户只能重建节点。
+    local old_cfg=""
+    if [ -s "$XRAY_CONFIG" ]; then
+        old_cfg=$(mktemp 2>/dev/null) || old_cfg=""
+        [ -n "$old_cfg" ] && { cp -a "$XRAY_CONFIG" "$old_cfg" 2>/dev/null || old_cfg=""; }
+    fi
+    printf '%s\n' "$cfg" > "$XRAY_CONFIG"
+
+    local tout
+    tout=$("$XRAY_BIN" run -test -config "$XRAY_CONFIG" 2>&1)
+    if [ $? -ne 0 ]; then
+        log_error "配置文件验证失败: \n$tout"
+        if [ -n "$old_cfg" ] && [ -s "$old_cfg" ]; then
+            cp -a "$old_cfg" "$XRAY_CONFIG" 2>/dev/null \
+                && log_warn "已还原上一份可用配置 (服务可继续用旧配置运行)。"
+        fi
+        [ -n "$old_cfg" ] && rm -f "$old_cfg"
+        return 1
+    fi
+    [ -n "$old_cfg" ] && rm -f "$old_cfg"
+    return 0
+}
+
+xray_is_active() {
+    if [ "$SVC_MGR" = "systemd" ]; then
+        systemctl is-active --quiet xray 2>/dev/null
+        return $?
+    else
+        /etc/init.d/xray status 2>/dev/null | grep -q "started"
+        return $?
+    fi
+}
+
+start_xray() {
+    write_xray_service
+    if [ "$SVC_MGR" = "systemd" ]; then
+        systemctl daemon-reload 2>/dev/null || true
+        systemctl enable xray >/dev/null 2>&1 || true
+        systemctl restart xray 2>/dev/null || true
+    else
+        /etc/init.d/xray restart >/dev/null 2>&1 || true
+    fi
+    # 每次重启都顺带校验自启是否在位 (静默，失败由启动检查明说)
+    ensure_xray_autostart >/dev/null 2>&1 || true
+}
+
+allow_port() {
+    if cmd_exists iptables; then
+        iptables -C INPUT -p tcp --dport "$1" -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport "$1" -j ACCEPT 2>/dev/null
+    fi
+    if cmd_exists ufw; then ufw allow "$1"/tcp >/dev/null 2>&1 || true; fi
+    # v2.4.2: firewalld 正在运行时同步放行 (RHEL 系常见)
+    if cmd_exists firewall-cmd && firewall-cmd --state >/dev/null 2>&1; then
+        firewall-cmd --permanent --add-port="$1"/tcp >/dev/null 2>&1 || true
+        firewall-cmd --reload >/dev/null 2>&1 || true
+    fi
+}
+
+urlencode() {
+    local str="$1" encoded="" i c
+    for i in $(seq 0 $(( ${#str} - 1 ))); do
+        c="${str:$i:1}"
+        case "$c" in [-_.~a-zA-Z0-9]) encoded="${encoded}${c}" ;; *) encoded="${encoded}$(printf '%%%02X' "'$c")" ;; esac
+    done
+    echo "$encoded"
+}
+
+make_uri() {
+    local uuid="$1" ip="$2" port="$3" sni="$4" pbk="$5" sid="$6" name="$7" fp="$8" is_v6="${9:-0}"
+    local host="$ip"
+    [ "$is_v6" = "1" ] && host="[${ip}]"
+    # v2.4.2: 内核 >= 26.9.8 时链接带上 MLKEM 提示参数, mihomo 导入
+    # 时会自动开启 support-x25519mlkem768; 内核更低或探测不到时
+    # 不带此参数, 链接与 v2.4.1 逐字一致。
+    local mlkem_param=""
+    if xray_needs_mlkem; then mlkem_param="&support-x25519mlkem768=true"; fi
+    echo "vless://${uuid}@${host}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=${fp}&pbk=${pbk}&sid=${sid}${mlkem_param}&type=tcp&headerType=none#$(urlencode "$name")"
+}
+
+# ==============================================================
+# 本机节点管理
+# ==============================================================
+add_node() {
+    log_title "添加本机 VLESS+Reality 节点"
+    [ ! -x "$XRAY_BIN" ] && { system_init; install_xray || return 1; }
+
+    local name
+    read -rp "节点名称 [回车=自动]: " name
+    [ -z "$name" ] && name="VLESS-$(date +%m%d-%H%M)"
+    name=$(sanitize_field "$name")
+    [ -z "$name" ] && name="VLESS-$(date +%m%d-%H%M)"
+
+    local port
+    while true; do
+        read -rp "监听端口 [回车=443]: " port
+        [ -z "$port" ] && port=443
+        case "$port" in ''|*[!0-9]*) log_error "端口必须是数字"; continue ;; esac
+        if [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then log_error "端口范围 1-65535"; continue; fi
+        if port_in_use "$port"; then log_error "端口 $port 已被其他节点占用，请换一个"; continue; fi
+        break
+    done
+
+    if [ "$port" != "443" ]; then
+        log_warn "端口 $port 不是 443。高位随机端口承载 TLS 是明显特征,"
+        log_warn "被识别的概率显著高于 443 (NAT 机无法避免, 但要有这个预期)。"
+    fi
+    # v2.5.2: NAT 机型最常见的"节点不通"原因 —— 链接端口写的是内网端口
+    log_info "提示: 下面输出的链接用【内网监听端口 ${port}】。"
+    log_info "      若本机是 NAT 型且面板做了端口映射 (如 外部 54324 -> 内网 ${port}),"
+    log_info "      请把链接里的 ':${port}' 改成外部端口再导入客户端。"
+
+    echo -e "${GREEN}提示: SNI 入库前会实测 (TLS1.3 + ALPN h2), 不合格不给过。${NC}"
+    local sni_memo=""
+    [ -s "$SNI_CHOSEN_FILE" ] && sni_memo=$(tr -d ' \r\n' < "$SNI_CHOSEN_FILE")
+    echo -e "${GREEN}      回车 = 自动预检 10 个候选, 按握手速度排名后让你选${NC}"
+    echo -e "${GREEN}      auto = 重新预检;  也可以直接手打域名${NC}"
+    [ -n "$sni_memo" ] && echo -e "${GREEN}      上次预检选定: ${sni_memo}${NC}"
+    local sni sni_try=0 sni_fail=0
+    while true; do
+        if [ "$sni_try" -eq 0 ]; then
+            read -rp "SNI 伪装域名 [回车=自动预检]: " sni
+            if [ -z "$sni" ]; then
+                if [ -n "$sni_memo" ]; then
+                    log_step "沿用上次预检结果: $sni_memo"
+                    sni="$sni_memo"
+                else
+                    sni="auto"
+                fi
+            fi
+        else
+            read -rp "SNI 伪装域名 (必填, auto=重新预检): " sni
+            [ -z "$sni" ] && { log_error "不能为空"; continue; }
+        fi
+        sni=$(sanitize_field "$sni")
+        [ -z "$sni" ] && continue
+        sni_try=1
+        case "$sni" in
+            auto|AUTO|Auto)
+                if sni_pick_menu; then sni="$SNI_PICKED"; break; fi
+                log_warn "未选定域名, 请重新输入 (可再输入 auto 重试)。"
+                continue
+                ;;
+        esac
+        if sni_validate "$sni"; then break; fi
+        sni_fail=$((sni_fail + 1))
+        log_warn "换一个域名再试。"
+        if [ "$sni_fail" -ge 2 ]; then
+            log_warn "已连续 ${sni_fail} 次不合格: 这更像本机网络/openssl 的共性问题, 不是域名问题。"
+            echo -e "  ${GREEN}输入 auto 走 [14] 自动预检 (10 个通用候选, 显式连 IPv4 排名)${NC}"
+            echo -e "  ${GREEN}先验证本机 TLS: echo | openssl s_client -connect www.gentoo.org:443 -servername www.gentoo.org -tls1_3 -alpn h2 2>&1 | tail -20${NC}"
+        fi
+    done
+
+    local fp
+    read -rp "Fingerprint [回车=chrome]: " fp
+    [ -z "$fp" ] && fp="chrome"
+    fp=$(sanitize_field "$fp")
+    [ -z "$fp" ] && fp="chrome"
+    warn_fp_mlkem "$fp"
+
+    local key_out priv pub uuid sid
+    key_out=$("$XRAY_BIN" x25519 2>&1)
+    parse_xray_keys "$key_out" || return 1
+    priv="$PARSED_PRIV"; pub="$PARSED_PUB"
+    uuid=$(gen_uuid); sid=$(openssl rand -hex 8 2>/dev/null || od -An -tx1 /dev/urandom | head -c 8 | tr -d ' \n')
+
+    printf '%s|%s|%s|%s|%s|%s|%s\n' "$uuid" "$port" "$sni" "$sid" "$priv" "$name" "$fp" >> "$NODE_DB"
+    allow_port "$port"
+
+    if regen_config; then
+        start_xray
+        log_success "节点添加成功！"
+        show_node_info "$uuid" "$port" "$sni" "$sid" "$priv" "$pub" "$name" "$fp"
+    else
+        log_error "配置生成失败，已回滚"
+        local tmp
+        tmp=$(mktemp)
+        grep -v "^${uuid}|" "$NODE_DB" > "$tmp" 2>/dev/null || true
+        mv "$tmp" "$NODE_DB"
+    fi
+}
+
+edit_node() {
+    log_title "修改节点 (无损生效)"
+    pick_node || return
+    local uuid port sni sid priv name fp
+    IFS='|' read -r uuid port sni sid priv name fp <<< "$PICKED_LINE"
+
+    echo -e "${CYAN}当前节点信息:${NC}"
+    echo " 名称: $name"
+    echo " 端口: $port"
+    echo " SNI:  $sni"
+    echo " 指纹: $fp"
+    echo -e "${YELLOW}提示: 下面输入新值，如果直接按回车则保持旧值不变。${NC}"
+    echo ""
+
+    local nn np ns nf
+    read -rp "新名称 [$name]: " nn; [ -z "$nn" ] && nn="$name"
+    nn=$(sanitize_field "$nn"); [ -z "$nn" ] && nn="$name"
+
+    read -rp "新端口 [$port]: " np; [ -z "$np" ] && np="$port"
+    case "$np" in ''|*[!0-9]*) log_error "端口必须是数字"; return 1;; esac
+    if [ "$np" -lt 1 ] || [ "$np" -gt 65535 ]; then log_error "端口范围 1-65535"; return 1; fi
+    if [ "$np" != "$port" ] && port_in_use "$np" "$uuid"; then
+        log_error "端口 $np 已被其他节点占用"
+        return 1
+    fi
+
+    # 若 [14] 预检已经选定过域名, 这里把"回车"的含义改成"采用预检结果",
+    # 而不是"保持旧值" —— 否则用户刚在 [14] 选完, 到这一步回车却被静默
+    # 保留旧 SNI, 看起来就像预检没生效。想保留旧值就显式输入 -。
+    local sni_memo=""
+    [ -s "$SNI_CHOSEN_FILE" ] && sni_memo=$(tr -d ' \r\n' < "$SNI_CHOSEN_FILE")
+    if [ -n "$sni_memo" ] && [ "$sni_memo" != "$sni" ]; then
+        echo -e "  ${CYAN}预检已选定: ${sni_memo}${NC}"
+        read -rp "新 SNI [回车=采用 ${sni_memo} / 输入 - 保持 ${sni} / auto=重新预检]: " ns
+        case "$ns" in
+            "")  ns="$sni_memo" ;;
+            "-") ns="$sni" ;;
+        esac
+    else
+        read -rp "新 SNI [$sni] (auto=重新预检): " ns; [ -z "$ns" ] && ns="$sni"
+    fi
+    ns=$(sanitize_field "$ns"); [ -z "$ns" ] && ns="$sni"
+    case "$ns" in
+        auto|AUTO|Auto)
+            if sni_pick_menu; then ns="$SNI_PICKED"; else ns="$sni"; fi
+            ;;
+    esac
+    # v2.5.0: SNI 变更时同样做实测, 不合格不允许改过去
+    if [ "$ns" != "$sni" ]; then
+        while ! sni_validate "$ns"; do
+            read -rp "新 SNI [$sni] (回车保持原值, auto=重新预检): " ns
+            if [ -z "$ns" ]; then ns="$sni"; break; fi
+            ns=$(sanitize_field "$ns")
+            [ -z "$ns" ] && { ns="$sni"; break; }
+            case "$ns" in
+                auto|AUTO|Auto)
+                    if sni_pick_menu; then ns="$SNI_PICKED"; else ns="$sni"; fi
+                    break
+                    ;;
+            esac
+        done
+    fi
+
+    read -rp "新指纹 [$fp]: " nf; [ -z "$nf" ] && nf="$fp"
+    nf=$(sanitize_field "$nf"); [ -z "$nf" ] && nf="$fp"
+    warn_fp_mlkem "$nf"
+
+    local tmp
+    tmp=$(mktemp)
+    awk -F'|' -v u="$uuid" -v nn="$nn" -v np="$np" -v ns="$ns" -v nf="$nf" 'BEGIN{OFS="|"}
+        /^#/{print; next}
+        { if($1==u){ $2=np; $3=ns; $6=nn; $7=nf; } print }' "$NODE_DB" > "$tmp" 2>/dev/null || true
+    mv "$tmp" "$NODE_DB"
+
+    if regen_config; then
+        allow_port "$np"
+        start_xray
+        log_success "修改成功！Xray已重载新配置。"
+        local pub
+        pub=$(derive_pub "$priv")
+        show_node_info "$uuid" "$np" "$ns" "$sid" "$priv" "$pub" "$nn" "$nf"
+    else
+        log_error "修改失败，可能端口被占用或配置格式错误"
+    fi
+}
+
+view_node() {
+    log_title "查看单个节点信息"
+    pick_node || return
+    local uuid port sni sid priv name fp
+    IFS='|' read -r uuid port sni sid priv name fp <<< "$PICKED_LINE"
+    local pub
+    pub=$(derive_pub "$priv")
+    show_node_info "$uuid" "$port" "$sni" "$sid" "$priv" "$pub" "$name" "$fp"
+}
+
+view_all_nodes() {
+    log_title "所有节点信息"
+    if [ ! -s "$NODE_DB" ]; then
+        echo "  (无节点)"
+        return
+    fi
+    while IFS='|' read -r uuid port sni sid priv name fp; do
+        [ -z "$uuid" ] && continue
+        case "$uuid" in '#'*) continue ;; esac
+        local pub
+        pub=$(derive_pub "$priv")
+        show_node_info "$uuid" "$port" "$sni" "$sid" "$priv" "$pub" "$name" "${fp:-chrome}"
+    done < <(cat "$NODE_DB" | tr -d '\r')
+}
+
+show_node_info() {
+    local uuid="$1" port="$2" sni="$3" sid="$4" priv="$5" pub="$6" name="$7" fp="${8:-chrome}"
+    local ipv4 ipv6
+    ipv4=$(safe_ipv4); ipv6=$(get_ipv6)
+
+    # v2.5.2: 不再无条件回写缓存。原实现每次查看节点信息都把 server_ip 重写一遍,
+    # mtime 被刷新成"刚刚" -> IP_CACHE_TTL_DAYS 永远不触发, TTL 等于白加。
+    # public_ip4 内部已负责"首次探测落盘", 这里只在缓存文件缺失时补写。
+    if [ -n "$ipv4" ] && [ ! -s "$DATA_DIR/server_ip" ]; then
+        echo "$ipv4" > "$DATA_DIR/server_ip" 2>/dev/null
+    fi
+    if [ -z "$ipv4" ] && [ -f "$DATA_DIR/server_ip" ]; then
+        ipv4=$(tr -d ' \r\n' < "$DATA_DIR/server_ip" 2>/dev/null)
+    fi
+
+    echo -e "\n${CYAN}════ 节点: $name ════${NC}"
+    echo "UUID:        $uuid"
+    echo "Port:        $port"
+    echo "SNI:         $sni"
+    echo "Public Key:  $pub"
+    echo "Short ID:    $sid"
+
+    # IPv4 链接永远输出：拿不到 IP 就用占位符，保证链接可见
+    local host4="$ipv4"
+    if [ -z "$host4" ]; then
+        host4="你的服务器IP"
+        echo -e "${YELLOW}提示: 未能自动检测公网 IP，已用占位符生成链接，请把「你的服务器IP」替换为实际 IP${NC}"
+    fi
+    echo -e "\n${GREEN}── VLESS URI (IPv4) ──${NC}\n${YELLOW}$(make_uri "$uuid" "$host4" "$port" "$sni" "$pub" "$sid" "$name" "$fp" "0")${NC}"
+    if [ -n "$ipv6" ]; then
+        echo -e "\n${GREEN}── VLESS URI (IPv6) ──${NC}\n${YELLOW}$(make_uri "$uuid" "$ipv6" "$port" "$sni" "$pub" "$sid" "${name}-v6" "$fp" "1")${NC}"
+    fi
+    echo -e "\n${GREEN}── Mihomo (Clash Party) 配置片段 · 直接可用 ──${NC}"
+    echo -e "${YELLOW}  两段分别贴进 profile 的 proxies: 和 proxy-groups: 即可${NC}"
+    echo ""
+    echo "proxies:"
+    echo "  - name: \"$name\""
+    echo "    type: vless"
+    echo "    server: ${host4}"
+    echo "    port: ${port}"
+    echo "    uuid: ${uuid}"
+    echo "    network: tcp"
+    echo "    tls: true"
+    echo "    udp: true"
+    echo "    flow: xtls-rprx-vision"
+    echo "    servername: ${sni}"
+    echo "    client-fingerprint: ${fp}"
+    echo "    skip-cert-verify: false"
+    echo "    packet-encoding: xudp"
+    echo "    reality-opts:"
+    echo "      public-key: ${pub}"
+    echo "      short-id: \"${sid}\""
+    if xray_needs_mlkem; then
+        echo "      support-x25519mlkem768: true"
+    fi
+
+    if [ -n "$ipv6" ]; then
+        echo "  - name: \"${name}-IPv6\""
+        echo "    type: vless"
+        echo "    server: ${ipv6}"
+        echo "    port: ${port}"
+        echo "    uuid: ${uuid}"
+        echo "    network: tcp"
+        echo "    tls: true"
+        echo "    udp: true"
+        echo "    flow: xtls-rprx-vision"
+        echo "    servername: ${sni}"
+        echo "    client-fingerprint: ${fp}"
+        echo "    skip-cert-verify: false"
+        echo "    packet-encoding: xudp"
+        echo "    reality-opts:"
+        echo "      public-key: ${pub}"
+        echo "      short-id: \"${sid}\""
+        if xray_needs_mlkem; then
+            echo "      support-x25519mlkem768: true"
+        fi
+    fi
+
+    echo ""
+    if [ -n "$ipv6" ]; then
+        echo "proxy-groups:"
+        echo "  - name: \"${name}-自动\""
+        echo "    type: fallback"
+        echo "    proxies:"
+        echo "      - \"$name\""
+        echo "      - \"${name}-IPv6\""
+        echo "    url: https://www.gstatic.com/generate_204"
+        echo "    interval: 180"
+        echo ""
+        echo -e "${GREEN}  规则里引用 \"${name}-自动\": IPv4 被阻断时自动切 IPv6, 不用手工改。${NC}"
+    else
+        echo -e "${YELLOW}  未检测到本机 IPv6, 只生成单节点。若服务器确实有 IPv6,${NC}"
+        echo -e "${YELLOW}  请先确认 get_ipv6 能取到地址, 再重新查看节点信息。${NC}"
+    fi
+    echo -e "${CYAN}═════════════════════${NC}\n"
+}
+
+list_nodes() {
+    echo -e "\n${CYAN}── 本机节点列表 ────────────────────────────${NC}"
+    [ ! -s "$NODE_DB" ] && { echo "  (无节点)"; return 0; }
+    local idx=0
+    while IFS='|' read -r uuid port sni sid priv name fp; do
+        [ -z "$uuid" ] && continue
+        case "$uuid" in '#'*) continue ;; esac
+        idx=$((idx + 1))
+        echo "  [$idx] $name  端口:$port  SNI:$sni  UUID:${uuid:0:8}..."
+    done < <(cat "$NODE_DB" | tr -d '\r')
+    [ "$idx" -eq 0 ] && echo "  (无节点)"
+    return 0
+}
+
+pick_node() {
+    list_nodes
+    [ ! -s "$NODE_DB" ] && return 1
+    read -rp "请输入序号: " n
+    n=$(echo "$n" | tr -d ' ')
+    case "$n" in ''|*[!0-9]*) log_error "输入无效"; return 1;; esac
+
+    PICKED_LINE=$(awk -F'|' -v n="$n" '!/^#/ && NF>=7 {cnt++; if(cnt==n){print; exit}}' "$NODE_DB" | tr -d '\r')
+    [ -z "$PICKED_LINE" ] && { log_error "找不到该序号"; return 1; }
+    return 0
+}
+
+delete_node() {
+    log_title "删除节点"
+    pick_node || return
+    local uuid name; IFS='|' read -r uuid _ _ _ _ name _ <<< "$PICKED_LINE"
+    read -rp "确认删除节点 '$name'? [y/N]: " c
+    [ "${c:-N}" != "y" ] && [ "${c:-N}" != "Y" ] && return
+
+    local tmp
+    tmp=$(mktemp)
+    grep -v "^${uuid}|" "$NODE_DB" > "$tmp" 2>/dev/null || true
+    mv "$tmp" "$NODE_DB"
+
+    regen_config && start_xray && log_success "已删除节点"
+}
+
+# 真实解析配置的验配版测试
+test_node() {
+    log_title "检测节点状态"
+    pick_node || return
+    local uuid port sni sid priv name fp
+    IFS='|' read -r uuid port sni sid priv name fp <<< "$PICKED_LINE"
+    echo ""
+
+    log_step "1. Xray 服务状态..."
+    if xray_is_active; then
+        log_success "Xray 运行中"
+    else
+        log_error "Xray 未运行，尝试自动启动..."
+        start_xray
+        if xray_is_active; then log_success "已成功启动"; else log_error "启动失败，请查看日志"; fi
+    fi
+
+    log_step "2. 配置文件验证..."
+    local tout
+    tout=$("$XRAY_BIN" run -test -config "$XRAY_CONFIG" 2>&1)
+    if [ $? -eq 0 ]; then
+        log_success "配置文件内部验证通过"
+    else
+        log_error "配置文件内部验证失败:\n$tout"
+    fi
+
+    log_step "3. 端口 $port 监听检查..."
+    if ss -tlnp 2>/dev/null | grep -q ":${port}[[:space:]]"; then
+        log_success "端口 $port 正在监听"
+    else
+        log_warn "端口 $port 未检测到监听 (若在容器内可能正常)"
+    fi
+
+    log_step "4. SNI 伪装域名可达性 ($sni)..."
+    local hc
+    hc=$(curl -sI --max-time 5 "https://${sni}" -o /dev/null -w "%{http_code}" 2>/dev/null || echo "0")
+    case "$hc" in
+        2*|3*) log_success "SNI $sni 连通正常 (HTTP $hc)" ;;
+        *)     log_warn "SNI $sni 返回异常 ($hc)" ;;
+    esac
+
+    log_step "5. 防偷流量架构检测..."
+    if [ -f "$XRAY_CONFIG" ] && grep -q '"dest": "127.0.0.1:' "$XRAY_CONFIG" && grep -q 'dokodemo-door' "$XRAY_CONFIG"; then
+        log_success "XTLS 官方 Dokodemo-door 防偷架构已完全加载！(域前置免疫)"
+    else
+        log_error "未检测到完整的防偷架构配置，请执行 [强制修复配置] 以重建。"
+    fi
+
+    log_step "6. Xray 内核版本与客户端要求..."
+    xray_kernel_version
+    local kver="$XRAY_VER_STR"
+    if [ -n "$kver" ]; then
+        if [ "$XRAY_VER_FALLBACK" = "1" ]; then
+            echo "    内核版本: 无法从二进制读取, 按锁定版 ${XRAY_VERSION_PIN} 处理"
+            log_warn "版本探测失败但二进制存在, 已按锁定版判断。若你手动换过内核, 请核对实际版本。"
+        else
+            echo "    内核版本: Xray $kver"
+        fi
+        if xray_needs_mlkem; then
+            log_warn "内核 >= 26.9.8: REALITY 客户端必须在 ClientHello 中发送 X25519MLKEM768, 否则会被静默回落到伪装站 (极像被风控)。"
+            log_warn "客户端要求: mihomo/Clash 的 reality-opts 必须有 support-x25519mlkem768: true, 且指纹须为 chrome;"
+            log_warn "            sing-box / Shadowrocket 未更新到支持 MLKEM 的版本将连不上。"
+            log_warn "本脚本 (v2.5.2+) 生成的 vless 链接已自动带 support-x25519mlkem768=true。"
+            log_warn "若你手上的链接来自 v2.5.1 及更早版本, 请用主菜单 [4/5] 重新取一次 —— 旧链接缺该参数, 连不上新内核。"
+        else
+            log_success "内核 < 26.9.8: 客户端无 X25519MLKEM768 强制要求, 两种 ClientHello 均可连接。"
+        fi
+    else
+        log_warn "未能探测内核版本 (Xray 二进制缺失?), 已跳过 MLKEM 要求检查"
+    fi
+
+    echo ""
+    log_success "检测完成 - [$name] 状态检查结束"
+}
+
+# ==============================================================
+# 落地管理 (完整增删改查)
+# ==============================================================
+show_relay_mode() {
+    local al ai
+    al=$(awk -F'|' '!/^#/ && NF && $9=="1" {print $1; exit}' "$RELAY_DB" 2>/dev/null || true)
+    if [ -n "$al" ]; then
+        ai=$(awk -F'|' '!/^#/ && NF && $9=="1" {print $2":"$3; exit}' "$RELAY_DB" 2>/dev/null || true)
+        echo -e "  当前模式: ${YELLOW}中转${NC} → $al ($ai)"
+    else
+        echo -e "  当前模式: ${GREEN}直连${NC} (流量从本机直接出网)"
+    fi
+}
+
+list_relays() {
+    echo -e "\n${CYAN}── 落地节点列表 ────────────────────────────${NC}"
+    show_relay_mode; echo ""
+    [ ! -s "$RELAY_DB" ] && { echo "  (无)"; return 0; }
+    local idx=0
+    while IFS='|' read -r label ip port uuid pubkey shortid sni fp active; do
+        [ -z "$label" ] && continue
+        case "$label" in '#'*) continue ;; esac
+        idx=$((idx + 1))
+        local mark="      "
+        [ "$(echo "$active" | tr -d '\r')" = "1" ] && mark="${GREEN}[激活]${NC}"
+        echo -e "  [$idx] ${mark} $label  ${ip}:${port}  SNI:$sni"
+    done < "$RELAY_DB"
+}
+
+# 按列表序号选中落地，序号口径与 list_relays 显示一致 (非空且非#开头行)
+pick_relay() {
+    list_relays
+    [ ! -s "$RELAY_DB" ] && return 1
+    local n
+    read -rp "请输入序号: " n
+    n=$(echo "$n" | tr -d ' ')
+    case "$n" in ''|*[!0-9]*) log_error "输入无效"; return 1;; esac
+
+    PICKED_RELAY_NUM=$(awk -v n="$n" '!/^#/ && NF {cnt++; if(cnt==n){print NR; exit}}' "$RELAY_DB" | tr -d '\r')
+    [ -z "$PICKED_RELAY_NUM" ] && { log_error "找不到该序号"; return 1; }
+    PICKED_RELAY_LINE=$(sed -n "${PICKED_RELAY_NUM}p" "$RELAY_DB" | tr -d '\r')
+    [ -z "$PICKED_RELAY_LINE" ] && { log_error "读取落地数据失败"; return 1; }
+    return 0
+}
+
+add_relay() {
+    log_title "添加落地节点"
+    local label ip port uuid pubkey shortid sni fp
+    read -rp "备注名称: " label; [ -z "$label" ] && label="relay-$(date +%s)"
+    label=$(sanitize_field "$label"); [ -z "$label" ] && label="relay-$(date +%s)"
+
+    while true; do
+        read -rp "落地 IP: " ip
+        ip=$(echo "$ip" | tr -d ' ')
+        [ -n "$ip" ] && break
+        log_error "IP 不能为空"
+    done
+
+    while true; do
+        read -rp "端口 [443]: " port; port=${port:-443}
+        case "$port" in ''|*[!0-9]*) log_error "端口必须为数字"; continue;; esac
+        if [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then log_error "端口范围 1-65535"; continue; fi
+        break
+    done
+
+    while true; do
+        read -rp "UUID: " uuid
+        uuid=$(echo "$uuid" | tr -d ' ')
+        [ -n "$uuid" ] && break
+        log_error "UUID 不能为空"
+    done
+
+    read -rp "Public Key: " pubkey; pubkey=$(echo "$pubkey" | tr -d ' ')
+    read -rp "Short ID: " shortid; shortid=$(echo "$shortid" | tr -d ' ')
+    read -rp "SNI [www.yahoo.com]: " sni; sni=${sni:-www.yahoo.com}
+    sni=$(sanitize_field "$sni"); [ -z "$sni" ] && sni="www.yahoo.com"
+    read -rp "Fingerprint [chrome]: " fp; fp=${fp:-chrome}
+    fp=$(sanitize_field "$fp"); [ -z "$fp" ] && fp="chrome"
+
+    local active=0
+    if [ ! -s "$RELAY_DB" ]; then active=1
+    else
+        read -rp "立即激活此落地并切换为中转? [y/N]: " act
+        if [ "${act:-N}" = "y" ] || [ "${act:-N}" = "Y" ]; then
+            active=1
+            awk -F'|' 'BEGIN{OFS="|"} /^#/{print;next} NF{$9=0; print}' "$RELAY_DB" > "$RELAY_DB.tmp" && mv "$RELAY_DB.tmp" "$RELAY_DB"
+        fi
+    fi
+
+    printf '%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$label" "$ip" "$port" "$uuid" "$pubkey" "$shortid" "$sni" "$fp" "$active" >> "$RELAY_DB"
+    sanitize_db
+    regen_config && start_xray && log_success "已添加落地: $label"
+    list_relays
+}
+
+edit_relay() {
+    log_title "修改落地节点 (无损生效)"
+    pick_relay || return
+    local label ip port uuid pubkey shortid sni fp active
+    IFS='|' read -r label ip port uuid pubkey shortid sni fp active <<< "$PICKED_RELAY_LINE"
+
+    echo -e "${CYAN}当前落地信息:${NC}"
+    echo " 备注名称: $label"
+    echo " 落地 IP: $ip"
+    echo " 端口: $port"
+    echo " UUID: ${uuid:0:8}..."
+    echo " SNI: $sni"
+    echo " 指纹: $fp"
+    echo -e "${YELLOW}提示: 下面输入新值，直接回车保持不变${NC}\n"
+
+    local nl nip np nuuid npub nshort nsni nfp
+    read -rp "新备注 [$label]: " nl; [ -z "$nl" ] && nl="$label"
+    nl=$(sanitize_field "$nl"); [ -z "$nl" ] && nl="$label"
+
+    read -rp "新 IP [$ip]: " nip; [ -z "$nip" ] && nip="$ip"
+    nip=$(echo "$nip" | tr -d ' '); [ -z "$nip" ] && nip="$ip"
+
+    read -rp "新端口 [$port]: " np; [ -z "$np" ] && np="$port"
+    case "$np" in ''|*[!0-9]*) log_error "端口必须是数字"; return 1;; esac
+    if [ "$np" -lt 1 ] || [ "$np" -gt 65535 ]; then log_error "端口范围 1-65535"; return 1; fi
+
+    read -rp "新 UUID (回车保持): " nuuid; [ -z "$nuuid" ] && nuuid="$uuid"
+    nuuid=$(echo "$nuuid" | tr -d ' '); [ -z "$nuuid" ] && nuuid="$uuid"
+
+    read -rp "新 Public Key (回车保持): " npub; [ -z "$npub" ] && npub="$pubkey"
+    npub=$(echo "$npub" | tr -d ' ')
+
+    read -rp "新 Short ID [$shortid]: " nshort; [ -z "$nshort" ] && nshort="$shortid"
+    nshort=$(echo "$nshort" | tr -d ' ')
+
+    read -rp "新 SNI [$sni]: " nsni; [ -z "$nsni" ] && nsni="$sni"
+    nsni=$(sanitize_field "$nsni"); [ -z "$nsni" ] && nsni="$sni"
+
+    read -rp "新指纹 [$fp]: " nfp; [ -z "$nfp" ] && nfp="$fp"
+    nfp=$(sanitize_field "$nfp"); [ -z "$nfp" ] && nfp="$fp"
+
+    local newline
+    newline=$(printf '%s|%s|%s|%s|%s|%s|%s|%s|%s' "$nl" "$nip" "$np" "$nuuid" "$npub" "$nshort" "$nsni" "$nfp" "$active")
+    replace_line_by_num "$RELAY_DB" "$PICKED_RELAY_NUM" "$newline"
+    sanitize_db
+
+    if regen_config; then
+        start_xray
+        log_success "落地修改成功，已重载生效"
+    else
+        log_error "配置生成失败，请检查输入"
+    fi
+}
+
+delete_relay() {
+    log_title "删除落地节点"
+    pick_relay || return
+    local label active
+    IFS='|' read -r label _ _ _ _ _ _ _ active <<< "$PICKED_RELAY_LINE"
+    if [ "$active" = "1" ]; then
+        log_warn "该落地当前处于激活(中转)状态，删除后将自动切回直连模式"
+    fi
+    read -rp "确认删除落地 '$label'? [y/N]: " c
+    [ "${c:-N}" != "y" ] && [ "${c:-N}" != "Y" ] && return
+
+    delete_line_by_num "$RELAY_DB" "$PICKED_RELAY_NUM"
+    sanitize_db
+    regen_config && start_xray && log_success "已删除落地: $label"
+}
+
+switch_relay() {
+    log_title "切换路由模式"
+    list_relays
+    echo "输入序号 -> 激活该落地(中转) | 输入 0 -> 取消所有激活(直连)"
+    read -rp "请输入: " n; n=$(echo "$n" | tr -d ' ')
+    case "$n" in ''|*[!0-9]*) log_error "输入无效"; return 1;; esac
+
+    if [ "$n" = "0" ]; then
+        awk -F'|' 'BEGIN{OFS="|"} /^#/{print;next} NF{gsub(/\r/,"",$9); $9=0; print}' "$RELAY_DB" > "$RELAY_DB.tmp" && mv "$RELAY_DB.tmp" "$RELAY_DB"
+        regen_config && start_xray && log_success "已切换为直连模式"
+    else
+        # 计数口径与 list_relays 一致
+        local target_num
+        target_num=$(awk -v n="$n" '!/^#/ && NF {cnt++; if(cnt==n){print NR; exit}}' "$RELAY_DB" | tr -d '\r')
+        [ -z "$target_num" ] && { log_error "找不到该序号"; return 1; }
+        awk -F'|' -v tn="$target_num" 'BEGIN{OFS="|"}
+            /^#/{print; next}
+            NF{gsub(/\r/,"",$9); $9=(NR==tn?1:0); print}' "$RELAY_DB" > "$RELAY_DB.tmp" && mv "$RELAY_DB.tmp" "$RELAY_DB"
+        regen_config && start_xray && log_success "模式切换已生效"
+    fi
+}
+
+relay_menu() {
+    while true; do
+        log_title "中转落地管理"
+        show_relay_mode; echo ""
+        echo "  1) 添加落地节点"
+        echo "  2) 查看所有落地"
+        echo "  3) 修改落地节点"
+        echo "  4) 删除落地节点"
+        echo "  5) 切换路由模式 (直连/中转)"
+        echo "  0) 返回主菜单"
+        read -rp "选择: " c
+        case "$c" in
+            1) add_relay ;; 2) list_relays ;; 3) edit_relay ;; 4) delete_relay ;; 5) switch_relay ;; 0) break ;; *) ;;
+        esac
+    done
+}
+
+# ==============================================================
+# Hysteria2 管理 (v2.4.0 新增)
+# DB 格式 (hy2.db, | 分隔, 文本字段已过滤 |):
+# svc_id|名称|主端口|跳跃类型(none/range/nat)|段起|段止|内网端口列表|外网端口串|
+# 密码|SNI|伪装类型(proxy/file/string)|伪装值|混淆开关(0/1)|混淆密码|
+# 上行Mbps|下行Mbps|忽略客户端带宽(0/1)
+# 约定:
+#   none : 单端口, 无跳跃
+#   range: 非 NAT 机, listen 写成 :起-止, hysteria2 自动建/清重定向规则
+#   nat  : NAT 机, listen 为单个内网主端口, 其余内网端口由脚本做
+#          REDIRECT 落到主端口; 客户端用外网端口串跳跃 (总数<=3)
+# 注意: hysteria2 没有 --test 校验模式, 本节用“启动服务 + 查 UDP
+#       监听 + 查进程”作为验收, 失败时打日志尾巴并回滚。
+# ==============================================================
+yaml_quote() {
+    local s="$1"
+    s=${s//\\/\\\\}
+    s=${s//\"/\\\"}
+    printf '"%s"' "$s"
+}
+
+hy2_is_uint() { case "$1" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+
+hy2_valid_port() {
+    hy2_is_uint "$1" || return 1
+    [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
+}
+
+# 统计外网端口串里的端口总数 ("40001-40003,40005" -> 4), 非法返回 1
+hy2_count_ports() {
+    local spec="$1" total=0 part a b
+    [ -z "$spec" ] && return 1
+    local old_ifs="$IFS"; IFS=','
+    for part in $spec; do
+        IFS="$old_ifs"
+        case "$part" in
+            *-*)
+                a="${part%%-*}"; b="${part##*-}"
+                hy2_valid_port "$a" && hy2_valid_port "$b" && [ "$a" -le "$b" ] || return 1
+                total=$((total + b - a + 1))
+                ;;
+            *)
+                hy2_valid_port "$part" || return 1
+                total=$((total + 1))
+                ;;
+        esac
+        IFS=','
+    done
+    IFS="$old_ifs"
+    echo "$total"
+    return 0
+}
+
+# 判断端口串是否全部为数字/逗号/横杠组成
+hy2_valid_port_spec() {
+    case "$1" in ''|*[!0-9,\-]*) return 1 ;; *) hy2_count_ports "$1" >/dev/null 2>&1 ;; esac
+}
+
+hy2_gen_hex() {
+    openssl rand -hex "$1" 2>/dev/null || od -An -tx1 /dev/urandom | tr -d ' \n' | head -c "$(( $1 * 2 ))"
+}
+
+hy2_new_svc_id() {
+    local id
+    while true; do
+        id="hy2-$(hy2_gen_hex 4)"
+        grep -q "^${id}|" "$HY2_DB" 2>/dev/null || { echo "$id"; return 0; }
+    done
+}
+
+install_hysteria() {
+    if [ -x "$HY2_BIN" ]; then return 0; fi
+    log_step "安装 Hysteria2..."
+    local tag
+    tag=$(curl -fsSL "https://api.github.com/repos/apernet/hysteria/releases/latest" 2>/dev/null | grep '"tag_name"' | head -1 | sed 's/.*"\(app\/v[^"]*\)".*/\1/')
+    [ -z "$tag" ] && tag="$HY2_VERSION_PIN"
+    local machine arch
+    machine=$(uname -m)
+    case "$machine" in
+        x86_64)        arch="amd64" ;;
+        aarch64|arm64) arch="arm64" ;;
+        armv7l)        arch="arm" ;;
+        *)             log_error "不支持的架构: $machine"; return 1 ;;
+    esac
+    local tmp
+    tmp=$(mktemp -d)
+    if ! gh_download "https://github.com/apernet/hysteria/releases/download/${tag}/hysteria-linux-${arch}" "$tmp/hysteria"; then
+        log_error "Hysteria2 下载失败 (版本 $tag)"
+        rm -rf "$tmp"
+        return 1
+    fi
+    install -m 755 "$tmp/hysteria" "$HY2_BIN"
+    rm -rf "$tmp"
+    if [ ! -x "$HY2_BIN" ]; then log_error "Hysteria2 安装后未找到二进制文件"; return 1; fi
+    log_success "Hysteria2 已安装: $("$HY2_BIN" version 2>/dev/null | grep -i "version" | head -1 || echo "$tag")"
+    return 0
+}
+
+write_hy2_service() {
+    local svc="$1"
+    local unit="hysteria2-${svc}"
+    mkdir -p "$HY2_ETC" "$HY2_LOG_DIR"
+    if [ "$SVC_MGR" = "systemd" ]; then
+        cat > "/etc/systemd/system/${unit}.service" <<HY2SVCEOF
+[Unit]
+Description=Hysteria2 Service (${svc})
+After=network-online.target nss-lookup.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ExecStartPre=/bin/sh ${HY2_ETC}/${svc}.fw.sh
+ExecStart=${HY2_BIN} server -c ${HY2_ETC}/${svc}.yaml
+Restart=on-failure
+RestartSec=3
+LimitNPROC=10000
+LimitNOFILE=1000000
+StandardOutput=append:${HY2_LOG_DIR}/${svc}.log
+StandardError=append:${HY2_LOG_DIR}/${svc}.log
+
+[Install]
+WantedBy=multi-user.target
+HY2SVCEOF
+        systemctl daemon-reload 2>/dev/null || true
+    else
+        cat > "/etc/init.d/${unit}" <<HY2ORCEOF
+#!/sbin/openrc-run
+name="${unit}"
+command="${HY2_BIN}"
+command_args="server -c ${HY2_ETC}/${svc}.yaml"
+command_background="yes"
+pidfile="/run/${unit}.pid"
+output_log="${HY2_LOG_DIR}/${svc}.log"
+error_log="${HY2_LOG_DIR}/${svc}.log"
+
+start_pre() {
+    [ -f "${HY2_ETC}/${svc}.fw.sh" ] && sh "${HY2_ETC}/${svc}.fw.sh" >/dev/null 2>&1
+    return 0
+}
+HY2ORCEOF
+        chmod +x "/etc/init.d/${unit}"
+    fi
+}
+
+hy2_svc_ctl() {
+    local svc="$1" act="$2"
+    if [ "$SVC_MGR" = "systemd" ]; then
+        systemctl "$act" "hysteria2-${svc}" >/dev/null 2>&1 || true
+    else
+        "/etc/init.d/hysteria2-${svc}" "$act" >/dev/null 2>&1 || true
+    fi
+}
+
+hy2_svc_enable() {
+    local svc="$1"
+    if [ "$SVC_MGR" = "systemd" ]; then
+        systemctl enable "hysteria2-${svc}" >/dev/null 2>&1 || true
+    else
+        rc-update add "hysteria2-${svc}" default >/dev/null 2>&1 || true
+    fi
+}
+
+hy2_svc_enabled() {
+    local svc="$1"
+    if [ "$SVC_MGR" = "systemd" ]; then
+        systemctl is-enabled "hysteria2-${svc}" 2>/dev/null | grep -qx "enabled"
+    else
+        rc-update show default 2>/dev/null | grep -qw "hysteria2-${svc}"
+    fi
+}
+
+hy2_svc_disable() {
+    local svc="$1"
+    if [ "$SVC_MGR" = "systemd" ]; then
+        systemctl disable "hysteria2-${svc}" >/dev/null 2>&1 || true
+    else
+        rc-update del "hysteria2-${svc}" default >/dev/null 2>&1 || true
+    fi
+}
+
+hy2_is_active() {
+    local svc="$1"
+    if [ "$SVC_MGR" = "systemd" ]; then
+        systemctl is-active --quiet "hysteria2-${svc}" 2>/dev/null
+    else
+        "/etc/init.d/hysteria2-${svc}" status 2>/dev/null | grep -q "started"
+    fi
+}
+
+hy2_show_log() {
+    local svc="$1"
+    local logf="$HY2_LOG_DIR/${svc}.log"
+    if [ -s "$logf" ]; then
+        tail -n 20 "$logf"
+    elif [ "$SVC_MGR" = "systemd" ] && cmd_exists journalctl; then
+        journalctl -u "hysteria2-${svc}" --no-pager -n 20 2>/dev/null || echo "(无日志)"
+    else
+        echo "(无日志)"
+    fi
+}
+
+# 生成自签证书 (hysteria2 必须配 tls 或 acme, 不配会直接拒绝启动)。
+# CN 与 SAN 都写 SNI, 客户端 insecure=1 跳过校验, sniGuard 默认 dns-san
+# 下 SNI 与 SAN 一致才能握手, 所以证书必须跟着 SNI 走。
+hy2_gen_cert() {
+    local svc="$1" sni="$2"
+    local crt="$HY2_CERT_DIR/${svc}.crt" key="$HY2_CERT_DIR/${svc}.key"
+    mkdir -p "$HY2_CERT_DIR"
+    if [ -f "$crt" ] && [ -f "$key" ]; then return 0; fi
+    openssl req -x509 -newkey rsa:2048 -nodes \
+        -keyout "$key" -out "$crt" -days 3650 \
+        -subj "/CN=${sni}" -addext "subjectAltName=DNS:${sni}" 2>/dev/null || return 1
+    chmod 600 "$key" 2>/dev/null || true
+    chmod 644 "$crt" 2>/dev/null || true
+    return 0
+}
+
+# 从 DB 读出指定 svc 的行并生成 YAML 配置 (文件扩展名必须是 .yaml，
+# hysteria2 不读无后缀/错后缀的配置文件名逻辑与 xray 类似)。
+hy2_gen_config() {
+    local svc="$1"
+    local line
+    line=$(awk -F'|' -v s="$svc" '$1==s {print; exit}' "$HY2_DB" | tr -d '\r')
+    [ -n "$line" ] || return 1
+    local _id name port hop_type hop_start hop_end int_ports ext_ports password sni masq_type masq_value obfs obfs_pw up down ignore_bw
+    IFS='|' read -r _id name port hop_type hop_start hop_end int_ports ext_ports password sni masq_type masq_value obfs obfs_pw up down ignore_bw <<< "$line"
+
+    local listen_spec=":${port}"
+    [ "$hop_type" = "range" ] && listen_spec=":${hop_start}-${hop_end}"
+
+    mkdir -p "$HY2_ETC"
+    {
+        echo "listen: ${listen_spec}"
+        echo "auth:"
+        echo "  type: password"
+        echo "  password: $(yaml_quote "$password")"
+        echo "tls:"
+        echo "  cert: ${HY2_CERT_DIR}/${svc}.crt"
+        echo "  key: ${HY2_CERT_DIR}/${svc}.key"
+        if { [ -n "$up" ] && [ "$up" != "0" ]; } || { [ -n "$down" ] && [ "$down" != "0" ]; }; then
+            echo "bandwidth:"
+            [ -n "$up" ] && [ "$up" != "0" ] && echo "  up: ${up} mbps"
+            [ -n "$down" ] && [ "$down" != "0" ] && echo "  down: ${down} mbps"
+        fi
+        if [ "$ignore_bw" = "1" ]; then
+            echo "ignoreClientBandwidth: true"
+        else
+            echo "ignoreClientBandwidth: false"
+        fi
+        if [ "$obfs" = "1" ]; then
+            echo "obfs:"
+            echo "  type: salamander"
+            echo "  salamander:"
+            echo "    password: $(yaml_quote "$obfs_pw")"
+        fi
+        echo "masquerade:"
+        case "$masq_type" in
+            proxy)
+                echo "  type: proxy"
+                echo "  proxy:"
+                echo "    url: $(yaml_quote "$masq_value")"
+                echo "    rewriteHost: true"
+                ;;
+            file)
+                echo "  type: file"
+                echo "  file:"
+                echo "    dir: $(yaml_quote "$masq_value")"
+                ;;
+            string)
+                echo "  type: string"
+                echo "  string:"
+                echo "    content: $(yaml_quote "$masq_value")"
+                echo "    statusCode: 200"
+                ;;
+        esac
+    } > "$HY2_ETC/${svc}.yaml"
+    return 0
+}
+
+# 生成防火墙脚本 (每次服务启动前都会重跑, 规则已存在则跳过, 不重复)。
+# 只写 UDP 规则; 端口变量全部经过校验, 空变量绝不写规则。
+# v2.4.2: 生成时若 firewalld 在运行, 额外写入 firewalld 等价放行;
+# 但 NAT 模式的 REDIRECT 重定向只走 iptables/ip6tables,
+# firewalld 不做等价重定向 (逐端口 REDIRECT 与其 rich rule 语义
+# 不等价, 强行映射容易出错), 代码里以注释标明。
+hy2_gen_fw_script() {
+    local svc="$1"
+    local line
+    line=$(awk -F'|' -v s="$svc" '$1==s {print; exit}' "$HY2_DB" | tr -d '\r')
+    [ -n "$line" ] || return 1
+    local _id name port hop_type hop_start hop_end int_ports ext_ports
+    IFS='|' read -r _id name port hop_type hop_start hop_end int_ports ext_ports _rest <<< "$line"
+    hy2_valid_port "$port" || return 1
+
+    local fw="$HY2_ETC/${svc}.fw.sh"
+    {
+        echo "#!/bin/sh"
+        echo "# vps_manager 自动生成: hy2 节点 ${svc} 的防火墙规则, 服务启动前重跑"
+        if [ "$hop_type" = "range" ]; then
+            echo "iptables -C INPUT -p udp --dport ${hop_start}:${hop_end} -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport ${hop_start}:${hop_end} -j ACCEPT 2>/dev/null"
+            echo "ip6tables -C INPUT -p udp --dport ${hop_start}:${hop_end} -j ACCEPT 2>/dev/null || ip6tables -I INPUT -p udp --dport ${hop_start}:${hop_end} -j ACCEPT 2>/dev/null"
+        else
+            echo "iptables -C INPUT -p udp --dport ${port} -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport ${port} -j ACCEPT 2>/dev/null"
+            echo "ip6tables -C INPUT -p udp --dport ${port} -j ACCEPT 2>/dev/null || ip6tables -I INPUT -p udp --dport ${port} -j ACCEPT 2>/dev/null"
+        fi
+        if [ "$hop_type" = "nat" ] && [ -n "$int_ports" ]; then
+            local old_ifs="$IFS" p
+            IFS=','
+            for p in $int_ports; do
+                IFS="$old_ifs"
+                hy2_valid_port "$p" || continue
+                [ "$p" = "$port" ] && continue
+                echo "iptables -C INPUT -p udp --dport ${p} -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport ${p} -j ACCEPT 2>/dev/null"
+                echo "ip6tables -C INPUT -p udp --dport ${p} -j ACCEPT 2>/dev/null || ip6tables -I INPUT -p udp --dport ${p} -j ACCEPT 2>/dev/null"
+                echo "iptables -t nat -C PREROUTING -p udp --dport ${p} -j REDIRECT --to-ports ${port} 2>/dev/null || iptables -t nat -A PREROUTING -p udp --dport ${p} -j REDIRECT --to-ports ${port} 2>/dev/null"
+                echo "ip6tables -t nat -C PREROUTING -p udp --dport ${p} -j REDIRECT --to-ports ${port} 2>/dev/null || ip6tables -t nat -A PREROUTING -p udp --dport ${p} -j REDIRECT --to-ports ${port} 2>/dev/null"
+                IFS=','
+            done
+            IFS="$old_ifs"
+        fi
+        if cmd_exists ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
+            if [ "$hop_type" = "range" ]; then
+                echo "ufw allow ${hop_start}:${hop_end}/udp >/dev/null 2>&1 || true"
+            else
+                echo "ufw allow ${port}/udp >/dev/null 2>&1 || true"
+            fi
+        fi
+        # firewalld: 按生成时刻的状态决定是否写入, 与 ufw 处理方式一致
+        if cmd_exists firewall-cmd && firewall-cmd --state >/dev/null 2>&1; then
+            if [ "$hop_type" = "range" ]; then
+                echo "firewall-cmd --permanent --add-port=${hop_start}-${hop_end}/udp >/dev/null 2>&1 || true"
+            else
+                echo "firewall-cmd --permanent --add-port=${port}/udp >/dev/null 2>&1 || true"
+            fi
+            if [ "$hop_type" = "nat" ] && [ -n "$int_ports" ]; then
+                local old_ifs_fw="$IFS" pf
+                IFS=','
+                for pf in $int_ports; do
+                    IFS="$old_ifs_fw"
+                    hy2_valid_port "$pf" || continue
+                    echo "firewall-cmd --permanent --add-port=${pf}/udp >/dev/null 2>&1 || true"
+                    IFS=','
+                done
+                IFS="$old_ifs_fw"
+            fi
+            echo "firewall-cmd --reload >/dev/null 2>&1 || true"
+        fi
+        echo "exit 0"
+    } > "$fw"
+    chmod +x "$fw"
+    return 0
+}
+
+# 删除某行配置对应的防火墙规则 (删除节点 / 改端口前调用)
+hy2_remove_fw() {
+    local line="$1"
+    [ -n "$line" ] || return 0
+    local _id name port hop_type hop_start hop_end int_ports
+    IFS='|' read -r _id name port hop_type hop_start hop_end int_ports _rest <<< "$line"
+    hy2_valid_port "$port" || return 0
+    if [ "$hop_type" = "range" ]; then
+        iptables -D INPUT -p udp --dport "${hop_start}:${hop_end}" -j ACCEPT 2>/dev/null || true
+        ip6tables -D INPUT -p udp --dport "${hop_start}:${hop_end}" -j ACCEPT 2>/dev/null || true
+    else
+        iptables -D INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || true
+        ip6tables -D INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || true
+    fi
+    if [ "$hop_type" = "nat" ] && [ -n "$int_ports" ]; then
+        local old_ifs="$IFS" p
+        IFS=','
+        for p in $int_ports; do
+            IFS="$old_ifs"
+            hy2_valid_port "$p" || continue
+            [ "$p" = "$port" ] && continue
+            iptables -D INPUT -p udp --dport "$p" -j ACCEPT 2>/dev/null || true
+            ip6tables -D INPUT -p udp --dport "$p" -j ACCEPT 2>/dev/null || true
+            iptables -t nat -D PREROUTING -p udp --dport "$p" -j REDIRECT --to-ports "$port" 2>/dev/null || true
+            ip6tables -t nat -D PREROUTING -p udp --dport "$p" -j REDIRECT --to-ports "$port" 2>/dev/null || true
+            IFS=','
+        done
+        IFS="$old_ifs"
+    fi
+    # v2.4.2: firewalld 正在运行时同步回收放行 (REDIRECT 部分仍只走
+    # 上面的 iptables/ip6tables, firewalld 不做等价重定向回收)
+    if cmd_exists firewall-cmd && firewall-cmd --state >/dev/null 2>&1; then
+        if [ "$hop_type" = "range" ]; then
+            firewall-cmd --permanent --remove-port="${hop_start}-${hop_end}/udp" >/dev/null 2>&1 || true
+        else
+            firewall-cmd --permanent --remove-port="${port}/udp" >/dev/null 2>&1 || true
+        fi
+        if [ "$hop_type" = "nat" ] && [ -n "$int_ports" ]; then
+            local old_ifs_r="$IFS" pr
+            IFS=','
+            for pr in $int_ports; do
+                IFS="$old_ifs_r"
+                hy2_valid_port "$pr" || continue
+                [ "$pr" = "$port" ] && continue
+                firewall-cmd --permanent --remove-port="${pr}/udp" >/dev/null 2>&1 || true
+                IFS=','
+            done
+            IFS="$old_ifs_r"
+        fi
+        firewall-cmd --reload >/dev/null 2>&1 || true
+    fi
+    return 0
+}
+
+hy2_udp_listening() {
+    ss -uln 2>/dev/null | grep -qE ":$1[[:space:]]"
+}
+
+# 启动并验收: 服务活着 + UDP 主端口在听。失败返回 1 并打日志尾巴。
+hy2_start_verify() {
+    local svc="$1" port="$2"
+    local i
+    hy2_svc_ctl "$svc" restart
+    for i in 1 2 3 4 5 6; do
+        sleep 1
+        if hy2_is_active "$svc" && hy2_udp_listening "$port"; then
+            return 0
+        fi
+    done
+    log_error "HY2 服务启动验收失败，日志尾巴："
+    hy2_show_log "$svc" | sed 's/^/    /'
+    return 1
+}
+
+# 端口冲突检查: 与其他 HY2 节点的端口/段/内网端口重叠, 或已被 UDP 监听。
+# exclude_svc 为空表示不排除 (新增时用)。
+hy2_port_conflict() {
+    local port="$1" exclude_svc="${2:-}"
+    local line svc2 _n port2 hop2 start2 end2 ints2
+    while IFS='|' read -r svc2 _n port2 hop2 start2 end2 ints2 _rest; do
+        [ -z "$svc2" ] && continue
+        case "$svc2" in '#'*) continue ;; esac
+        [ -n "$exclude_svc" ] && [ "$svc2" = "$exclude_svc" ] && continue
+        if [ "$hop2" = "range" ]; then
+            if [ "$port" -ge "$start2" ] && [ "$port" -le "$end2" ]; then return 0; fi
+        else
+            [ "$port" = "$port2" ] && return 0
+            if [ -n "$ints2" ]; then
+                local old_ifs="$IFS" p
+                IFS=','
+                for p in $ints2; do
+                    IFS="$old_ifs"
+                    [ "$port" = "$p" ] && return 0
+                    IFS=','
+                done
+                IFS="$old_ifs"
+            fi
+        fi
+    done < <(cat "$HY2_DB" 2>/dev/null | tr -d '\r')
+    hy2_udp_listening "$port" && return 0
+    return 1
+}
+
+# 段冲突检查: [start,end] 与其他 HY2 节点端口/段重叠, 或段内已有 UDP 监听。
+hy2_range_conflict() {
+    local start="$1" end="$2" exclude_svc="${3:-}"
+    # 注意: 绝不能逐个端口循环查 (旧写法对 30000-40000 这种万级端口段
+    # 会跑 10001 次 ss, 在小机器上等于假死)。这里一次遍历 DB 做区间
+    # 重叠算术判断, 再只跑一次 ss 取监听表比对, 段多大都一样快。
+    local line svc2 _n port2 hop2 start2 end2 ints2
+    while IFS='|' read -r svc2 _n port2 hop2 start2 end2 ints2 _rest; do
+        [ -z "$svc2" ] && continue
+        case "$svc2" in '#'*) continue ;; esac
+        [ -n "$exclude_svc" ] && [ "$svc2" = "$exclude_svc" ] && continue
+        if [ "$hop2" = "range" ]; then
+            # 区间重叠: start <= end2 && start2 <= end (空字段先跳过, 防脏数据)
+            case "$start2" in ''|*[!0-9]*) continue ;; esac
+            case "$end2" in ''|*[!0-9]*) continue ;; esac
+            if [ "$start" -le "$end2" ] && [ "$start2" -le "$end" ]; then return 0; fi
+        else
+            case "$port2" in ''|*[!0-9]*) ;; *) [ "$port2" -ge "$start" ] && [ "$port2" -le "$end" ] && return 0 ;; esac
+            if [ -n "$ints2" ]; then
+                local old_ifs="$IFS" p
+                IFS=','
+                for p in $ints2; do
+                    IFS="$old_ifs"
+                    case "$p" in ''|*[!0-9]*) ;; *) [ "$p" -ge "$start" ] && [ "$p" -le "$end" ] && return 0 ;; esac
+                    IFS=','
+                done
+                IFS="$old_ifs"
+            fi
+        fi
+    done < <(cat "$HY2_DB" 2>/dev/null | tr -d '\r')
+    # 段内已有 UDP 监听: 一次性取表比对
+    local lp
+    while read -r lp; do
+        case "$lp" in ''|*[!0-9]*) continue ;; esac
+        if [ "$lp" -ge "$start" ] && [ "$lp" -le "$end" ]; then return 0; fi
+    done < <(ss -uln 2>/dev/null | awk '{print $4}' | sed 's/.*://' | sort -un)
+    return 1
+}
+
+list_hy2() {
+    echo -e "\n${CYAN}── Hysteria2 节点列表 ────────────────────────${NC}"
+    [ ! -s "$HY2_DB" ] && { echo "  (无节点)"; return 0; }
+    local idx=0
+    while IFS='|' read -r svc name port hop_type hop_start hop_end int_ports ext_ports _rest; do
+        [ -z "$svc" ] && continue
+        case "$svc" in '#'*) continue ;; esac
+        idx=$((idx + 1))
+        local mode="单端口:$port"
+        [ "$hop_type" = "range" ] && mode="跳跃段:${hop_start}-${hop_end}"
+        [ "$hop_type" = "nat" ] && mode="NAT 外网:${ext_ports} -> 内网主端口:$port"
+        local st="停止"
+        hy2_is_active "$svc" && st="${GREEN}运行中${NC}"
+        echo -e "  [$idx] $name  $mode  状态:$st"
+    done < <(cat "$HY2_DB" 2>/dev/null | tr -d '\r')
+    [ "$idx" -eq 0 ] && echo "  (无节点)"
+    return 0
+}
+
+pick_hy2() {
+    list_hy2
+    [ ! -s "$HY2_DB" ] && return 1
+    local n
+    read -rp "请输入序号: " n
+    n=$(echo "$n" | tr -d ' ')
+    case "$n" in ''|*[!0-9]*) log_error "输入无效"; return 1;; esac
+    PICKED_HY2_NUM=$(awk -v n="$n" '!/^#/ && NF {cnt++; if(cnt==n){print NR; exit}}' "$HY2_DB" | tr -d '\r')
+    [ -z "$PICKED_HY2_NUM" ] && { log_error "找不到该序号"; return 1; }
+    PICKED_HY2_LINE=$(sed -n "${PICKED_HY2_NUM}p" "$HY2_DB" | tr -d '\r')
+    [ -z "$PICKED_HY2_LINE" ] && { log_error "读取节点数据失败"; return 1; }
+    return 0
+}
+
+# 客户端地址串: range -> "起-止", nat -> 外网端口串, none -> 主端口
+hy2_client_ports() {
+    local hop_type="$1" port="$2" hop_start="$3" hop_end="$4" ext_ports="$5"
+    case "$hop_type" in
+        range) echo "${hop_start}-${hop_end}" ;;
+        nat)   echo "$ext_ports" ;;
+        *)     echo "$port" ;;
+    esac
+}
+
+show_hy2_info() {
+    local line="$1"
+    local svc name port hop_type hop_start hop_end int_ports ext_ports password sni masq_type masq_value obfs obfs_pw up down ignore_bw
+    IFS='|' read -r svc name port hop_type hop_start hop_end int_ports ext_ports password sni masq_type masq_value obfs obfs_pw up down ignore_bw <<< "$line"
+    local cports
+    cports=$(hy2_client_ports "$hop_type" "$port" "$hop_start" "$hop_end" "$ext_ports")
+
+    local ipv4 ipv6
+    ipv4=$(safe_ipv4); ipv6=$(get_ipv6)
+    [ -n "$ipv4" ] && echo "$ipv4" > "$DATA_DIR/server_ip" 2>/dev/null
+    if [ -z "$ipv4" ] && [ -f "$DATA_DIR/server_ip" ]; then
+        ipv4=$(tr -d ' \r\n' < "$DATA_DIR/server_ip" 2>/dev/null)
+    fi
+
+    local qpw qsni qname qobfs
+    qpw=$(urlencode "$password")
+    qsni=$(urlencode "$sni")
+    qname=$(urlencode "$name")
+    qobfs=$(urlencode "$obfs_pw")
+
+    local obfs_q=""
+    [ "$obfs" = "1" ] && obfs_q="&obfs=salamander&obfs-password=${qobfs}"
+
+    echo -e "\n${CYAN}════ HY2 节点: $name ════${NC}"
+    echo "服务:        hysteria2-${svc}"
+    echo "主端口(UDP): $port"
+    [ "$hop_type" = "range" ] && echo "跳跃段:     ${hop_start}-${hop_end} (服务端自动重定向, 客户端默认 30 秒一跳)"
+    [ "$hop_type" = "nat" ] && echo "NAT 映射:   外网 ${ext_ports} -> 内网主端口 $port (内网端口: ${int_ports})"
+    echo "SNI:         $sni"
+    echo "密码:        $password"
+    [ "$obfs" = "1" ] && echo "混淆:        salamander (密码与认证密码不同)"
+    [ "$obfs" != "1" ] && echo "混淆:        未开启"
+    echo "伪装:        $masq_type ($masq_value)"
+    echo "带宽:        上行 ${up:-不限} Mbps / 下行 ${down:-不限} Mbps (0=不限, 服务端封顶)"
+    [ "$ignore_bw" = "1" ] && echo "忽略客户端带宽: 是 (强制 BBR, 不用 Brutal)"
+    echo -e "${YELLOW}注意: 本节点用自签证书, 客户端必须 insecure=1 (跳过校验)。${NC}"
+
+    local host4="$ipv4"
+    if [ -z "$host4" ]; then
+        host4="你的服务器IP"
+        echo -e "${YELLOW}提示: 未能自动检测公网 IP，已用占位符生成链接，请把「你的服务器IP」替换为实际 IP${NC}"
+    fi
+    echo -e "\n${GREEN}── HY2 URI (IPv4) ──${NC}\n${YELLOW}hysteria2://${qpw}@${host4}:${cports}?sni=${qsni}&insecure=1${obfs_q}#${qname}${NC}"
+    if [ -n "$ipv6" ]; then
+        echo -e "\n${GREEN}── HY2 URI (IPv6) ──${NC}\n${YELLOW}hysteria2://${qpw}@[${ipv6}]:${cports}?sni=${qsni}&insecure=1${obfs_q}#${qname}-v6${NC}"
+    fi
+    echo -e "\n${GREEN}── Mihomo (Clash Meta) 配置片段 ──${NC}"
+    echo "  - name: \"$name\""
+    echo "    type: hysteria2"
+    echo "    server: ${host4}"
+    if [ "$hop_type" = "none" ]; then
+        echo "    port: ${port}"
+    else
+        echo "    ports: \"${cports}\""
+    fi
+    echo "    password: \"$password\""
+    echo "    sni: $sni"
+    echo "    skip-cert-verify: true"
+    if [ "$obfs" = "1" ]; then
+        echo "    obfs: salamander"
+        echo "    obfs-password: \"$obfs_pw\""
+    fi
+    [ -n "$up" ] && [ "$up" != "0" ] && echo "    up: $up"
+    [ -n "$down" ] && [ "$down" != "0" ] && echo "    down: $down"
+    echo -e "${CYAN}═════════════════════${NC}\n"
+}
+
+add_hy2() {
+    log_title "添加 Hysteria2 节点"
+    [ ! -x "$HY2_BIN" ] && { system_init; install_hysteria || return 1; }
+    mkdir -p "$HY2_ETC" "$HY2_CERT_DIR" "$HY2_LOG_DIR"
+    touch "$HY2_DB" 2>/dev/null || true
+
+    local name
+    read -rp "节点名称 [回车=自动]: " name
+    [ -z "$name" ] && name="HY2-$(date +%m%d-%H%M)"
+    name=$(sanitize_field "$name")
+    [ -z "$name" ] && name="HY2-$(date +%m%d-%H%M)"
+
+    echo ""
+    echo "  服务器类型 (决定端口跳跃怎么做):"
+    echo "  1) 非 NAT 机: 公网 IP 直接在网卡上，端口段可大范围跳跃"
+    echo "  2) NAT 机: 面板只映射了少量端口，外网端口最多用 3 个"
+    local nat_choice
+    read -rp "请选择 [1/2, 回车=1]: " nat_choice
+    nat_choice=${nat_choice:-1}
+
+    local port hop_type="none" hop_start="" hop_end="" int_ports="" ext_ports=""
+    if [ "$nat_choice" = "2" ]; then
+        hop_type="nat"
+        echo -e "${YELLOW}请先在面板把外网端口映射到内网端口，再填下面两项。${NC}"
+        while true; do
+            read -rp "外网端口串 (如 40001-40003 或 40001,40002，最多 3 个端口): " ext_ports
+            ext_ports=$(echo "$ext_ports" | tr -d ' ')
+            local cnt
+            cnt=$(hy2_count_ports "$ext_ports" 2>/dev/null || echo "0")
+            if [ "$cnt" -ge 1 ] && [ "$cnt" -le 3 ]; then break; fi
+            log_error "外网端口串无效或超过 3 个端口 (当前算出 $cnt 个)，请重填"
+        done
+        read -rp "内网端口串 (与外网一一对应，逗号分隔；回车=与外网端口相同): " int_ports
+        int_ports=$(echo "$int_ports" | tr -d ' ')
+        [ -z "$int_ports" ] && int_ports="$ext_ports"
+        # 内网串若是范围先展开成列表 (REDIRECT 只能逐个端口写)
+        if echo "$int_ports" | grep -q '-'; then
+            local expanded="" part a b p
+            local old_ifs="$IFS"; IFS=','
+            for part in $int_ports; do
+                IFS="$old_ifs"
+                case "$part" in
+                    *-* )
+                        a="${part%%-*}"; b="${part##*-}"
+                        for p in $(seq "$a" "$b" 2>/dev/null); do expanded="${expanded}${expanded:+,}${p}"; done
+                        ;;
+                    * ) expanded="${expanded}${expanded:+,}${part}" ;;
+                esac
+                IFS=','
+            done
+            IFS="$old_ifs"
+            int_ports="$expanded"
+        fi
+        # 校验: 内网端口数 = 外网端口数, 或内网只有 1 个 (全部外网端口都映射到它)
+        local int_cnt ext_cnt
+        int_cnt=$(echo "$int_ports" | awk -F',' '{print NF}')
+        ext_cnt=$(hy2_count_ports "$ext_ports")
+        if [ "$int_cnt" != "$ext_cnt" ] && [ "$int_cnt" != "1" ]; then
+            log_error "内网端口数 ($int_cnt) 既不等于外网端口数 ($ext_cnt) 也不为 1，请重填"
+            return 1
+        fi
+        # 内网端口逐个校验为数字 (范围已在上面展开，残留非法 token 在此拦下)
+        local tok
+        local old_ifs2="$IFS"; IFS=','
+        for tok in $int_ports; do
+            IFS="$old_ifs2"
+            hy2_valid_port "$tok" || { log_error "内网端口串含非法端口: $tok"; return 1; }
+            IFS=','
+        done
+        IFS="$old_ifs2"
+        port=$(echo "$int_ports" | cut -d',' -f1)
+        if ! hy2_valid_port "$port"; then log_error "内网主端口无效"; return 1; fi
+        if hy2_port_conflict "$port"; then log_error "内网主端口 $port 已被其他 HY2 节点占用或已被 UDP 监听"; return 1; fi
+    else
+        echo ""
+        echo "  1) 单端口 (默认)"
+        echo "  2) 端口段跳跃 (服务端自动重定向，客户端默认 30 秒一跳)"
+        local hop_choice
+        read -rp "请选择 [1/2, 回车=1]: " hop_choice
+        hop_choice=${hop_choice:-1}
+        while true; do
+            read -rp "主端口 (UDP) [回车=443]: " port
+            [ -z "$port" ] && port=443
+            hy2_valid_port "$port" || { log_error "端口必须是 1-65535 的数字"; continue; }
+            hy2_port_conflict "$port" && { log_error "端口 $port 已被其他 HY2 节点占用或已被 UDP 监听"; continue; }
+            break
+        done
+        if [ "$hop_choice" = "2" ]; then
+            hop_type="range"
+            hop_start="$port"
+            while true; do
+                read -rp "跳跃段结束端口 (必须大于 $hop_start，如 50000): " hop_end
+                hy2_valid_port "$hop_end" || { log_error "端口必须是 1-65535 的数字"; continue; }
+                [ "$hop_end" -le "$hop_start" ] && { log_error "结束端口必须大于起始端口"; continue; }
+                hy2_range_conflict "$hop_start" "$hop_end" && { log_error "该端口段与已有 HY2 节点或 UDP 监听冲突"; continue; }
+                break
+            done
+            ext_ports="${hop_start}-${hop_end}"
+        fi
+    fi
+
+    local password
+    read -rp "认证密码 [回车=自动生成 32 位强密码]: " password
+    password=$(echo "$password" | tr -d ' ')
+    if [ -z "$password" ]; then
+        password=$(hy2_gen_hex 16)
+    elif [ "${#password}" -lt 12 ]; then
+        log_error "自定义密码太短，至少 12 位 (建议直接回车自动生成)"
+        return 1
+    fi
+
+    local sni
+    read -rp "SNI 域名 [回车=www.bing.com]: " sni
+    [ -z "$sni" ] && sni="www.bing.com"
+    sni=$(sanitize_field "$sni")
+    [ -z "$sni" ] && sni="www.bing.com"
+
+    echo ""
+    echo "  服务端伪装 Masquerade (非 HY2 客户端访问时看到的内容):"
+    echo "  1) 反代真实网站 (默认)"
+    echo "  2) 本地文件目录"
+    echo "  3) 固定字符串"
+    local masq_choice masq_type masq_value
+    read -rp "请选择 [1/2/3, 回车=1]: " masq_choice
+    masq_choice=${masq_choice:-1}
+    case "$masq_choice" in
+        2)
+            masq_type="file"
+            read -rp "本地目录 [回车=/var/www/masq]: " masq_value
+            [ -z "$masq_value" ] && masq_value="/var/www/masq"
+            mkdir -p "$masq_value" 2>/dev/null || true
+            if [ ! -f "$masq_value/index.html" ]; then
+                printf '<html><head><title>Welcome</title></head><body><h1>Welcome to nginx!</h1></body></html>\n' > "$masq_value/index.html" 2>/dev/null || true
+            fi
+            ;;
+        3)
+            masq_type="string"
+            read -rp "固定返回内容 [回车=Hello World]: " masq_value
+            [ -z "$masq_value" ] && masq_value="Hello World"
+            ;;
+        *)
+            masq_type="proxy"
+            read -rp "反代目标 URL [回车=https://www.bing.com]: " masq_value
+            [ -z "$masq_value" ] && masq_value="https://www.bing.com"
+            ;;
+    esac
+    masq_value=$(sanitize_field "$masq_value")
+
+    echo ""
+    echo -e "${YELLOW}关于混淆 Obfs 的权衡:${NC}"
+    echo "  salamander 会把每个包打乱成无规律字节，能绕过只针对 QUIC/HTTP3"
+    echo "  特征的封锁；但它不防 UDP 整体封锁、会增加 CPU 开销、且开启后"
+    echo "  不再兼容标准 QUIC 探测。网络本身没针对性封锁时，不开更快更稳。"
+    local obfs="0" obfs_pw=""
+    read -rp "是否开启 salamander 混淆? [y/N]: " obfs_ans
+    if [ "${obfs_ans:-N}" = "y" ] || [ "${obfs_ans:-N}" = "Y" ]; then
+        obfs="1"
+        read -rp "混淆密码 [回车=自动生成，必须与认证密码不同]: " obfs_pw
+        obfs_pw=$(echo "$obfs_pw" | tr -d ' ')
+        if [ -z "$obfs_pw" ]; then
+            obfs_pw=$(hy2_gen_hex 16)
+        elif [ "${#obfs_pw}" -lt 12 ]; then
+            log_error "混淆密码太短，至少 12 位"
+            return 1
+        elif [ "$obfs_pw" = "$password" ]; then
+            log_error "混淆密码不能与认证密码相同"
+            return 1
+        fi
+    fi
+
+    local up down
+    echo ""
+    echo "  带宽限制 (写进服务端，封顶 Brutal 的发送速率；服务端上行=客户端下行，反之亦然；"
+    echo "  不要高于线路真实速度，否则反而变慢不稳定；0 = 不限，走 BBR 自适应)"
+    read -rp "上行 Mbps [回车=0 不限]: " up; up=${up:-0}
+    read -rp "下行 Mbps [回车=0 不限]: " down; down=${down:-0}
+    hy2_is_uint "$up" || { log_error "上行必须是数字"; return 1; }
+    hy2_is_uint "$down" || { log_error "下行必须是数字"; return 1; }
+
+    local ignore_bw="0"
+    read -rp "是否忽略客户端带宽 (强制 BBR，不用 Brutal，适合求公平不抢占)? [y/N]: " ig_ans
+    if [ "${ig_ans:-N}" = "y" ] || [ "${ig_ans:-N}" = "Y" ]; then ignore_bw="1"; fi
+
+    local svc
+    svc=$(hy2_new_svc_id)
+    local newline
+    newline=$(printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' \
+        "$svc" "$name" "$port" "$hop_type" "$hop_start" "$hop_end" "$int_ports" "$ext_ports" \
+        "$password" "$sni" "$masq_type" "$masq_value" "$obfs" "$obfs_pw" "$up" "$down" "$ignore_bw")
+    printf '%s\n' "$newline" >> "$HY2_DB"
+    sanitize_db
+
+    if ! hy2_gen_cert "$svc" "$sni"; then
+        log_error "证书生成失败"
+        grep -v "^${svc}|" "$HY2_DB" > "$HY2_DB.tmp" && mv "$HY2_DB.tmp" "$HY2_DB"
+        return 1
+    fi
+    if ! hy2_gen_config "$svc" || ! hy2_gen_fw_script "$svc"; then
+        log_error "HY2 配置生成失败"
+        grep -v "^${svc}|" "$HY2_DB" > "$HY2_DB.tmp" && mv "$HY2_DB.tmp" "$HY2_DB"
+        return 1
+    fi
+    sh "$HY2_ETC/${svc}.fw.sh" >/dev/null 2>&1 || true
+    write_hy2_service "$svc"
+    hy2_svc_enable "$svc"
+
+    if hy2_start_verify "$svc" "$port"; then
+        log_success "HY2 节点添加成功！"
+        show_hy2_info "$newline"
+    else
+        # 段跳跃失败时，常见原因是内核缺 NAT 支持：自动降级为单端口
+        if [ "$hop_type" = "range" ]; then
+            log_warn "端口段模式启动失败 (常见原因：内核缺 NAT 模块，hysteria2 建不了重定向规则)，自动降级为单端口重试..."
+            # 先清掉段模式那次 fw 脚本已写入的段 INPUT 规则，否则残留的段规则会一直留在防火墙里
+            local old_line
+            old_line=$(awk -F'|' -v s="$svc" '$1==s {print; exit}' "$HY2_DB" | tr -d '\r')
+            hy2_remove_fw "$old_line"
+            local tmp
+            tmp=$(mktemp)
+            awk -F'|' -v s="$svc" 'BEGIN{OFS="|"} $1==s{$4="none"; $5=""; $6=""; $8="";} {print}' "$HY2_DB" > "$tmp" && mv "$tmp" "$HY2_DB"
+            sanitize_db
+            hy2_gen_config "$svc" && hy2_gen_fw_script "$svc" && sh "$HY2_ETC/${svc}.fw.sh" >/dev/null 2>&1 || true
+            if hy2_start_verify "$svc" "$port"; then
+                log_success "已降级为单端口模式并启动成功 (跳跃段在此机上不可用)。"
+                local new_line
+                new_line=$(awk -F'|' -v s="$svc" '$1==s {print; exit}' "$HY2_DB" | tr -d '\r')
+                show_hy2_info "$new_line"
+                return 0
+            fi
+        fi
+        log_error "HY2 节点启动失败，已回滚删除该节点"
+        hy2_svc_ctl "$svc" stop
+        hy2_svc_disable "$svc"
+        hy2_remove_fw "$newline"
+        rm -f "$HY2_ETC/${svc}.yaml" "$HY2_ETC/${svc}.fw.sh" "$HY2_CERT_DIR/${svc}.crt" "$HY2_CERT_DIR/${svc}.key"
+        [ "$SVC_MGR" = "systemd" ] && rm -f "/etc/systemd/system/hysteria2-${svc}.service" && systemctl daemon-reload 2>/dev/null || true
+        [ "$SVC_MGR" != "systemd" ] && rm -f "/etc/init.d/hysteria2-${svc}"
+        grep -v "^${svc}|" "$HY2_DB" > "$HY2_DB.tmp" && mv "$HY2_DB.tmp" "$HY2_DB"
+        return 1
+    fi
+}
+
+edit_hy2() {
+    log_title "修改 HY2 节点 (无损生效，端口/跳跃结构也可改)"
+    pick_hy2 || return
+    local old_line="$PICKED_HY2_LINE"
+    local svc name port hop_type hop_start hop_end int_ports ext_ports password sni masq_type masq_value obfs obfs_pw up down ignore_bw
+    IFS='|' read -r svc name port hop_type hop_start hop_end int_ports ext_ports password sni masq_type masq_value obfs obfs_pw up down ignore_bw <<< "$old_line"
+
+    echo -e "${CYAN}当前节点信息:${NC}"
+    echo " 名称: $name / 主端口: $port / 类型: $hop_type"
+    echo " SNI: $sni / 伪装: $masq_type ($masq_value)"
+    echo " 带宽: 上行 ${up} / 下行 ${down} Mbps / 混淆: $obfs"
+    echo -e "${YELLOW}提示: 下面输入新值，直接回车保持不变。端口与跳跃结构改动会重建防火墙规则。${NC}\n"
+
+    local nn np nhop nhs nhe nint next npw nsni nmasq_type nmasq_value nobfs nobfs_pw nup ndown nig
+    read -rp "新名称 [$name]: " nn; [ -z "$nn" ] && nn="$name"
+    nn=$(sanitize_field "$nn"); [ -z "$nn" ] && nn="$name"
+
+    read -rp "新主端口 [$port]: " np; [ -z "$np" ] && np="$port"
+    hy2_valid_port "$np" || { log_error "端口必须是 1-65535 的数字"; return 1; }
+    if [ "$np" != "$port" ] && hy2_port_conflict "$np" "$svc"; then log_error "端口 $np 已被占用"; return 1; fi
+
+    echo "  跳跃类型: 1) 单端口 2) 端口段 (非 NAT) 3) NAT 映射 (当前: $hop_type)"
+    read -rp "新跳跃类型 [回车=不变]: " nhop
+    local nhop_type="$hop_type" nhop_start="$hop_start" nhop_end="$hop_end" nint_ports="$int_ports" next_ports="$ext_ports"
+    case "$nhop" in
+        1) nhop_type="none"; nhop_start=""; nhop_end=""; nint_ports=""; next_ports="" ;;
+        2)
+            nhop_type="range"; nhop_start="$np"; nint_ports=""
+            read -rp "新跳跃段结束端口 [当前 ${hop_end:-无}]: " nhe
+            [ -z "$nhe" ] && nhe="$hop_end"
+            hy2_valid_port "$nhe" || { log_error "结束端口无效"; return 1; }
+            [ "$nhe" -le "$np" ] && { log_error "结束端口必须大于起始端口"; return 1; }
+            hy2_range_conflict "$np" "$nhe" "$svc" && { log_error "该端口段与已有 HY2 节点或 UDP 监听冲突"; return 1; }
+            nhop_end="$nhe"; next_ports="${np}-${nhe}"
+            ;;
+        3)
+            nhop_type="nat"
+            read -rp "新外网端口串 (最多 3 个端口): " next_ports
+            next_ports=$(echo "$next_ports" | tr -d ' ')
+            local cnt
+            cnt=$(hy2_count_ports "$next_ports" 2>/dev/null || echo "0")
+            if [ "$cnt" -lt 1 ] || [ "$cnt" -gt 3 ]; then log_error "外网端口串无效或超过 3 个端口"; return 1; fi
+            read -rp "新内网端口串 (逗号分隔，回车=与外网相同): " nint_ports
+            nint_ports=$(echo "$nint_ports" | tr -d ' ')
+            [ -z "$nint_ports" ] && nint_ports="$next_ports"
+            ;;
+        *) ;;
+    esac
+    if [ "$nhop_type" = "nat" ]; then
+        # 内网串若是范围先展开成列表 (与添加时一致, REDIRECT 只能逐个端口写)
+        if echo "$nint_ports" | grep -q '-'; then
+            local nexpanded="" npart na nb npt
+            local old_ifs_n="$IFS"; IFS=','
+            for npart in $nint_ports; do
+                IFS="$old_ifs_n"
+                case "$npart" in
+                    *-* )
+                        na="${npart%%-*}"; nb="${npart##*-}"
+                        for npt in $(seq "$na" "$nb" 2>/dev/null); do nexpanded="${nexpanded}${nexpanded:+,}${npt}"; done
+                        ;;
+                    * ) nexpanded="${nexpanded}${nexpanded:+,}${npart}" ;;
+                esac
+                IFS=','
+            done
+            IFS="$old_ifs_n"
+            nint_ports="$nexpanded"
+        fi
+        # 内网端口逐个校验为数字 (残留非法 token 在此拦下, 与添加时一致)
+        local ntok old_ifs_t="$IFS"; IFS=','
+        for ntok in $nint_ports; do
+            IFS="$old_ifs_t"
+            hy2_valid_port "$ntok" || { log_error "内网端口串含非法端口: $ntok"; return 1; }
+            IFS=','
+        done
+        IFS="$old_ifs_t"
+        local np_first
+        np_first=$(echo "$nint_ports" | cut -d',' -f1)
+        if [ "$np_first" != "$np" ]; then
+            # 内网首端口即主端口，保持一致
+            np="$np_first"
+            hy2_valid_port "$np" || { log_error "内网主端口无效"; return 1; }
+            if [ "$np" != "$port" ] && hy2_port_conflict "$np" "$svc"; then log_error "内网主端口 $np 已被占用"; return 1; fi
+        fi
+        local nint_cnt next_cnt
+        nint_cnt=$(echo "$nint_ports" | awk -F',' '{print NF}')
+        next_cnt=$(hy2_count_ports "$next_ports" 2>/dev/null || echo "0")
+        if [ "$nint_cnt" != "$next_cnt" ] && [ "$nint_cnt" != "1" ]; then
+            log_error "内网端口数 ($nint_cnt) 既不等于外网端口数 ($next_cnt) 也不为 1"
+            return 1
+        fi
+    fi
+
+    read -rp "新认证密码 (回车保持，输入新值则更换): " npw
+    [ -z "$npw" ] && npw="$password"
+    npw=$(echo "$npw" | tr -d ' ')
+    if [ "${#npw}" -lt 12 ]; then log_error "密码至少 12 位"; return 1; fi
+
+    read -rp "新 SNI [$sni]: " nsni; [ -z "$nsni" ] && nsni="$sni"
+    nsni=$(sanitize_field "$nsni"); [ -z "$nsni" ] && nsni="$sni"
+
+    echo "  伪装: 1) 反代 2) 本地文件 3) 固定字符串 (当前: $masq_type)"
+    read -rp "新伪装类型 [回车=不变]: " nmasq_type
+    nmasq_value="$masq_value"
+    case "$nmasq_type" in
+        1) masq_type="proxy"; read -rp "新反代 URL [$masq_value]: " nmasq_value; [ -z "$nmasq_value" ] && nmasq_value="$masq_value" ;;
+        2) masq_type="file"; read -rp "新本地目录 [$masq_value]: " nmasq_value; [ -z "$nmasq_value" ] && nmasq_value="$masq_value"; mkdir -p "$nmasq_value" 2>/dev/null || true ;;
+        3) masq_type="string"; read -rp "新固定内容 [$masq_value]: " nmasq_value; [ -z "$nmasq_value" ] && nmasq_value="$masq_value" ;;
+        *) ;;
+    esac
+    nmasq_value=$(sanitize_field "$nmasq_value"); [ -z "$nmasq_value" ] && nmasq_value="$masq_value"
+
+    read -rp "混淆开关 (当前 $obfs，输入 1 开启 / 0 关闭，回车=不变): " nobfs
+    [ -z "$nobfs" ] && nobfs="$obfs"
+    nobfs_pw="$obfs_pw"
+    if [ "$nobfs" = "1" ] && [ -z "$nobfs_pw" ]; then
+        read -rp "混淆密码 [回车=自动生成]: " nobfs_pw
+        nobfs_pw=$(echo "$nobfs_pw" | tr -d ' ')
+        [ -z "$nobfs_pw" ] && nobfs_pw=$(hy2_gen_hex 16)
+    fi
+    if [ "$nobfs" = "1" ] && [ "$nobfs_pw" = "$npw" ]; then log_error "混淆密码不能与认证密码相同"; return 1; fi
+    [ "$nobfs" != "1" ] && nobfs="0"
+
+    read -rp "新上行 Mbps [$up]: " nup; [ -z "$nup" ] && nup="$up"
+    read -rp "新下行 Mbps [$down]: " ndown; [ -z "$ndown" ] && ndown="$down"
+    hy2_is_uint "$nup" && hy2_is_uint "$ndown" || { log_error "带宽必须是数字"; return 1; }
+
+    read -rp "忽略客户端带宽 (当前 $ignore_bw，输入 1/0，回车=不变): " nig
+    [ -z "$nig" ] && nig="$ignore_bw"
+    [ "$nig" != "1" ] && nig="0"
+
+    local newline
+    newline=$(printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' \
+        "$svc" "$nn" "$np" "$nhop_type" "$nhop_start" "$nhop_end" "$nint_ports" "$next_ports" \
+        "$npw" "$nsni" "$masq_type" "$nmasq_value" "$nobfs" "$nobfs_pw" "$nup" "$ndown" "$nig")
+    replace_line_by_num "$HY2_DB" "$PICKED_HY2_NUM" "$newline"
+    sanitize_db
+
+    # 先清旧防火墙规则，再按新配置重建 (SNI 变了则证书重建)
+    hy2_remove_fw "$old_line"
+    if [ "$nsni" != "$sni" ]; then
+        rm -f "$HY2_CERT_DIR/${svc}.crt" "$HY2_CERT_DIR/${svc}.key"
+    fi
+    if ! hy2_gen_cert "$svc" "$nsni" || ! hy2_gen_config "$svc" || ! hy2_gen_fw_script "$svc"; then
+        log_error "配置生成失败，正在恢复旧配置"
+        replace_line_by_num "$HY2_DB" "$PICKED_HY2_NUM" "$old_line"
+        hy2_gen_config "$svc" && hy2_gen_fw_script "$svc"
+        hy2_svc_ctl "$svc" restart
+        return 1
+    fi
+    sh "$HY2_ETC/${svc}.fw.sh" >/dev/null 2>&1 || true
+    write_hy2_service "$svc"
+    hy2_svc_enable "$svc"
+    if hy2_start_verify "$svc" "$np"; then
+        log_success "HY2 节点修改成功，已重载生效"
+        show_hy2_info "$newline"
+    else
+        log_error "新配置启动失败，正在恢复旧配置"
+        hy2_remove_fw "$newline"
+        replace_line_by_num "$HY2_DB" "$PICKED_HY2_NUM" "$old_line"
+        hy2_gen_config "$svc" && hy2_gen_fw_script "$svc"
+        sh "$HY2_ETC/${svc}.fw.sh" >/dev/null 2>&1 || true
+        hy2_svc_ctl "$svc" restart
+    fi
+}
+
+delete_hy2() {
+    log_title "删除 HY2 节点"
+    pick_hy2 || return
+    local svc name
+    IFS='|' read -r svc name _rest <<< "$PICKED_HY2_LINE"
+    read -rp "确认删除 HY2 节点 '$name'? [y/N]: " c
+    [ "${c:-N}" != "y" ] && [ "${c:-N}" != "Y" ] && return
+
+    hy2_svc_ctl "$svc" stop
+    hy2_svc_disable "$svc"
+    hy2_remove_fw "$PICKED_HY2_LINE"
+    rm -f "$HY2_ETC/${svc}.yaml" "$HY2_ETC/${svc}.fw.sh" "$HY2_CERT_DIR/${svc}.crt" "$HY2_CERT_DIR/${svc}.key"
+    if [ "$SVC_MGR" = "systemd" ]; then
+        rm -f "/etc/systemd/system/hysteria2-${svc}.service"
+        systemctl daemon-reload 2>/dev/null || true
+    else
+        rm -f "/etc/init.d/hysteria2-${svc}"
+    fi
+    delete_line_by_num "$HY2_DB" "$PICKED_HY2_NUM"
+    sanitize_db
+    log_success "已删除 HY2 节点: $name"
+}
+
+view_hy2() {
+    log_title "查看单个 HY2 节点信息"
+    pick_hy2 || return
+    show_hy2_info "$PICKED_HY2_LINE"
+}
+
+view_all_hy2() {
+    log_title "所有 HY2 节点信息"
+    if [ ! -s "$HY2_DB" ]; then
+        echo "  (无节点)"
+        return
+    fi
+    while IFS='|' read -r line; do
+        [ -z "$line" ] && continue
+        case "$line" in '#'*) continue ;; esac
+        show_hy2_info "$line"
+    done < <(cat "$HY2_DB" | tr -d '\r')
+}
+
+test_hy2() {
+    log_title "检测 HY2 节点状态"
+    pick_hy2 || return
+    local svc name port hop_type hop_start hop_end int_ports ext_ports password sni masq_type masq_value
+    IFS='|' read -r svc name port hop_type hop_start hop_end int_ports ext_ports password sni masq_type masq_value _rest <<< "$PICKED_HY2_LINE"
+    echo ""
+
+    log_step "1. HY2 服务状态..."
+    if hy2_is_active "$svc"; then
+        log_success "HY2 运行中"
+    else
+        log_error "HY2 未运行，尝试启动..."
+        hy2_svc_ctl "$svc" start
+        hy2_is_active "$svc" && log_success "已成功启动" || log_error "启动失败，请查看日志"
+    fi
+
+    log_step "2. UDP 主端口 $port 监听检查..."
+    if hy2_udp_listening "$port"; then
+        log_success "UDP 端口 $port 正在监听"
+    else
+        log_warn "UDP 端口 $port 未检测到监听"
+    fi
+
+    log_step "3. 证书有效期..."
+    local crt="$HY2_CERT_DIR/${svc}.crt"
+    if [ -f "$crt" ]; then
+        openssl x509 -noout -enddate -in "$crt" 2>/dev/null | sed 's/^/    /'
+        openssl x509 -noout -checkend 0 -in "$crt" >/dev/null 2>&1 && log_success "证书未过期" || log_warn "证书已过期，请修改节点 (换 SNI) 重建证书"
+    else
+        log_warn "证书文件缺失"
+    fi
+
+    log_step "4. 伪装目标可达性..."
+    if [ "$masq_type" = "proxy" ]; then
+        local hc
+        hc=$(curl -sI --max-time 5 "$masq_value" -o /dev/null -w "%{http_code}" 2>/dev/null || echo "0")
+        case "$hc" in
+            2*|3*) log_success "伪装目标 $masq_value 连通正常 (HTTP $hc)" ;;
+            *)     log_warn "伪装目标 $masq_value 返回异常 ($hc)" ;;
+        esac
+    else
+        log_info "伪装类型 $masq_type 无需外网可达性检查"
+    fi
+
+    log_step "5. 配置文件..."
+    if [ -f "$HY2_ETC/${svc}.yaml" ]; then
+        log_success "配置文件存在: $HY2_ETC/${svc}.yaml"
+    else
+        log_error "配置文件缺失"
+    fi
+    echo ""
+    log_success "检测完成 - [$name] 状态检查结束"
+}
+
+hy2_menu() {
+    [ ! -x "$HY2_BIN" ] && { system_init; install_hysteria || return 1; }
+    mkdir -p "$HY2_ETC" "$HY2_CERT_DIR" "$HY2_LOG_DIR"
+    touch "$HY2_DB" 2>/dev/null || true
+    sanitize_db
+    while true; do
+        log_title "Hysteria2 节点管理"
+        list_hy2; echo ""
+        echo "  1) 添加 HY2 节点"
+        echo "  2) 查看单个 HY2 节点信息 & URI"
+        echo "  3) 查看所有 HY2 节点信息 & URI"
+        echo "  4) 修改 HY2 节点"
+        echo "  5) 删除 HY2 节点"
+        echo "  6) 检测 HY2 节点状态"
+        echo "  0) 返回主菜单"
+        read -rp "选择: " c
+        case "$c" in
+            1) add_hy2 ;; 2) view_hy2 ;; 3) view_all_hy2 ;; 4) edit_hy2 ;; 5) delete_hy2 ;; 6) test_hy2 ;; 0) break ;; *) ;;
+        esac
+    done
+}
+
+# ==============================================================
+# 开机自启修复 (v2.4.0 新增)
+# 旧脚本的问题定位:
+#   OpenRC 分支的 start_xray 只 restart，从未 rc-update add，
+#   所以 Alpine 机重启后 xray 不自启；systemd 分支的 enable
+#   失败被重定向吞掉且从未校验。本节补齐 + 校验 + 明说。
+# ==============================================================
+ensure_xray_autostart() {
+    [ -x "$XRAY_BIN" ] || return 0
+    if [ "$SVC_MGR" = "systemd" ]; then
+        if systemctl is-enabled xray 2>/dev/null | grep -qx "enabled"; then return 0; fi
+        systemctl enable xray >/dev/null 2>&1 || true
+        if systemctl is-enabled xray 2>/dev/null | grep -qx "enabled"; then
+            log_success "Xray 开机自启已补齐 (systemctl enable)"
+            return 0
+        fi
+        log_error "Xray 开机自启开启失败：systemctl enable 未生效 (若为无 systemd 的容器，请改用宿主或其他启动方式)"
+        return 1
+    else
+        if rc-update show default 2>/dev/null | grep -qw "xray"; then return 0; fi
+        rc-update add xray default >/dev/null 2>&1 || true
+        if rc-update show default 2>/dev/null | grep -qw "xray"; then
+            log_success "Xray 开机自启已补齐 (rc-update add xray default)"
+            return 0
+        fi
+        log_error "Xray 开机自启开启失败：rc-update add 未生效"
+        return 1
+    fi
+}
+
+ensure_hy2_autostart() {
+    [ -x "$HY2_BIN" ] || return 0
+    [ ! -s "$HY2_DB" ] && return 0
+    local svc line
+    while IFS='|' read -r line; do
+        [ -z "$line" ] && continue
+        case "$line" in '#'*) continue ;; esac
+        svc=$(echo "$line" | cut -d'|' -f1)
+        [ -z "$svc" ] && continue
+        if hy2_svc_enabled "$svc"; then continue; fi
+        hy2_svc_enable "$svc"
+        if hy2_svc_enabled "$svc"; then
+            log_success "HY2 节点 $svc 开机自启已补齐"
+        else
+            log_error "HY2 节点 $svc 开机自启开启失败"
+        fi
+    done < <(cat "$HY2_DB" | tr -d '\r')
+    return 0
+}
+
+ensure_autostart_all() {
+    ensure_xray_autostart || true
+    ensure_hy2_autostart || true
+    return 0
+}
+
+# 清空全部 HY2 足迹 (仅用于“清空重装 / 一键全新初始化”)
+hy2_wipe_all() {
+    [ ! -s "$HY2_DB" ] && [ ! -d "$HY2_ETC" ] && return 0
+    local line svc
+    while IFS='|' read -r line; do
+        [ -z "$line" ] && continue
+        case "$line" in '#'*) continue ;; esac
+        svc=$(echo "$line" | cut -d'|' -f1)
+        [ -z "$svc" ] && continue
+        hy2_svc_ctl "$svc" stop
+        hy2_svc_disable "$svc"
+        hy2_remove_fw "$line"
+        if [ "$SVC_MGR" = "systemd" ]; then
+            rm -f "/etc/systemd/system/hysteria2-${svc}.service"
+        else
+            rm -f "/etc/init.d/hysteria2-${svc}"
+        fi
+    done < <(cat "$HY2_DB" 2>/dev/null | tr -d '\r')
+    [ "$SVC_MGR" = "systemd" ] && systemctl daemon-reload 2>/dev/null || true
+    rm -rf "$HY2_ETC" "$HY2_LOG_DIR"
+    rm -f "$HY2_DB"
+    return 0
+}
+
+
+# ==============================================================
+# 内核升级的状态备份 / 恢复 (v2.5.2 新增)
+# 背景: 原 upgrade_xray 只备份了二进制和 .dat。一旦新内核起不来,
+# 回滚时恢复的是"旧二进制 + 已被覆盖的新配置"; 更糟的是 nodes.db /
+# relay.db / hy2.db 完全没备份 —— 里面是每个节点的 UUID 与 REALITY
+# 私钥, 丢了等于所有节点作废, 只能全部重建。
+# 这里把"能让服务恢复原样"的东西全备上, 备份不成功就不允许升级。
+# ==============================================================
+backup_xray_state() {
+    local bakdir="$1"
+    mkdir -p "$bakdir" || return 1
+    cp -a "$XRAY_BIN"                   "$bakdir/xray"         2>/dev/null || true
+    cp -a /usr/local/share/xray/*.dat   "$bakdir/"             2>/dev/null || true
+    cp -a "$XRAY_CONFIG"                "$bakdir/config.json"  2>/dev/null || true
+    cp -a "$NODE_DB"                    "$bakdir/nodes.db"     2>/dev/null || true
+    cp -a "$RELAY_DB"                   "$bakdir/relay.db"     2>/dev/null || true
+    cp -a "$HY2_DB"                     "$bakdir/hy2.db"       2>/dev/null || true
+    cp -a /etc/systemd/system/xray.service "$bakdir/xray.service" 2>/dev/null || true
+    cp -a "$HY2_ETC"/*.yaml             "$bakdir/"             2>/dev/null || true
+
+    # 关键数据必须确认落盘, 否则"备份"等于没有。节点库有内容却备份不出来
+    # 时直接失败, 让上层取消升级 —— 不冒节点全丢的风险。
+    if [ -s "$NODE_DB" ] && [ ! -s "$bakdir/nodes.db" ]; then
+        log_error "节点数据库备份失败 ($NODE_DB), 已中止升级以避免数据丢失。"
+        return 1
+    fi
+    if [ -s "$RELAY_DB" ] && [ ! -s "$bakdir/relay.db" ]; then
+        log_error "中转数据库备份失败 ($RELAY_DB), 已中止升级以避免数据丢失。"
+        return 1
+    fi
+    return 0
+}
+
+restore_xray_state() {
+    local bakdir="$1" f
+    [ -s "$bakdir/xray" ]          && install -m 755 "$bakdir/xray" "$XRAY_BIN"
+    if [ -d "$bakdir" ]; then
+        cp -a "$bakdir/"*.dat /usr/local/share/xray/ 2>/dev/null || true
+        for f in "$bakdir"/*.yaml; do
+            [ -s "$f" ] && cp -a "$f" "$HY2_ETC/" 2>/dev/null || true
+        done
+    fi
+    [ -s "$bakdir/config.json" ]   && cp -a "$bakdir/config.json"   "$XRAY_CONFIG"
+    [ -s "$bakdir/nodes.db" ]      && cp -a "$bakdir/nodes.db"      "$NODE_DB"
+    [ -s "$bakdir/relay.db" ]      && cp -a "$bakdir/relay.db"      "$RELAY_DB"
+    [ -s "$bakdir/hy2.db" ]        && cp -a "$bakdir/hy2.db"        "$HY2_DB"
+    [ -s "$bakdir/xray.service" ]  && cp -a "$bakdir/xray.service"  /etc/systemd/system/xray.service
+    return 0
+}
+# v2.5.2: 只保留最近 N 份内核备份。每份含 xray 二进制 (~30MB) + .dat +
+# 配置与节点库, 升级几次就能把 /root 堆满 —— 磁盘满是比升级失败更常见的
+# "服务莫名其妙挂掉"的原因。
+prune_xray_backups() {
+    local keep="${1:-3}" dirs n
+    [ -d "$BACKUP_DIR" ] || return 0
+    dirs=$(ls -1dt "$BACKUP_DIR"/xray-core-* 2>/dev/null | tail -n +$((keep + 1)))
+    [ -z "$dirs" ] && return 0
+    n=$(printf '%s\n' "$dirs" | wc -l | tr -d ' ')
+    printf '%s\n' "$dirs" | while IFS= read -r d; do
+        [ -n "$d" ] && [ -d "$d" ] && rm -rf "$d"
+    done
+    log_info "已清理 ${n} 份过期内核备份 (保留最近 ${keep} 份)。"
+    return 0
+}
+
+# ==============================================================
+# Xray 内核升级 (v2.4.2 新增, 主菜单 13)
+# 与 install_xray 分工: install 只负责“无 → 有”且锁版本; 升级走
+# 这里。旧二进制先备份, 新内核验收不过自动回滚, 全程菜单操作。
+# ==============================================================
+upgrade_xray() {
+    log_title "升级 Xray 内核"
+    if [ ! -x "$XRAY_BIN" ]; then
+        log_warn "本机尚未安装 Xray, 请先用主菜单 [1) 添加节点] 完成安装 (将安装锁定版本 ${XRAY_VERSION_PIN})。"
+        return 1
+    fi
+    xray_kernel_version
+    local cur="$XRAY_VER_STR"
+    echo -e " 当前内核版本: ${CYAN}Xray ${cur:-未知}${NC}"
+    echo -e " 锁定版本 (推荐): ${GREEN}${XRAY_VERSION_PIN}${NC}"
+    echo ""
+    echo "  1) 升级到锁定版本 ${XRAY_VERSION_PIN} (推荐, 已验证)"
+    echo "  2) 升级到官方最新版 (版本未知, 可能引入未验证的协议变更)"
+    echo "  0) 取消"
+    local ch target=""
+    read -rp "请选择 [1/2/0]: " ch
+    case "$ch" in
+        1) target="$XRAY_VERSION_PIN" ;;
+        2)
+            target=$(curl -fsSL "https://api.github.com/repos/XTLS/Xray-core/releases/latest" 2>/dev/null | grep '"tag_name"' | head -1 | sed 's/.*"\(v[^"]*\)".*/\1/')
+            if [ -z "$target" ]; then log_error "获取官方最新版本失败, 已取消"; return 1; fi
+            log_warn "目标为官方最新版 ${target}: 未经本脚本验证, 升级后请第一时间用客户端实测各节点连通性。"
+            ;;
+        *) log_info "已取消升级"; return 0 ;;
+    esac
+
+    local target_num="${target#v}"
+    if [ -n "$cur" ] && [ "$cur" = "$target_num" ]; then
+        log_success "当前已是 ${target}, 无需升级。"
+        return 0
+    fi
+
+    local tmp
+    tmp=$(mktemp -d)
+    log_step "下载 Xray ${target}..."
+    if ! xray_fetch_zip "$target" "$tmp"; then
+        log_error "下载或解压失败, 内核未做任何更换。"
+        rm -rf "$tmp"
+        return 1
+    fi
+
+    # 备份完整状态 (内核 + .dat + config.json + 节点库 + service)
+    local ts bakdir
+    ts=$(date +%Y%m%d-%H%M%S)
+    bakdir="$BACKUP_DIR/xray-core-${cur:-unknown}-${ts}"
+    log_step "备份当前完整状态 (内核/配置/节点库)..."
+    if ! backup_xray_state "$bakdir"; then
+        log_error "备份未通过校验, 已取消升级 (不冒数据丢失的风险)。"
+        rm -rf "$tmp"
+        return 1
+    fi
+    log_info "完整状态已备份到: $bakdir"
+
+    # 是否跨过 26.9.8 边界 (旧 < 26.9.8 且 新 >= 26.9.8)
+    local crossed=0 cc tc
+    if [ -n "$cur" ]; then
+        ver_cmp "v$cur" "v26.9.8"; cc=$?
+        ver_cmp "$target" "v26.9.8"; tc=$?
+        if [ "$cc" -eq 2 ] && [ "$tc" -ne 2 ]; then crossed=1; fi
+    fi
+
+    log_step "替换内核并重启服务..."
+    if [ "$SVC_MGR" = "systemd" ]; then systemctl stop xray >/dev/null 2>&1 || true
+    else /etc/init.d/xray stop >/dev/null 2>&1 || true; fi
+    install -m 755 "$tmp/unzipped/xray" "$XRAY_BIN"
+    mkdir -p /usr/local/share/xray
+    cp "$tmp/unzipped/"*.dat /usr/local/share/xray/ 2>/dev/null || true
+    rm -rf "$tmp"
+    XRAY_VER_CHECKED=0; XRAY_VER_STR=""
+    write_xray_service
+
+    local ok=0
+    if regen_config; then
+        start_xray
+        sleep 1
+        xray_kernel_version
+        if xray_is_active && [ "$XRAY_VER_STR" = "$target_num" ]; then ok=1; fi
+    fi
+
+    if [ "$ok" = "1" ]; then
+        log_success "内核升级成功: ${cur:-未知} → ${target_num}"
+        prune_xray_backups 3
+        if [ "$crossed" = "1" ]; then
+            log_warn "注意: 本次升级跨过了 26.9.8 边界, 新内核要求客户端 ClientHello 带 X25519MLKEM768:"
+            log_warn "  - 本脚本之后生成的 vless 链接会自动带 support-x25519mlkem768=true 提示, 用主菜单 [4/5] 重新查看节点即可拿到新链接;"
+            log_warn "  - sing-box / Shadowrocket 等未更新到支持 MLKEM 的客户端将连不上, 属上游兼容问题, 不是节点故障。"
+        fi
+        return 0
+    fi
+
+    log_error "新内核启动验收失败, 正在完整回滚到旧状态 (${cur:-未知})..."
+    if [ "$SVC_MGR" = "systemd" ]; then systemctl stop xray >/dev/null 2>&1 || true
+    else /etc/init.d/xray stop >/dev/null 2>&1 || true; fi
+    # v2.5.2: 恢复的是"内核 + config.json + 节点库 + service"整套状态,
+    # 而不是只把二进制退回去。回滚后不再 regen_config —— 升级过程已经
+    # 用新内核验证过一遍配置, 再生成一次只会多一次写坏配置的机会。
+    restore_xray_state "$bakdir"
+    XRAY_VER_CHECKED=0; XRAY_VER_STR=""; XRAY_VER_FALLBACK=0
+    write_xray_service
+    start_xray
+    if xray_is_active; then
+        xray_kernel_version
+        log_warn "已完整回滚 (内核 + 配置 + 节点库), 当前版本: ${XRAY_VER_STR:-未知}。"
+        log_warn "本次升级未生效, 原有节点与配置未受影响。"
+    else
+        log_error "回滚后服务仍未运行。完整备份在 $bakdir, 可手工恢复:"
+        log_error "  install -m 755 $bakdir/xray $XRAY_BIN"
+        log_error "  cp -a $bakdir/config.json $XRAY_CONFIG"
+        log_error "  cp -a $bakdir/nodes.db    $NODE_DB"
+        log_error "  cp -a $bakdir/relay.db    $RELAY_DB"
+        log_error "  然后: systemctl restart xray"
+    fi
+    return 1
+}
+
+# >>> TUNE-MODULE-START  (v2.6.0 网络自检与差异化 TCP 调优)
+# ==============================================================
+# 设计约束（改动本模块前请先读）
+#   1. 单文件自包含，只依赖 coreutils / procps / curl / awk；不改 Xray、HY2、
+#      防火墙、DNS、路由，也不安装任何软件包。
+#   2. 只写「未被其它配置文件占用」且「当前内核确实可写」的 sysctl 键。
+#      v2.5.x 的 BBR(/etc/sysctl.conf) 与 99-proxy-harden.conf 一律不抢。
+#   3. 每次 apply 前必备份；支持临时试跑(不落盘/重启即还原) + 一键回滚。
+#   4. KVM / NAT / LXC / OpenVZ 自适应：内存分档 + 逐键可写性实测。
+#   5. 参数由 BDP = 实测上行带宽 × 到本地 RTT 推导，每台机器各算一份。
+# ==============================================================
+TUNE_DIR="$DATA_DIR/tune"
+TUNE_BACKUP_DIR="$TUNE_DIR/backups"
+TUNE_CONF="/etc/sysctl.d/98-vps-net-tune.conf"
+TUNE_STATE="$TUNE_DIR/state.env"
+TUNE_LAST_BACKUP="$TUNE_DIR/last-backup"
+TUNE_MARK="generated-by: xray-v2.6.0-net-tune"
+TUNE_BLOCK_BEGIN="# BEGIN xray-v2.6.0-net-tune"
+TUNE_BLOCK_END="# END xray-v2.6.0-net-tune"
+
+# 本模块「有可能」写入的键。注意：刻意不含 tcp_congestion_control、
+# default_qdisc、tcp_fastopen、conntrack_max、ip_local_port_range、somaxconn、
+# tcp_max_syn_backlog —— 这些已由旧版脚本或 99-proxy-harden.conf 管理。
+TUNE_MANAGED_KEYS=(
+    net.core.rmem_max
+    net.core.wmem_max
+    net.ipv4.tcp_rmem
+    net.ipv4.tcp_wmem
+    net.ipv4.tcp_slow_start_after_idle
+    net.ipv4.tcp_mtu_probing
+    net.ipv4.tcp_notsent_lowat
+    net.core.netdev_max_backlog
+)
+TUNE_PLAN=()
+TUNE_SKIP=()
+TUNE_OK_KEYS=" "
+TUNE_BAD_KEYS=" "
+TUNE_HAD_XRAY=0
+TUNE_ENV_MEM_MB=0
+TUNE_ENV_VIRT="unknown"
+TUNE_ENV_CLASS="full"
+
+tune_pause() { echo ""; read -rp "按回车继续..." _tune_dummy || true; }
+
+tune_load_state() {
+    [ -f "$TUNE_STATE" ] && . "$TUNE_STATE" 2>/dev/null || true
+    : "${TUNE_UP_MBPS:=0}"       "${TUNE_DOWN_MBPS:=0}"
+    : "${TUNE_UP_SRC:=none}"     "${TUNE_RTT_MS:=0}"
+    : "${TUNE_RTT_SRC:=none}"    "${TUNE_LOCAL_IP:=}"
+    : "${TUNE_LOCAL_CAP_MBPS:=0}" "${TUNE_DIST:=unknown}"
+    : "${TUNE_UPDATED:=never}"
+}
+
+tune_save_state() {
+    mkdir -p "$TUNE_DIR" 2>/dev/null || return 1
+    {
+        echo "TUNE_UP_MBPS=${TUNE_UP_MBPS:-0}"
+        echo "TUNE_DOWN_MBPS=${TUNE_DOWN_MBPS:-0}"
+        echo "TUNE_UP_SRC=${TUNE_UP_SRC:-none}"
+        echo "TUNE_RTT_MS=${TUNE_RTT_MS:-0}"
+        echo "TUNE_RTT_SRC=${TUNE_RTT_SRC:-none}"
+        echo "TUNE_LOCAL_IP=${TUNE_LOCAL_IP:-}"
+        echo "TUNE_LOCAL_CAP_MBPS=${TUNE_LOCAL_CAP_MBPS:-0}"
+        echo "TUNE_DIST=${TUNE_DIST:-unknown}"
+        echo "TUNE_UPDATED=$(date +%Y%m%d-%H%M%S)"
+    } > "$TUNE_STATE" 2>/dev/null || return 1
+}
+
+# ── 环境识别 ──────────────────────────────────────────────────
+tune_detect_virt() {
+    local v=""
+    if command -v systemd-detect-virt >/dev/null 2>&1; then
+        v=$(systemd-detect-virt 2>/dev/null || true)
+    fi
+    if [ -z "$v" ] || [ "$v" = "none" ]; then
+        if [ -f /.dockerenv ] || grep -qE 'docker|lxc|kubepods|containerd' /proc/1/cgroup 2>/dev/null; then
+            v="container"
+        elif [ -d /proc/vz ] && [ ! -d /proc/bc ]; then
+            v="openvz"
+        elif [ -d /proc/xen ]; then
+            v="xen"
+        elif grep -qi 'hypervisor' /proc/cpuinfo 2>/dev/null; then
+            v="kvm"
+        else
+            v="unknown"
+        fi
+    fi
+    echo "$v"
+}
+
+tune_detect_env() {
+    local mk class
+    mk=$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null || echo 0)
+    mk=${mk:-0}
+    TUNE_ENV_MEM_MB=$(( ${mk:-0} / 1024 ))
+    TUNE_ENV_VIRT=$(tune_detect_virt)
+    case "$TUNE_ENV_VIRT" in
+        openvz|lxc|docker|container|podman|wsl|systemd-nspawn)
+            class="container" ;;
+        *) class="full" ;;
+    esac
+    TUNE_ENV_CLASS="$class"
+}
+
+tune_dist_label() {
+    case "${1:-}" in
+        near)     echo "近距 <30ms（同城/周边）" ;;
+        regional) echo "区域 30-80ms（日本/新加坡）" ;;
+        far)      echo "跨洋 80-160ms（美西）" ;;
+        veryfar)  echo "远洋 >160ms（美东/欧洲）" ;;
+        *)        echo "未测量" ;;
+    esac
+}
+
+tune_classify_rtt() {
+    local r=${1:-0}
+    if   [ "$r" -lt 30 ];  then echo "near"
+    elif [ "$r" -lt 80 ];  then echo "regional"
+    elif [ "$r" -lt 160 ]; then echo "far"
+    else                        echo "veryfar"
+    fi
+}
+
+# ── 归属与可写性探测 ──────────────────────────────────────────
+# 返回「已占用该键的配置文件路径」；本模块自己的 conf 不算。
+tune_key_owner() {
+    local k=$1 re f
+    re=${k//./\\.}
+    for f in /etc/sysctl.conf /etc/sysctl.d/*.conf; do
+        [ -f "$f" ] || continue
+        [ "$f" = "$TUNE_CONF" ] && continue
+        # 一律走 awk：既跳过本模块自己写进 sysctl.conf 的标记块，
+        # 也避开不同 grep 实现对 -E 转义的差异。
+        if awk -v b="$TUNE_BLOCK_BEGIN" -v e="$TUNE_BLOCK_END" '
+                $0 == b { skip=1; next }
+                $0 == e { skip=0; next }
+                !skip   { print }
+           ' "$f" 2>/dev/null | grep -qE "^[[:space:]]*${re}[[:space:]]*=" 2>/dev/null; then
+            echo "$f"; return 0
+        fi
+    done
+    return 1
+}
+
+tune_is_writable() {
+    case " $TUNE_OK_KEYS " in *" $1 "*) return 0 ;; esac
+    case " $TUNE_BAD_KEYS " in *" $1 "*) return 1 ;; esac
+    tune_probe_writable "$1"
+    case " $TUNE_OK_KEYS " in *" $1 "*) return 0 ;; esac
+    return 1
+}
+
+# 用「写回原值」探测是否可写：不改变系统状态，容器只读 /proc/sys 会失败。
+tune_probe_writable() {
+    local k=$1 old
+    case " $TUNE_OK_KEYS " in *" $k "*) return 0 ;; esac
+    case " $TUNE_BAD_KEYS " in *" $k "*) return 1 ;; esac
+    old=$(sysctl -n "$k" 2>/dev/null || true)
+    if [ -z "$old" ] || ! sysctl -w "$k=$old" >/dev/null 2>&1; then
+        TUNE_BAD_KEYS="${TUNE_BAD_KEYS}${k} "
+        return 1
+    fi
+    TUNE_OK_KEYS="${TUNE_OK_KEYS}${k} "
+    return 0
+}
+
+# ── 只读环境体检 ──────────────────────────────────────────────
+tune_show_env() {
+    tune_detect_env
+    local k owner wr cpu mtu iface cc qd v4 v6 cur
+    cpu=$(grep -c '^processor' /proc/cpuinfo 2>/dev/null || echo 1)
+    cpu=${cpu:-1}
+    iface=$(awk '$2=="00000000"{print $1; exit}' /proc/net/route 2>/dev/null || true)
+    [ -z "$iface" ] && iface=$(ip route 2>/dev/null | awk '/default/{print $5; exit}')
+    mtu=$(cat "/sys/class/net/${iface:-lo}/mtu" 2>/dev/null || echo "n/a")
+    cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo n/a)
+    qd=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo n/a)
+    v4=$(curl -4 -s --max-time 4 https://api4.ipify.org 2>/dev/null || true)
+    v6=$(curl -6 -s --max-time 4 https://api6.ipify.org 2>/dev/null || true)
+
+    log_title "网络与系统体检（只读）"
+    echo "  系统      : $(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-unknown}")"
+    echo "  内核      : $(uname -r)"
+    echo "  虚拟化    : ${TUNE_ENV_VIRT}  →  ${TUNE_ENV_CLASS}"
+    echo "  CPU / 内存: ${cpu} 核 / ${TUNE_ENV_MEM_MB} MB"
+    echo "  网卡 / MTU: ${iface:-n/a} / ${mtu}"
+    echo "  出口 IPv4 : ${v4:-无（NAT 纯 v6 常见）}"
+    echo "  出口 IPv6 : ${v6:-无}"
+    echo "  拥塞控制  : ${cc}   (可用: $(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || echo n/a))"
+    echo "  队列规则  : ${qd}"
+    echo ""
+    echo -e "  ${CYAN}本模块管理的键（现值 / 归属 / 可写性）${NC}"
+    for k in "${TUNE_MANAGED_KEYS[@]}"; do
+        owner=$(tune_key_owner "$k" 2>/dev/null || true)
+        if [ -n "$owner" ]; then
+            wr="被 ${owner} 占用 → 跳过"
+        elif tune_is_writable "$k"; then
+            wr="可写"
+        else
+            wr="内核只读/不存在 → 跳过"
+        fi
+        printf "    %-40s %s\n" "$k" "$wr"
+        cur=$(sysctl -n "$k" 2>/dev/null | tr '\t' ' ' || true)
+        printf "      现值: %s\n" "${cur:-n/a}"
+    done
+    if [ -f "$TUNE_CONF" ]; then
+        echo ""
+        log_info "已存在本模块配置: ${TUNE_CONF}（菜单 8 可一键回滚）"
+    fi
+    echo ""
+    echo "  说明: 窗口缩放 / SACK / ECN 只校验不修改；MSS clamp 与拥塞控制切换"
+    echo "        只给建议，因为改它们需要动防火墙或旧版脚本已占用的键。"
+    tune_pause
+}
+
+# ── 带宽测量 ──────────────────────────────────────────────────
+# $1=url  $2=speed_download|speed_upload  $3=可选的 POST 文件
+tune_curl_speed_mbps() {
+    local url=$1 field=$2 postf=${3:-} flag out mb
+    command -v curl >/dev/null 2>&1 || { echo 0; return; }
+    for flag in -4 -6 ""; do
+        if [ -n "$postf" ]; then
+            out=$(curl $flag -s -o /dev/null -w "%{${field}}" --max-time 20 \
+                  -X POST --data-binary "@${postf}" "$url" 2>/dev/null || true)
+        else
+            out=$(curl $flag -s -o /dev/null -w "%{${field}}" --max-time 20 \
+                  "$url" 2>/dev/null || true)
+        fi
+        mb=$(awk -v s="${out:-0}" 'BEGIN{ s+=0; if(s>0) printf "%d", s*8/1000000+0.5; else print 0 }' 2>/dev/null || echo 0)
+        [ "${mb:-0}" -gt 0 ] 2>/dev/null && { echo "$mb"; return; }
+    done
+    echo 0
+}
+
+tune_measure_bandwidth() {
+    tune_load_state
+    local down up tmp ov
+    log_title "VPS 外网带宽实测"
+    echo "  下行用 Cloudflare 10MB 探测文件；上行用 2MB POST 到 Cloudflare __up。"
+    echo "  纯 IPv6 的 NAT 机自动尝试 -6；小资源机串行测量，约 20-50 秒。"
+    echo ""
+    log_step "测下行..."
+    down=$(tune_curl_speed_mbps "https://speed.cloudflare.com/__down?bytes=10000000" "speed_download")
+    log_step "测上行（代理下载方向靠 VPS 上行，这个更关键）..."
+    tmp=$(mktemp /tmp/tune-up.XXXXXX 2>/dev/null || true)
+    up=0
+    if [ -n "$tmp" ] && [ -w "$tmp" ]; then
+        dd if=/dev/zero of="$tmp" bs=1M count=2 >/dev/null 2>&1 || true
+        up=$(tune_curl_speed_mbps "https://speed.cloudflare.com/__up" "speed_upload" "$tmp")
+        rm -f "$tmp"
+    fi
+    echo ""
+    if [ "${down:-0}" -eq 0 ] && [ "${up:-0}" -eq 0 ]; then
+        log_warn "自动测量失败（可能无外网、Cloudflare 不可达或 curl 缺失）。"
+        log_warn "请直接手填商家标称/你实测的带宽，脚本照样能按 BDP 算参数。"
+    else
+        log_success "实测: 下行 ${down} Mbps / 上行 ${up} Mbps"
+    fi
+    if [ "${up:-0}" -eq 0 ] && [ "${down:-0}" -gt 0 ]; then
+        up=$down
+        log_warn "上行测不出，暂用下行值 ${up} Mbps 代替（标记为估算）。"
+        TUNE_UP_SRC="estimated-from-down"
+    else
+        TUNE_UP_SRC="measured"
+    fi
+    echo ""
+    read -rp "上行带宽采纳多少 Mbps？[回车=${up:-0}，或输入数字]: " ov
+    ov=$(echo "${ov:-}" | tr -d ' ' | grep -oE '^[0-9]+$' | head -1 || true)
+    [ -n "$ov" ] && { up=$ov; TUNE_UP_SRC="manual"; }
+    read -rp "下行带宽采纳多少 Mbps？[回车=${down:-0}，或输入数字]: " ov
+    ov=$(echo "${ov:-}" | tr -d ' ' | grep -oE '^[0-9]+$' | head -1 || true)
+    [ -n "$ov" ] && down=$ov
+    TUNE_UP_MBPS=${up:-0}
+    TUNE_DOWN_MBPS=${down:-0}
+    tune_save_state
+    log_success "已记录: 上行 ${TUNE_UP_MBPS} Mbps (${TUNE_UP_SRC}) / 下行 ${TUNE_DOWN_MBPS} Mbps"
+    tune_pause
+}
+
+# ── 到「本地」的 RTT / 物理距离 ───────────────────────────────
+tune_measure_rtt() {
+    tune_load_state
+    local ip inp out avg dist v
+    # SSH 会话里能直接拿到本地公网出口，这是最省事也最准的来源。
+    ip=$(echo "${SSH_CONNECTION:-${SSH_CLIENT:-}}" | awk '{print $1}' 2>/dev/null || true)
+    [ -z "$ip" ] && ip="${TUNE_LOCAL_IP:-}"
+    log_title "到本地的 RTT / 距离档"
+    if [ -n "$ip" ]; then
+        echo "  从 SSH 连接推测本地公网出口: ${ip}"
+    else
+        echo "  未能从 SSH 连接推测本地 IP（跳板/面板/网页终端常见）。"
+    fi
+    case "$ip" in
+        10.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[0-1].*|127.*|169.254.*|fe80:*|fc*:*|fd*:*)
+            log_warn "推测值是私网地址，不能代表本地出口，请手填公网 IP。"; ip="" ;;
+    esac
+    echo ""
+    read -rp "本地出口 IP 或域名 [回车=${ip:-采用上次的 ${TUNE_LOCAL_IP:-无}}]: " inp
+    inp=$(echo "${inp:-}" | tr -d ' ')
+    [ -n "$inp" ] && ip=$inp
+    [ -z "$ip" ] && ip="${TUNE_LOCAL_IP:-}"
+    if [ -z "$ip" ]; then
+        log_error "没有本地目标，无法测 RTT。可直接用菜单 9 手填 RTT。"
+        tune_pause; return 1
+    fi
+    TUNE_LOCAL_IP="$ip"
+    log_step "ping ${ip} (8 包)..."
+    out=""
+    if echo "$ip" | grep -q ':'; then
+        out=$(ping -6 -c 8 -i 0.3 -W 2 "$ip" 2>/dev/null || true)
+    else
+        out=$(ping -c 8 -i 0.3 -W 2 "$ip" 2>/dev/null || true)
+    fi
+    avg=$(echo "$out" | awk -F'/' '/^(rtt|round-trip)/ {printf "%d", $5+0.5; exit}' 2>/dev/null || true)
+    avg=${avg:-0}
+    if [ "$avg" -gt 0 ] 2>/dev/null; then
+        log_success "平均 RTT: ${avg} ms"
+        TUNE_RTT_SRC="ping"
+    else
+        log_warn "ICMP 不可用或被本地防火墙挡住（家宽很常见），需要手填 RTT。"
+        echo "  参考: 中国香港 30 / 日本 60 / 新加坡 70 / 美西 150 / 美东 220 / 欧洲 250 ms"
+        read -rp "请输入平均 RTT (ms): " inp
+        avg=$(echo "${inp:-}" | grep -oE '^[0-9]+$' | head -1 || true)
+        avg=${avg:-0}
+        [ "$avg" -le 0 ] 2>/dev/null && { log_error "无效 RTT，未保存。"; tune_pause; return 1; }
+        TUNE_RTT_SRC="manual"
+    fi
+    TUNE_RTT_MS=$avg
+    dist=$(tune_classify_rtt "$avg")
+    TUNE_DIST="$dist"
+    v=$(tune_dist_label "$dist")
+    log_success "距离档: ${v}"
+    echo "  提示: 这是 VPS→本地单侧测量，跨境链路有时会不对称；"
+    echo "        晚高峰复测一次更可靠（菜单 3 可反复测）。"
+    tune_save_state
+    tune_pause
+}
+
+# ── 按 BDP 生成每台机器专属参数 ───────────────────────────────
+tune_add_plan() {
+    local k=$1 val=$2 why=$3 owner
+    owner=$(tune_key_owner "$k" 2>/dev/null || true)
+    if [ -n "$owner" ]; then
+        TUNE_SKIP+=("$k|由 ${owner} 占用，不覆盖"); return
+    fi
+    if ! tune_is_writable "$k"; then
+        TUNE_SKIP+=("$k|内核只读或不存在（容器/精简内核）"); return
+    fi
+    TUNE_PLAN+=("$k|$val|$why")
+}
+
+tune_build_plan() {
+    tune_load_state
+    tune_detect_env
+    TUNE_PLAN=(); TUNE_SKIP=()
+    local up=${TUNE_UP_MBPS:-0} rtt=${TUNE_RTT_MS:-0} cap=${TUNE_LOCAL_CAP_MBPS:-0}
+    local eff bdp target hard_cap budget lim mid notsent backlog cpu mem
+    if [ "$up" -le 0 ] 2>/dev/null || [ "$rtt" -le 0 ] 2>/dev/null; then
+        log_warn "缺少有效测量值：请先跑菜单 [2] 带宽测量 和 [3] RTT 测量。"
+        return 1
+    fi
+    eff=$up
+    if [ "$cap" -gt 0 ] 2>/dev/null && [ "$cap" -lt "$eff" ]; then eff=$cap; fi
+    # BDP(bytes) = Mbps * 1e6 / 8 * ms / 1000 = Mbps * ms * 125
+    bdp=$(( eff * rtt * 125 ))
+    target=$(( bdp * 2 ))
+    [ "$target" -lt 262144 ] && target=262144
+
+    mem=${TUNE_ENV_MEM_MB:-512}
+    if [ "$mem" -le 0 ] 2>/dev/null; then
+        log_warn "读不到 /proc/meminfo（精简系统常见），按 512MB 档保守估算"
+        mem=512
+    fi
+    if   [ "$mem" -lt 256 ];  then hard_cap=2097152
+    elif [ "$mem" -lt 512 ];  then hard_cap=4194304
+    elif [ "$mem" -lt 1024 ]; then hard_cap=8388608
+    elif [ "$mem" -lt 2048 ]; then hard_cap=16777216
+    else                           hard_cap=33554432
+    fi
+    [ "${TUNE_ENV_CLASS:-full}" = "container" ] && hard_cap=$(( hard_cap / 2 ))
+    # 内存预算：最多拿 8% 物理内存给 socket 缓冲，按 32 并发估
+    budget=$(( mem * 1024 * 1024 * 8 / 100 / 32 ))
+    [ "$budget" -lt 262144 ] && budget=262144
+    lim=$hard_cap; [ "$budget" -lt "$lim" ] && lim=$budget
+    [ "$target" -gt "$lim" ] && target=$lim
+
+    mid=$(( target / 2 ))
+    [ "$mid" -lt 131072 ] && mid=131072
+    [ "$mid" -gt 1048576 ] && mid=1048576
+    [ "$mid" -ge "$target" ] && mid=$(( target / 2 ))
+
+    case "${TUNE_DIST:-regional}" in
+        near)     notsent=16384 ;;
+        regional) notsent=65536 ;;
+        far)      notsent=131072 ;;
+        veryfar)  notsent=262144 ;;
+        *)        notsent=65536 ;;
+    esac
+    cpu=$(grep -c '^processor' /proc/cpuinfo 2>/dev/null || echo 1); cpu=${cpu:-1}
+    backlog=$(( cpu * 2048 )); [ "$backlog" -gt 16384 ] && backlog=16384
+    [ "${TUNE_ENV_CLASS:-full}" = "container" ] && [ "$backlog" -gt 4096 ] && backlog=4096
+
+    tune_add_plan "net.core.rmem_max" "$target" "接收缓冲上限 = clamp(2×BDP, 内存档)"
+    tune_add_plan "net.core.wmem_max" "$target" "发送缓冲上限 = clamp(2×BDP, 内存档)"
+    tune_add_plan "net.ipv4.tcp_rmem" "4096 ${mid} ${target}" "TCP 接收窗口三元组"
+    tune_add_plan "net.ipv4.tcp_wmem" "4096 ${mid} ${target}" "TCP 发送窗口三元组"
+    tune_add_plan "net.ipv4.tcp_slow_start_after_idle" "0" "代理长连接间歇流量，避免每次重新慢启动"
+    tune_add_plan "net.ipv4.tcp_mtu_probing" "1" "跨境 + 隧道易遇 PMTU 黑洞，开启路径 MTU 探测"
+    tune_add_plan "net.ipv4.tcp_notsent_lowat" "$notsent" "距离档 ${TUNE_DIST:-unknown}：控制未发送队列，抑制 bufferbloat"
+    tune_add_plan "net.core.netdev_max_backlog" "$backlog" "${cpu} 核收包队列，防高速收包丢包"
+
+    # 供报告展示
+    TUNE_CALC_BDP="$bdp"
+    TUNE_CALC_TARGET="$target"
+    TUNE_CALC_EFF="$eff"
+    TUNE_CALC_HARDCAP="$hard_cap"
+    return 0
+}
+
+tune_show_plan() {
+    tune_build_plan || return 1
+    local item k val why old
+    log_title "差异化调优方案（只显示，不应用）"
+    echo "  实测上行   : ${TUNE_UP_MBPS:-0} Mbps  (来源 ${TUNE_UP_SRC:-none})"
+    echo "  本地带宽上限: ${TUNE_LOCAL_CAP_MBPS:-0} Mbps  (0 = 不限)"
+    echo "  有效带宽   : ${TUNE_CALC_EFF} Mbps  = min(上行, 本地上限)"
+    echo "  到本地 RTT : ${TUNE_RTT_MS:-0} ms  (来源 ${TUNE_RTT_SRC:-none}, 目标 ${TUNE_LOCAL_IP:-未设})"
+    echo "  距离档     : $(tune_dist_label "${TUNE_DIST:-unknown}")"
+    echo "  VPS        : ${TUNE_ENV_VIRT} / ${TUNE_ENV_CLASS} / ${TUNE_ENV_MEM_MB} MB"
+    echo "  BDP        : $(( ${TUNE_CALC_BDP:-0} / 1024 )) KB"
+    echo "  目标窗口   : $(( ${TUNE_CALC_TARGET:-0} / 1024 )) KB  (2×BDP，已被内存档限制到 $(( ${TUNE_CALC_HARDCAP:-0} / 1024 )) KB 以内)"
+    echo ""
+    echo -e "  ${CYAN}将要修改的键${NC}"
+    for item in "${TUNE_PLAN[@]}"; do
+        IFS='|' read -r k val why <<< "$item"
+        old=$(sysctl -n "$k" 2>/dev/null | tr '\t' ' ' || echo n/a)
+        printf "    %-40s\n" "$k"
+        printf "      原值: %s\n      新值: %s\n      理由: %s\n" "${old:-n/a}" "$val" "$why"
+    done
+    if [ "${#TUNE_SKIP[@]}" -gt 0 ]; then
+        echo ""
+        echo -e "  ${YELLOW}跳过的键（安全保护，不是失败）${NC}"
+        for item in "${TUNE_SKIP[@]}"; do
+            IFS='|' read -r k why <<< "$item"
+            printf "    %-40s %s\n" "$k" "$why"
+        done
+    fi
+    echo ""
+    echo "  只校验不修改: $(sysctl -n net.ipv4.tcp_window_scaling 2>/dev/null || echo n/a) = 窗口缩放(应=1)"
+    echo "  建议（不自动执行）:"
+    echo "    · 当前拥塞控制 $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo n/a) / qdisc $(sysctl -n net.core.default_qdisc 2>/dev/null || echo n/a)，保持旧版设置不动"
+    echo "    · 若出现大包不通：iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu"
+    echo "    · IPv6 路径 MTU 至少 1280，必要时 clamp 到 1220"
+    tune_pause
+}
+
+# ── 备份 / 应用 / 验证 / 回滚 ─────────────────────────────────
+tune_backup_create() {
+    local ts d k f
+    ts=$(date +%Y%m%d-%H%M%S)
+    d="$TUNE_BACKUP_DIR/$ts"
+    mkdir -p "$d" 2>/dev/null || { log_error "无法创建备份目录 ${d}"; return 1; }
+    : > "$d/sysctl-before.conf" 2>/dev/null || return 1
+    for k in "${TUNE_MANAGED_KEYS[@]}"; do
+        echo "$k = $(sysctl -n "$k" 2>/dev/null | tr '\t' ' ' || echo NA)" >> "$d/sysctl-before.conf"
+    done
+    [ -f /etc/sysctl.conf ] && cp -p /etc/sysctl.conf "$d/sysctl.conf.orig" 2>/dev/null || true
+    for f in /etc/sysctl.d/*.conf; do
+        [ -f "$f" ] || continue
+        cp -p "$f" "$d/$(basename "$f").orig" 2>/dev/null || true
+    done
+    : > "$d/manifest" 2>/dev/null || return 1
+    echo "$d" > "$TUNE_LAST_BACKUP" 2>/dev/null || true
+    echo "$d"
+}
+
+tune_write_conf() {
+    local item k val why f
+    f="$TUNE_CONF"
+    mkdir -p /etc/sysctl.d 2>/dev/null || true
+    {
+        echo "# ${TUNE_MARK}"
+        echo "# 由 xray 脚本菜单 16 生成。回滚：菜单 8，或 bash 本脚本 后选 16→8"
+        echo "# 生成时间: $(date '+%Y-%m-%d %H:%M:%S')"
+        for item in "${TUNE_PLAN[@]}"; do
+            IFS='|' read -r k val why <<< "$item"
+            echo "$k = $val"
+        done
+    } > "$f" 2>/dev/null || { log_error "写入 ${f} 失败"; return 1; }
+    sysctl -p "$f" >/dev/null 2>&1 || true
+
+    # 非 systemd / 精简系统可能不读 sysctl.d，额外追加一段带标记的块。
+    if ! command -v systemctl >/dev/null 2>&1 || ! sysctl --system >/dev/null 2>&1; then
+        if [ -d /etc ]; then
+            tune_strip_block /etc/sysctl.conf
+            {
+                echo ""; echo "$TUNE_BLOCK_BEGIN"
+                for item in "${TUNE_PLAN[@]}"; do
+                    IFS='|' read -r k val why <<< "$item"
+                    echo "$k = $val"
+                done
+                echo "$TUNE_BLOCK_END"
+            } >> /etc/sysctl.conf 2>/dev/null || true
+            log_info "检测到非 systemd/精简系统，已同步追加到 /etc/sysctl.conf 标记块"
+        fi
+    fi
+    return 0
+}
+
+# 用 awk 删除带起止标记的块：GNU/BSD/busybox sed -i 语法不一致，awk 全平台一致。
+tune_strip_block() {
+    local f=$1 tmp
+    [ -f "$f" ] || return 0
+    grep -qF "$TUNE_BLOCK_BEGIN" "$f" 2>/dev/null || return 0
+    tmp=$(mktemp "${f}.tune.XXXXXX" 2>/dev/null || true)
+    [ -n "$tmp" ] || return 1
+    awk -v b="$TUNE_BLOCK_BEGIN" -v e="$TUNE_BLOCK_END" '
+        $0 == b { skip=1 }
+        !skip { print }
+        $0 == e { skip=0 }
+    ' "$f" > "$tmp" 2>/dev/null && mv "$tmp" "$f" 2>/dev/null || { rm -f "$tmp"; return 1; }
+    return 0
+}
+
+tune_remove_conf() {
+    if [ -f "$TUNE_CONF" ] && grep -qF "$TUNE_MARK" "$TUNE_CONF"; then
+        rm -f "$TUNE_CONF" 2>/dev/null || true
+    fi
+    if [ -f /etc/sysctl.conf ]; then
+        tune_strip_block /etc/sysctl.conf || true
+    fi
+}
+
+tune_revert_from() {
+    local d=$1 k old new cnt=0
+    [ -f "$d/manifest" ] || { log_warn "备份不完整: ${d}"; return 1; }
+    while IFS='|' read -r k old new; do
+        [ -n "$k" ] || continue
+        if [ "$old" = "NA" ] || [ -z "$old" ]; then
+            log_warn "${k}: 原值不可得，保持当前值"; continue
+        fi
+        if sysctl -w "$k=$old" >/dev/null 2>&1; then
+            cnt=$(( cnt + 1 ))
+        else
+            log_warn "${k}: 恢复失败，请查 ${d}/sysctl-before.conf"
+        fi
+    done < "$d/manifest"
+    tune_remove_conf
+    log_success "已恢复 ${cnt} 个键的运行时原值，并移除本模块配置"
+    log_info "备份保留在: ${d}（配置文件副本也在里面，可人工比对）"
+}
+
+# $1 = 1 持久化 / 0 仅临时试跑
+tune_apply() {
+    local persist=${1:-0} item k val why old cur exp d
+    [ "${#TUNE_PLAN[@]}" -gt 0 ] || { log_warn "方案为空，请先执行菜单 [4] 生成方案"; return 1; }
+    if [ "$(id -u 2>/dev/null || echo 1)" != "0" ]; then
+        log_error "需要 root 权限"; return 1
+    fi
+    echo ""
+    echo -e "${YELLOW}即将修改 ${#TUNE_PLAN[@]} 个内核参数。${NC}"
+    if [ "$persist" = "1" ]; then
+        echo "  模式: 正式应用（备份 → 运行时生效 → 验证 → 写入配置持久化）"
+    else
+        echo "  模式: 临时试跑（只改运行时，不写任何配置文件，重启自动还原）"
+    fi
+    read -rp "确认继续？[y/N]: " ok
+    case "${ok:-N}" in y|Y) ;; *) log_info "已取消，系统未改动"; return 0 ;; esac
+
+    d=$(tune_backup_create) || { log_error "备份失败，已中止（系统未改动）"; return 1; }
+    TUNE_HAD_XRAY=0
+    pgrep -x xray >/dev/null 2>&1 && TUNE_HAD_XRAY=1
+
+    for item in "${TUNE_PLAN[@]}"; do
+        IFS='|' read -r k val why <<< "$item"
+        old=$(sysctl -n "$k" 2>/dev/null | tr '\t' ' ' || echo NA)
+        if ! sysctl -w "$k=$val" >/dev/null 2>&1; then
+            log_error "写入失败: ${k}，自动回滚"
+            tune_revert_from "$d"; return 1
+        fi
+        echo "${k}|${old:-NA}|${val}" >> "$d/manifest"
+    done
+
+    # 运行时校验：值确实生效 + 原有 Xray 进程没被弄挂
+    for item in "${TUNE_PLAN[@]}"; do
+        IFS='|' read -r k val why <<< "$item"
+        cur=$(sysctl -n "$k" 2>/dev/null | tr '\t' ' ' || true)
+        exp=$(echo "$val" | tr '\t' ' ')
+        if [ "$cur" != "$exp" ]; then
+            log_error "校验失败: ${k} 期望[${exp}] 实际[${cur}]，自动回滚"
+            tune_revert_from "$d"; return 1
+        fi
+    done
+    if [ "$TUNE_HAD_XRAY" = "1" ] && ! pgrep -x xray >/dev/null 2>&1; then
+        log_error "Xray 进程异常消失，自动回滚"
+        tune_revert_from "$d"; return 1
+    fi
+
+    if [ "$persist" = "1" ]; then
+        if ! tune_write_conf; then
+            log_error "持久化失败，自动回滚"
+            tune_revert_from "$d"; return 1
+        fi
+        log_success "已持久化到 ${TUNE_CONF}"
+    else
+        log_success "临时生效完成。确认速度没问题后，再跑菜单 [6] 正式应用。"
+    fi
+    log_info "备份: ${d}"
+    log_warn "任何异常：菜单 [8] 一键回滚；临时试跑也可以直接重启 VPS。"
+    tune_pause
+}
+
+tune_list_backups() {
+    local d
+    echo ""
+    echo -e "${CYAN}── 备份列表（最新在前）──────────────────────────${NC}"
+    if [ -d "$TUNE_BACKUP_DIR" ]; then
+        for d in $(ls -1dt "$TUNE_BACKUP_DIR"/* 2>/dev/null | head -10); do
+            [ -f "$d/manifest" ] || continue
+            echo "  $(basename "$d")  改动 $(wc -l < "$d/manifest" 2>/dev/null || echo 0) 项  ${d}"
+        done
+    fi
+    if [ -f "$TUNE_CONF" ]; then
+        echo ""
+        echo "  当前配置 ${TUNE_CONF}:"
+        sed 's/^/    /' "$TUNE_CONF" 2>/dev/null
+    else
+        echo "  当前没有持久化的调优配置"
+    fi
+    echo ""
+}
+
+tune_revert_menu() {
+    local d choice
+    tune_list_backups
+    d=""
+    [ -f "$TUNE_LAST_BACKUP" ] && d=$(cat "$TUNE_LAST_BACKUP" 2>/dev/null || true)
+    if [ -z "$d" ] || [ ! -f "$d/manifest" ]; then
+        log_warn "没有可用备份，无需回滚"; tune_pause; return 0
+    fi
+    read -rp "回滚到哪份备份？[回车=最新 ${d}]: " choice
+    [ -n "${choice:-}" ] && d="$TUNE_BACKUP_DIR/$choice"
+    if [ ! -f "$d/manifest" ]; then
+        log_error "备份不存在: ${d}"; tune_pause; return 1
+    fi
+    read -rp "确认回滚？会恢复运行时原值并删除本模块配置 [y/N]: " choice
+    case "${choice:-N}" in
+        y|Y) tune_revert_from "$d" ;;
+        *)   log_info "已取消" ;;
+    esac
+    tune_pause
+}
+
+tune_set_manual() {
+    tune_load_state
+    local v
+    echo ""
+    echo "  当前: 上行=${TUNE_UP_MBPS:-0} Mbps / RTT=${TUNE_RTT_MS:-0} ms / 本地上限=${TUNE_LOCAL_CAP_MBPS:-0} Mbps"
+    read -rp "本地家宽下行上限 Mbps (0=不限，回车保持): " v
+    v=$(echo "${v:-}" | grep -oE '^[0-9]+$' | head -1 || true)
+    [ -n "$v" ] && TUNE_LOCAL_CAP_MBPS=$v
+    read -rp "手动覆盖 VPS 上行 Mbps (回车保持): " v
+    v=$(echo "${v:-}" | grep -oE '^[0-9]+$' | head -1 || true)
+    [ -n "$v" ] && { TUNE_UP_MBPS=$v; TUNE_UP_SRC="manual"; }
+    read -rp "手动覆盖 RTT ms (回车保持): " v
+    v=$(echo "${v:-}" | grep -oE '^[0-9]+$' | head -1 || true)
+    if [ -n "$v" ]; then
+        TUNE_RTT_MS=$v; TUNE_RTT_SRC="manual"; TUNE_DIST=$(tune_classify_rtt "$v")
+        log_info "距离档已按新 RTT 重算: $(tune_dist_label "$TUNE_DIST")"
+    fi
+    tune_save_state
+    log_success "已保存"
+    tune_pause
+}
+
+tune_show_status() {
+    tune_load_state
+    echo ""
+    echo -e "${CYAN}  最近测量: 上行 ${TUNE_UP_MBPS:-0} Mbps(${TUNE_UP_SRC:-none}) / RTT ${TUNE_RTT_MS:-0} ms(${TUNE_RTT_SRC:-none}) / 本地上限 ${TUNE_LOCAL_CAP_MBPS:-0} Mbps${NC}"
+    echo -e "${CYAN}  距离档  : $(tune_dist_label "${TUNE_DIST:-unknown}")   测量时间 ${TUNE_UPDATED:-never}${NC}"
+    if [ -f "$TUNE_CONF" ]; then
+        echo -e "  ${GREEN}状态    : 已有持久化配置（菜单 8 可一键回滚）${NC}"
+    else
+        echo -e "  ${YELLOW}状态    : 未持久化${NC}"
+    fi
+    echo ""
+}
+
+tune_menu() {
+    local c
+    if [ "$(id -u 2>/dev/null || echo 1)" != "0" ]; then
+        log_error "网络体检需要 root，请重新以 root 运行脚本"; tune_pause; return 0
+    fi
+    mkdir -p "$TUNE_DIR" "$TUNE_BACKUP_DIR" 2>/dev/null || true
+    while true; do
+        echo ""
+        log_title "网络体检 / TCP 差异化调优  v2.6.0"
+        tune_show_status
+        echo "   1) 环境体检（只读：虚拟化/内存/内核/键归属/可写性）"
+        echo "   2) 实测 VPS 外网带宽（下行 + 上行，可手填覆盖）"
+        echo "   3) 实测到「本地」的 RTT / 距离档（自动取 SSH 来源 IP）"
+        echo "   4) 生成差异化调优方案（只显示 diff，不应用）"
+        echo "   5) 临时试跑（仅运行时生效，重启自动还原）"
+        echo "   6) 正式应用（备份 → 生效 → 验证 → 持久化）"
+        echo "   7) 查看当前配置 / 备份列表"
+        echo "   8) 一键回滚（恢复原值 + 移除本模块配置）"
+        echo "   9) 手动设置带宽上限 / 覆盖测量值"
+        echo "   0) 返回主菜单"
+        echo ""
+        read -rp "选择: " c
+        c=$(echo "${c:-}" | tr -d ' ')
+        case "$c" in
+            1) tune_show_env ;;
+            2) tune_measure_bandwidth ;;
+            3) tune_measure_rtt ;;
+            4) tune_show_plan ;;
+            5) tune_show_plan && tune_apply 0 ;;
+            6) tune_show_plan && tune_apply 1 ;;
+            7) tune_list_backups; tune_pause ;;
+            8) tune_revert_menu ;;
+            9) tune_set_manual ;;
+            0) return 0 ;;
+            *) log_warn "无效选项" ;;
+        esac
+    done
+}
+# <<< TUNE-MODULE-END
+
+# ==============================================================
+# 菜单入口
+# ==============================================================
+main_menu() {
+    need_root
+    detect_os
+    # 管道下载 (bash <(curl...)) 时把交互输入切回终端，否则菜单读不到按键。
+    # 用 -r 而不用 -e 判断：无控制终端时 /dev/tty 存在但打不开，-e 会误判导致 exec 失败退出。
+    if [ ! -t 0 ] && [ -r /dev/tty ]; then exec </dev/tty; fi
+
+    mkdir -p "$DATA_DIR" "$BACKUP_DIR" "$XRAY_LOG_DIR" "$XRAY_ETC" "$HY2_ETC" "$HY2_CERT_DIR" "$HY2_LOG_DIR" 2>/dev/null || true
+    touch "$NODE_DB" "$RELAY_DB" "$HY2_DB" "$VERSION_FILE" 2>/dev/null || true
+    sanitize_db
+    check_version
+    # 启动时顺带校验开机自启 (已在位则静默，补齐或失败才各说一行)
+    ensure_autostart_all
+
+    while true; do
+        echo ""
+        echo -e "${BLUE}╔══════════════════════════════════════════════╗${NC}"
+        echo -e "${BLUE}║   VPS 一键管理  ${SCRIPT_VERSION}                     ║${NC}"
+        echo -e "${BLUE}║   Xray VLESS+Reality 严谨加固防偷优化版      ║${NC}"
+        echo -e "${BLUE}╚══════════════════════════════════════════════╝${NC}"
+        echo ""
+        show_relay_mode
+        if [ -s "$HY2_DB" ]; then
+            local hy2_cnt
+            hy2_cnt=$(grep -vc '^#\|^$' "$HY2_DB" 2>/dev/null || echo "0")
+            echo -e "  HY2 节点: ${hy2_cnt} 个"
+        fi
+        echo ""
+        echo -e "${CYAN}── 本机节点 ────────────────────────────────────${NC}"
+        echo "   1) 添加节点"
+        echo "   2) 修改节点 (SNI/端口等，无损生效)"
+        echo "   3) 删除节点"
+        echo "   4) 查看单个节点信息 & URI"
+        echo "   5) 查看所有节点信息 & URI"
+        echo "   6) 检测节点状态 (真实解析验配)"
+        echo ""
+        echo -e "${CYAN}── 中转落地 ────────────────────────────────────${NC}"
+        echo "   7) 中转落地管理（增删改查/切换）"
+        echo ""
+        echo -e "${CYAN}── Hysteria2 ───────────────────────────────────${NC}"
+        echo "  11) Hysteria2 节点管理（增删改查/端口跳跃/带宽/伪装/混淆）"
+        echo ""
+        echo -e "${CYAN}── Xray 服务 ───────────────────────────────────${NC}"
+        echo "   8) 重启 Xray 服务"
+        echo "   9) 强制修复配置 (解决部分启动失败)"
+        echo "  10) 一键全新初始化 (危险操作)"
+        echo "  12) 修复开机自启 (VPS 重启后自动启动 Xray/HY2)"
+        xray_kernel_version
+        local kver_disp="${XRAY_VER_STR:-未安装}"
+        echo "  13) 升级 Xray 内核 (当前版本: ${kver_disp}, 锁定版 ${XRAY_VERSION_PIN})"
+        echo ""
+        echo -e "${CYAN}── 抗风控诊断 ─────────────────────────────────${NC}"
+        echo "  14) SNI 预检 (10 个候选自动测速排名, 直接给出最优)"
+        echo "  15) 探测统计 / 日志级别 (看 GFW 探测频率)"
+        echo ""
+        echo -e "${CYAN}── 网络与性能 ─────────────────────────────────${NC}"
+        echo "  16) 网络自检 / TCP 差异化调优 (实测带宽·距离分档·备份·试跑·回滚)"
+        echo "   0) 退出"
+        echo ""
+        read -rp "请选择: " choice
+        choice=$(echo "${choice:-}" | tr -d ' ')
+        case "$choice" in
+            1)  add_node ;;
+            2)  edit_node ;;
+            3)  delete_node ;;
+            4)  view_node ;;
+            5)  view_all_nodes ;;
+            6)  test_node ;;
+            7)  relay_menu ;;
+            8)  start_xray && log_success "已重启" ;;
+            9)  regen_config && start_xray && log_success "修复成功" ;;
+            10) hy2_wipe_all; rm -rf "${DATA_DIR:?}" "${XRAY_ETC:?}"; log_success "已重置配置，请重新运行脚本"; exit 0 ;;
+            11) hy2_menu ;;
+            12) ensure_autostart_all && log_success "开机自启检查完成" ;;
+            13) upgrade_xray ;;
+            14) sni_pick_menu ;;
+            15) probe_stats ;;
+            16) tune_menu ;;
+            0)  exit 0 ;;
+            *)  log_warn "无效选项" ;;
+        esac
+    done
+}
+
+main_menu
+
